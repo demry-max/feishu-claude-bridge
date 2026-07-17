@@ -2,7 +2,16 @@
 
 > **给 Claude 的指令**：按步骤 1→11 顺序执行，源码原样写入不要改动。全程自动，唯一人工动作是步骤 9 用户扫码。
 >
-> **效果**：飞书私聊/群 @机器人 → 本机 Claude Code 回答（文本/图片/文件/语音/富文本/转发均可），会话持久续聊。无需公网服务器，飞书事件走长连接。前置：macOS 或 Windows、Node ≥ 18、已登录的 claude CLI；可选 ffmpeg（语音兜底转写，`brew install ffmpeg` / `winget install ffmpeg`）。
+> **效果**：飞书私聊/群 @机器人 → 本机 Claude Code 回答（文本/图片/文件/语音/富文本/转发均可），会话持久续聊。无需公网服务器，飞书事件走长连接。前置：macOS 或 Windows、Node ≥ 18；可选 ffmpeg（语音兜底转写，`brew install ffmpeg` / `winget install ffmpeg`）。
+
+## 步骤 0：安装/更新 Claude Code CLI 并登录
+
+```bash
+npm install -g @anthropic-ai/claude-code   # 安装或更新到最新版
+claude --version
+```
+
+然后运行 `claude /login`——会弹出登录选项，**让用户在浏览器完成授权**（订阅账号登录，之后机器人用的就是这个登录态）。已登录过的机器可跳过登录，后续步骤 8 会验证。
 
 ## 步骤 1：初始化项目
 
