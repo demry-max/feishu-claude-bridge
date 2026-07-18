@@ -1,13 +1,18 @@
 // 一键注册飞书应用（移植自 OpenClaw 的设备码注册流程）：
 // 扫码授权后，飞书官方接口直接返回 appId + appSecret + 用户 open_id，
 // 自动写入 .env 与 data/owner.json —— 无需进开发者后台建应用。
+import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const REG_URL = 'https://accounts.feishu.cn/oauth/v1/app/registration';
+// FEISHU_DOMAIN=lark 时走国际版 Lark 注册端点
+const REG_URL =
+  process.env.FEISHU_DOMAIN === 'lark'
+    ? 'https://accounts.larksuite.com/oauth/v1/app/registration'
+    : 'https://accounts.feishu.cn/oauth/v1/app/registration';
 
 async function post(body) {
   const res = await fetch(REG_URL, {

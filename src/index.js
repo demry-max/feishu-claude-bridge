@@ -12,10 +12,14 @@ if (!APP_ID || !APP_SECRET) {
   process.exit(1);
 }
 
-const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET });
+// FEISHU_DOMAIN=lark 时接入国际版 Lark（open.larksuite.com）
+const DOMAIN = process.env.FEISHU_DOMAIN === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu;
+
+const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET, domain: DOMAIN });
 const wsClient = new lark.WSClient({
   appId: APP_ID,
   appSecret: APP_SECRET,
+  domain: DOMAIN,
   loggerLevel: lark.LoggerLevel.info,
 });
 
