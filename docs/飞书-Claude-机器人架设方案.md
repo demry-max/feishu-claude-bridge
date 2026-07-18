@@ -33,7 +33,7 @@ npm install @larksuiteoapi/node-sdk dotenv qrcode-terminal cross-spawn
 FEISHU_APP_ID=
 FEISHU_APP_SECRET=
 
-ALLOWED_TOOLS=Read,Grep,Glob,WebSearch,WebFetch   # owner 可用工具
+ALLOWED_TOOLS=Read,Grep,Glob,WebSearch,WebFetch,Write(./memory/**),Edit(./memory/**),Write(./skills/**),Edit(./skills/**)   # owner 可用工具（含记忆/技能落盘）
 NON_OWNER_TOOLS=WebSearch,WebFetch                # 其他成员可用工具
 CLAUDE_MODEL=                                     # 留空=默认；可填 haiku/sonnet/opus
 CLAUDE_TIMEOUT_MS=300000
@@ -48,6 +48,53 @@ data/
 workspace/
 bridge.log
 .DS_Store
+```
+
+## 步骤 2c：写入 Agent 工作区（长期记忆 + 技能沉淀）
+
+```bash
+mkdir -p ~/feishu-claude-bridge/workspace/memory ~/feishu-claude-bridge/workspace/skills
+```
+
+写入 `workspace/CLAUDE.md`（机器人的常驻人格与记忆/技能协议，claude CLI 自动加载）：
+
+```markdown
+# 飞书 Claude 助手工作区
+
+你是通过飞书对话的常驻 AI 助手，此目录是你的工作区（workspace），跨会话持续存在。
+
+## 记忆系统（长期记忆）
+
+- 长期记忆存放在 `memory/` 目录：**一条记忆 = 一个 md 文件**，`memory/MEMORY.md` 是索引（已自动加载在下方）。
+- 当用户告诉你值得长期记住的事实、偏好、决定，或明确说「记住……」时：
+  1. 写入 `memory/<短横线小写slug>.md`（内容：事实本身 + 为什么重要）
+  2. 在 `memory/MEMORY.md` 追加一行 `- [标题](文件名.md) — 一句话摘要`
+- 发现记忆过时或错误时，直接修改/删除对应文件并同步索引。
+- 绝不把密码、密钥、token 写入记忆。
+- 注意：新写入的记忆对**新会话**生效（用户发 /new 或其他聊天窗口）；当前会话内你直接用对话上下文即可。
+
+@memory/MEMORY.md
+
+## 技能系统（自动沉淀 Skills）
+
+- 当用户教你一个**可复用**的流程、模板、规范，或说「以后都这样做」「存成技能」时：
+  在 `skills/<kebab-name>/SKILL.md` 创建技能文件（系统会自动同步加载），格式：frontmatter（name, description=触发条件）+ 正文（何时使用/步骤规范）。
+- 技能会在之后的会话中自动加载；当任务匹配某技能的 description 时，遵循该技能执行。
+- 用户问「你会哪些技能」时，列出 `skills/` 下的技能清单。
+
+## 行为约定
+
+- 你的回复经飞书 markdown 卡片展示，可用代码块、表格、加粗。
+- 你拥有：只读工具（Read/Grep/Glob）、联网检索（WebSearch/WebFetch）、以及**仅限** `memory/` 与 `skills/` 的写入权。不要尝试写其他位置。
+- 回答保持简洁直接，中文优先。
+```
+
+写入 `workspace/memory/MEMORY.md`：
+
+```markdown
+# 记忆索引
+
+（暂无记忆。按 CLAUDE.md 的记忆协议，每条记忆一个文件，并在此维护一行式索引。）
 ```
 
 ## 步骤 3：写入 `src/store.js`
@@ -93,6 +140,7 @@ export function saveSessions(sessions) {
 
 ```js
 import spawn from 'cross-spawn'; // Windows 下 claude 是 .cmd，原生 spawn 会 EINVAL
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadSessions, saveSessions } from './store.js';
@@ -128,7 +176,20 @@ export function sessionInfo(chatId, isOwner = false) {
   ].join('\n');
 }
 
+// Claude 被禁止自写 .claude 目录，agent 沉淀的技能先落 workspace/skills，
+// 每次调用前由桥接同步到 .claude/skills 供 CLI 自动加载
+function syncSkills() {
+  const src = path.join(WORKSPACE_DIR, 'skills');
+  const dest = path.join(WORKSPACE_DIR, '.claude', 'skills');
+  try {
+    if (fs.existsSync(src)) fs.cpSync(src, dest, { recursive: true });
+  } catch (e) {
+    console.error('[skills-sync]', e?.message ?? e);
+  }
+}
+
 export function runClaude(chatId, prompt, isOwner = false, extraTools = []) {
+  syncSkills();
   // 提示词走 stdin：--allowedTools 等可变参数选项会吞掉后置的位置参数
   const args = ['-p', '--output-format', 'json'];
   if (sessions[chatId]) args.push('--resume', sessions[chatId]);
