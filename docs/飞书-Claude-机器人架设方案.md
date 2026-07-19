@@ -143,6 +143,7 @@ export function saveSessions(sessions) {
 import spawn from 'cross-spawn'; // Windows 下 claude 是 .cmd，原生 spawn 会 EINVAL
 import fs from 'node:fs';
 import path from 'node:path';
+import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { loadSessions, saveSessions } from './store.js';
 
@@ -191,10 +192,17 @@ function syncSkills() {
   }
 }
 
-export function runClaude(chatId, prompt, isOwner = false, extraTools = []) {
+/**
+ * 运行 claude 无头模式。onProgress 提供时走 stream-json 实时解析：
+ * - 中间消息 = assistant 事件的 text 块；最终答案 = result 事件的 result 字段。
+ * - 最终答案会先以 assistant 事件出现一次再以 result 出现，因此 assistant 文本
+ *   先暂存，被下一条 assistant 文本顶替时才作为中间进度推送；result 到达时丢弃
+ *   暂存，只把 result 作为最终返回——保证最终答案只发一次。
+ */
+export function runClaude(chatId, prompt, isOwner = false, extraTools = [], onProgress = null) {
   syncSkills();
   // 提示词走 stdin：--allowedTools 等可变参数选项会吞掉后置的位置参数
-  const args = ['-p', '--output-format', 'json'];
+  const args = ['-p', '--output-format', 'stream-json', '--verbose'];
   if (sessions[chatId]) args.push('--resume', sessions[chatId]);
   const tools = [isOwner ? ALLOWED_TOOLS : NON_OWNER_TOOLS, ...extraTools]
     .filter(Boolean)
@@ -208,14 +216,51 @@ export function runClaude(chatId, prompt, isOwner = false, extraTools = []) {
       cwd: WORKSPACE_DIR,
       env: process.env,
     });
-    let stdout = '';
     let stderr = '';
+    let pending = ''; // 暂存的 assistant 文本（可能是中间进度，也可能是最终答案）
+    let finalText = null;
+    let finalErr = null;
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`claude CLI 超时（${CLAUDE_TIMEOUT_MS / 1000}s）`));
     }, CLAUDE_TIMEOUT_MS);
 
-    child.stdout.on('data', (d) => (stdout += d));
+    const rl = readline.createInterface({ input: child.stdout });
+    rl.on('line', (line) => {
+      if (!line.trim()) return;
+      let d;
+      try {
+        d = JSON.parse(line);
+      } catch {
+        return; // 非 JSON 行（罕见）忽略
+      }
+      if (d.type === 'assistant') {
+        const text = (d.message?.content ?? [])
+          .filter((b) => b?.type === 'text')
+          .map((b) => b.text)
+          .join('\n')
+          .trim();
+        if (!text) return;
+        if (pending && onProgress) {
+          Promise.resolve(onProgress(pending)).catch((e) =>
+            console.error('[progress]', e?.message ?? e)
+          );
+        }
+        pending = text;
+      } else if (d.type === 'result') {
+        if (d.session_id) {
+          sessions[chatId] = d.session_id;
+          saveSessions(sessions);
+        }
+        if (d.is_error) {
+          finalErr = new Error(String(d.result ?? 'unknown error').slice(0, 500));
+        } else {
+          finalText = String(d.result ?? pending ?? '');
+        }
+        pending = ''; // 暂存的就是最终答案，丢弃避免重复
+      }
+    });
+
     child.stderr.on('data', (d) => (stderr += d));
     child.on('error', (e) => {
       clearTimeout(timer);
@@ -223,25 +268,10 @@ export function runClaude(chatId, prompt, isOwner = false, extraTools = []) {
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code !== 0 && !stdout) {
-        return reject(
-          new Error(`claude CLI 失败(code ${code}): ${stderr.slice(0, 500)}`)
-        );
-      }
-      try {
-        const out = JSON.parse(stdout);
-        if (out.session_id) {
-          sessions[chatId] = out.session_id;
-          saveSessions(sessions);
-        }
-        if (out.is_error) {
-          return reject(new Error(String(out.result ?? 'unknown error').slice(0, 500)));
-        }
-        resolve(out.result ?? '');
-      } catch {
-        // 非 JSON 输出时原样返回
-        resolve(String(stdout).trim());
-      }
+      if (finalErr) return reject(finalErr);
+      if (finalText !== null) return resolve(finalText);
+      if (pending) return resolve(pending); // 异常缺失 result 时兜底
+      reject(new Error(`claude CLI 失败(code ${code}): ${stderr.slice(0, 500)}`));
     });
 
     child.stdin.write(prompt);
@@ -464,14 +494,18 @@ const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
 
 if (!APP_ID || !APP_SECRET) {
-  console.error('缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，请先运行 npm run register');
+  console.error('缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，请检查 .env');
   process.exit(1);
 }
 
-const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET });
+// FEISHU_DOMAIN=lark 时接入国际版 Lark（open.larksuite.com）
+const DOMAIN = process.env.FEISHU_DOMAIN === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu;
+
+const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET, domain: DOMAIN });
 const wsClient = new lark.WSClient({
   appId: APP_ID,
   appSecret: APP_SECRET,
+  domain: DOMAIN,
   loggerLevel: lark.LoggerLevel.info,
 });
 
@@ -578,7 +612,7 @@ async function handleMessage(data) {
   }
   const isOwner = senderOpenId === owner;
 
-  // ---- 消息 → 提示词（文本/图片/文件/语音/富文本/合并转发/卡片） ----
+  // ---- 消息 → 提示词（文本/图片/文件/富文本/合并转发/卡片） ----
   let built;
   try {
     built = await buildPrompt(client, message, WORKSPACE_DIR);
@@ -615,7 +649,9 @@ async function handleMessage(data) {
     console.log(`[msg] ${isOwner ? 'owner' : senderOpenId} @ ${message.chat_type} [${message.message_type}]: ${text.slice(0, 80)}`);
     await react(message.message_id, 'OnIt');
     try {
-      const answer = await runClaude(message.chat_id, text, isOwner, extraTools);
+      const answer = await runClaude(message.chat_id, text, isOwner, extraTools, (progress) =>
+        reply(message.message_id, `⏳ ${progress}`)
+      );
       await reply(message.message_id, answer || '（Claude 返回了空回复）');
       await react(message.message_id, 'DONE');
     } catch (e) {
@@ -624,7 +660,7 @@ async function handleMessage(data) {
       if (msg.includes('401') || /re-?authenticate/i.test(msg)) {
         await reply(
           message.message_id,
-          '⚠️ 主机上的 Claude 登录已过期。请在主机终端运行 `claude /login` 重新登录后再试。'
+          '⚠️ Mac 上的 Claude 登录已过期。请在 Mac 终端运行 `claude /login` 重新登录后再试。'
         );
       } else {
         await reply(message.message_id, `⚠️ Claude 调用失败：${msg}`);

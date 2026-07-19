@@ -163,7 +163,9 @@ async function handleMessage(data) {
     console.log(`[msg] ${isOwner ? 'owner' : senderOpenId} @ ${message.chat_type} [${message.message_type}]: ${text.slice(0, 80)}`);
     await react(message.message_id, 'OnIt');
     try {
-      const answer = await runClaude(message.chat_id, text, isOwner, extraTools);
+      const answer = await runClaude(message.chat_id, text, isOwner, extraTools, (progress) =>
+        reply(message.message_id, `⏳ ${progress}`)
+      );
       await reply(message.message_id, answer || '（Claude 返回了空回复）');
       await react(message.message_id, 'DONE');
     } catch (e) {
