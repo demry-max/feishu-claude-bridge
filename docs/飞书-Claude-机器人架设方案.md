@@ -38,6 +38,7 @@ NON_OWNER_TOOLS=WebSearch,WebFetch                # 其他成员可用工具
 CLAUDE_MODEL=                                     # 留空=默认；可填 haiku/sonnet/opus
 CLAUDE_TIMEOUT_MS=300000
 CLAUDE_EFFORT=          # 思考深度 low/medium/high/xhigh/max，留空=默认
+FFMPEG_BIN=             # 语音转写用；建议填绝对路径，如 /opt/homebrew/bin/ffmpeg
 ```
 
 `.gitignore`：
@@ -835,7 +836,7 @@ cd ~/feishu-claude-bridge && npm start
 
 ## 步骤 11：常驻自启
 
-**macOS**（launchd）：写入 `~/Library/LaunchAgents/com.<用户名>.feishu-claude-bridge.plist`（node 绝对路径用 `which node` 取；`PATH` 必须含 `claude` 所在目录，nvm 用户即 node 同目录）：
+**macOS**（launchd）：写入 `~/Library/LaunchAgents/com.<用户名>.feishu-claude-bridge.plist`（node 绝对路径用 `which node` 取；`PATH` 必须含 `claude` 与 `ffmpeg` 所在目录——launchd 不继承终端 PATH，homebrew 的 ffmpeg 在 `/opt/homebrew/bin`，漏掉会导致语音转写静默失败）：
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
