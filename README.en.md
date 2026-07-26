@@ -13,6 +13,7 @@ Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-
 - 🔌 **Zero public-network dependency**: events over a persistent WebSocket — deploy on a home computer
 - 📲 **App created by scanning a QR code**: `npm run register` uses Feishu's official app-registration OAuth flow — one scan auto-creates the app, writes credentials to `.env`, and registers you as owner
 - 🧠 **Session memory**: each Feishu chat maps to one Claude session (`--resume`), valid across days; `/new` to reset, `/status` to inspect
+- ⏰ **Scheduled tasks (the bot schedules itself)**: say "remind me every weekday at 8" and it writes a job definition into `workspace/schedules/`; the bridge fires it on time and pushes the result proactively. Supports cron expressions and one-shot times. **The bot never gets Bash/shell access** — it only writes job definitions in a whitelisted directory; execution stays with the bridge
 - 🖼️ **Rich message types**: text / images (Claude reads them directly) / files / voice (Feishu transcript field, with an ffmpeg + speech-API fallback) / rich posts / merged forwards / share cards
 - 🔐 **Tiered permissions**: the first person to DM the bot becomes **owner** (local read-only tools + web); everyone else gets web search only and cannot touch your machine's files
 - 💰 **Runs on your Claude subscription, not API keys**: headless `claude -p` reuses your local Claude Code login
