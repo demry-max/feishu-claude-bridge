@@ -36,7 +36,9 @@ FEISHU_APP_SECRET=
 ALLOWED_TOOLS=Read,Grep,Glob,WebSearch,WebFetch,Write(./memory/**),Edit(./memory/**),Write(./skills/**),Edit(./skills/**),Write(./schedules/**),Edit(./schedules/**)   # owner 可用工具（含记忆/技能落盘）
 NON_OWNER_TOOLS=WebSearch,WebFetch                # 其他成员可用工具
 CLAUDE_MODEL=                                     # 留空=默认；可填 haiku/sonnet/opus
-CLAUDE_TIMEOUT_MS=300000
+CLAUDE_TIMEOUT_MS=3600000       # 绝对上限（默认 60 分钟）
+CLAUDE_IDLE_TIMEOUT_MS=600000   # 静默多久判定卡死（默认 10 分钟，有输出即续命）
+TTS_VOICE=Tingting              # /voice 语音回复音色（macOS say）
 CLAUDE_EFFORT=          # 思考深度 low/medium/high/xhigh/max，留空=默认
 FFMPEG_BIN=             # 语音转写用；建议填绝对路径，如 /opt/homebrew/bin/ffmpeg
 ALLOW_USERS=            # 私聊白名单 open_id，逗号分隔；留空=不限制
