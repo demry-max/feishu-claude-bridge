@@ -39,6 +39,9 @@ CLAUDE_MODEL=                                     # 留空=默认；可填 haiku
 CLAUDE_TIMEOUT_MS=300000
 CLAUDE_EFFORT=          # 思考深度 low/medium/high/xhigh/max，留空=默认
 FFMPEG_BIN=             # 语音转写用；建议填绝对路径，如 /opt/homebrew/bin/ffmpeg
+ALLOW_USERS=            # 私聊白名单 open_id，逗号分隔；留空=不限制
+ALLOW_CHATS=            # 群白名单 chat_id，逗号分隔；留空=不限制
+FEISHU_TOOLS=           # 填 false 可关闭飞书文档/多维表格工具（默认开，仅 owner）
 ```
 
 `.gitignore`：
@@ -953,7 +956,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install-startup.ps1
 3. `open.feishu.cn/app/<APP_ID>/auth`：权限管理 → 批量导入：
 
    ```json
-   {"scopes":{"tenant":["im:message","im:message.p2p_msg:readonly","im:message.group_at_msg:readonly","im:resource","im:message.reactions:write","speech_to_text:speech"],"user":[]}}
+   {"scopes":{"tenant":["im:message","im:message.p2p_msg:readonly","im:message.group_at_msg:readonly","im:resource","im:message.reactions:write","speech_to_text:speech","docx:document:readonly","docx:document","bitable:app:readonly","bitable:app","wiki:wiki:readonly","contact:user.base:readonly"],"user":[]}}
    ```
 
 4. `open.feishu.cn/app/<APP_ID>/event`：订阅方式选「**使用长连接接收事件**」；添加事件 `im.message.receive_v1`
