@@ -1,5 +1,7 @@
 # feishu-claude-bridge
 
+[![version](https://img.shields.io/badge/version-1.1.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 **中文** | [English](README.en.md)
 
 **把 Claude Code 接进飞书** —— 私聊或群里 @机器人，让 Claude 回答问题、看图片、读文件、听语音，并保持上下文连续。无需公网服务器、域名、回调地址：飞书事件走长连接（WebSocket），跑在一台装有 Claude Code 的电脑上即可。

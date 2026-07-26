@@ -1,5 +1,7 @@
 # feishu-claude-bridge
 
+[![version](https://img.shields.io/badge/version-1.1.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 [中文](README.md) | **English**
 
 **Chat with Claude Code from Feishu/Lark** — DM the bot or @mention it in a group chat, and Claude answers with full context continuity: it reads images, files, and voice messages, and remembers across days and weeks. **No public server, domain, or callback URL required** — events arrive over Feishu's persistent WebSocket connection, so it runs on any machine with Claude Code installed.
