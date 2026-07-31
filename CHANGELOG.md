@@ -2,6 +2,15 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.1] - 2026-07-31
+
+### 修复
+- **升级后旧配置导致长任务被误杀**：v1.3.0 把 `CLAUDE_TIMEOUT_MS` 的语义从「硬超时」改为「绝对上限」，
+  但老 `.env` 里常见的 `300000`（5 分钟）会让上限反而变得比空闲超时还短，长任务必然被杀
+  （实测：一个需要串行拉日程、审批、会话记录的周报任务每次都在 5 分钟被终止）。
+  现在启动时自检：若绝对上限小于空闲超时，打印明确告警并自动提升到合理值。
+  **升级建议**：把 `.env` 里的 `CLAUDE_TIMEOUT_MS` 改为 `3600000`，并增加 `CLAUDE_IDLE_TIMEOUT_MS=600000`。
+
 ## [1.3.0] - 2026-07-26
 
 对照 GitHub 同类项目（ofoxai/lark-claude-bot、Kirafy123/feishu-claude-bot、yangwhale/CloseCrab）补齐的能力。
