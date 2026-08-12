@@ -1,6 +1,6 @@
 # feishu-claude-bridge
 
-[![version](https://img.shields.io/badge/version-1.4.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![version](https://img.shields.io/badge/version-1.5.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **中文** | [English](README.en.md)
 
@@ -21,6 +21,7 @@
 - 🛡️ **出站脱敏**：回复送出前抹掉密钥、令牌、JWT 与内网 IP
 - 🔊 **语音回复**：`/voice` 开启后回答附带语音消息
 - 🩺 **定时任务自诊断**：任务失败自动分析原因并给出建议动作
+- 🧷 **压缩前固化记忆**：上下文接近上限时自动提醒机器人把该留的写进 `memory/`，避免自动压缩后细节流失
 - 🔀 **模型随时切换**：`/model fable high` 一句话切换模型与思考档，立即生效无需重启；也可设定时自动切换（如早八点切回便宜档）
 - 📄 **飞书文档 / 多维表格读写**：内置 MCP 工具（读文档、追加段落、多维表格查表/读记录/增改记录）；用**机器人应用自己的租户权限**，能碰什么由飞书后台 scope 精确控制，仅 owner 可用
 - 🖼️ **回传图片与文件**：机器人写进 `workspace/outbox/` 的文件自动上传发送（图片可直接预览）

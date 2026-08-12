@@ -38,6 +38,7 @@ NON_OWNER_TOOLS=WebSearch,WebFetch                # 其他成员可用工具
 CLAUDE_MODEL=                                     # 留空=默认；可填 haiku/sonnet/opus
 CLAUDE_TIMEOUT_MS=3600000       # 绝对上限（默认 60 分钟）
 CLAUDE_IDLE_TIMEOUT_MS=600000   # 静默多久判定卡死（默认 10 分钟，有输出即续命）
+CONTEXT_NUDGE_TOKENS=850000     # 上下文超过该值时提醒机器人固化记忆；0=关闭
 TTS_VOICE=Tingting              # /voice 语音回复音色（macOS say）
 CLAUDE_EFFORT=          # 思考深度 low/medium/high/xhigh/max，留空=默认
 FFMPEG_BIN=             # 语音转写用；建议填绝对路径，如 /opt/homebrew/bin/ffmpeg
@@ -240,6 +241,24 @@ export function setRuntimeConfig({ model, effort } = {}) {
   if (Object.keys(updates).length) patchEnvFile(updates);
   return getRuntimeConfig();
 }
+// 上下文接近压缩点时提醒机器人先固化记忆的阈值（0 = 关闭）
+const CONTEXT_NUDGE_TOKENS = Number(process.env.CONTEXT_NUDGE_TOKENS ?? 850_000);
+const contextSize = new Map();  // chatId → 最近一轮喂入的上下文规模
+const nudgePending = new Set(); // 待注入提醒的会话
+
+export function getContextTokens(chatId) {
+  return contextSize.get(chatId) ?? 0;
+}
+export function getNudgeThreshold() {
+  return CONTEXT_NUDGE_TOKENS;
+}
+// 有待提醒则返回 true 并清位（取走即消费，保证只注入一次）
+export function consumeMemoryNudge(chatId) {
+  if (!nudgePending.has(chatId)) return false;
+  nudgePending.delete(chatId);
+  return true;
+}
+
 // 飞书文档/多维表格工具开关（默认开；仅 owner 生效，权限由飞书后台 scope 决定）
 const FEISHU_TOOLS = process.env.FEISHU_TOOLS !== 'false';
 
@@ -277,6 +296,7 @@ export function sessionInfo(chatId, isOwner = false) {
     `- 你的身份: ${isOwner ? 'owner' : '普通成员'}`,
     `- 模型: ${CLAUDE_MODEL || '（CLI 默认）'}`,
     `- 思考深度: ${CLAUDE_EFFORT || '（CLI 默认）'}`,
+    `- 上下文: ${(contextSize.get(chatId) ?? 0).toLocaleString()} tokens${CONTEXT_NUDGE_TOKENS > 0 ? ` / 固化提醒阈值 ${CONTEXT_NUDGE_TOKENS.toLocaleString()}` : ''}`,
     `- 允许工具: ${tools || '（无）'}`,
   ].join('\n');
 }
@@ -410,6 +430,17 @@ export function runClaude(chatId, prompt, isOwner = false, extraTools = [], onPr
         if (d.session_id) {
           sessions[chatId] = d.session_id;
           saveSessions(sessions);
+        }
+        // 记录本轮喂入的上下文规模；接近压缩点则置位，下一轮提醒固化记忆
+        const u = d.usage ?? {};
+        const ctx =
+          (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+        if (ctx > 0) {
+          contextSize.set(chatId, ctx);
+          if (CONTEXT_NUDGE_TOKENS > 0 && ctx >= CONTEXT_NUDGE_TOKENS) {
+            nudgePending.add(chatId);
+            console.log(`[context] ${chatId} 上下文 ${ctx.toLocaleString()} ≥ 阈值，下一轮将提醒固化记忆`);
+          }
         }
         if (d.is_error) {
           finalErr = new Error(String(d.result ?? 'unknown error').slice(0, 500));
@@ -654,7 +685,7 @@ export async function buildPrompt(client, message, workspaceDir) {
 import 'dotenv/config';
 import * as lark from '@larksuiteoapi/node-sdk';
 import path from 'node:path';
-import { runClaude, resetSession, sessionInfo, WORKSPACE_DIR, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS } from './claude.js';
+import { runClaude, resetSession, sessionInfo, WORKSPACE_DIR, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge } from './claude.js';
 import { buildPrompt } from './messages.js';
 import { loadOwner, saveOwner } from './store.js';
 import { startScheduler } from './scheduler.js';
@@ -922,6 +953,15 @@ async function handleMessage(data) {
   if (message.chat_type !== 'p2p') {
     const name = await resolveSenderName(client, senderOpenId);
     if (name) prompt = `[群成员 ${name}]：${text}`;
+  }
+
+  // 上下文接近压缩点：提醒机器人先固化记忆（仅 owner——只有 owner 有 memory 写权限）
+  if (isOwner && consumeMemoryNudge(message.chat_id)) {
+    prompt +=
+      '\n\n（系统提示：本会话上下文接近上限，即将被自动压缩。压缩只影响对话历史，不影响 memory/ 文件。' +
+      '请先检查这段对话里有哪些值得长期保留的事实、决定、偏好还没写进 memory/，有就现在写入并更新 MEMORY.md 索引；' +
+      '没有就忽略本提示，正常回答用户的问题。不要因为这条提示改变回答的语气或结构。）';
+    console.log(`[context] 已向 ${message.chat_id} 注入固化记忆提醒`);
   }
 
   enqueue(message.chat_id, async () => {

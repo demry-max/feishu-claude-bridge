@@ -1,6 +1,6 @@
 # feishu-claude-bridge
 
-[![version](https://img.shields.io/badge/version-1.4.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![version](https://img.shields.io/badge/version-1.5.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [中文](README.md) | **English**
 
@@ -16,6 +16,7 @@ Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-
 - 📲 **App created by scanning a QR code**: `npm run register` uses Feishu's official app-registration OAuth flow — one scan auto-creates the app, writes credentials to `.env`, and registers you as owner
 - 🧠 **Session memory**: each Feishu chat maps to one Claude session (`--resume`), valid across days; `/new` to reset, `/status` to inspect
 - ⏰ **Scheduled tasks (the bot schedules itself)**: say "remind me every weekday at 8" and it writes a job definition into `workspace/schedules/`; the bridge fires it on time and pushes the result proactively. Supports cron expressions and one-shot times. **The bot never gets Bash/shell access** — it only writes job definitions in a whitelisted directory; execution stays with the bridge
+- 🧷 **Persist memory before compaction**: nudges the bot to write durable facts into `memory/` before Claude Code auto-compacts the history
 - 🔀 **Switch models on the fly**: `/model fable high` changes model and thinking effort instantly — no restart — and jobs can switch automatically on a schedule
 - 📄 **Feishu Docs / Bitable read & write**: built-in MCP tools (read a doc, append paragraphs, list tables/fields, read and write Bitable records) using the **bot app's own tenant permissions** — what it can touch is governed by the scopes you enable; owner-only
 - 🖼️ **Send images and files back**: anything the bot writes into `workspace/outbox/` is uploaded and sent automatically (images preview inline)
