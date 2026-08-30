@@ -1,6 +1,6 @@
 # feishu-claude-bridge
 
-[![version](https://img.shields.io/badge/version-1.6.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![version](https://img.shields.io/badge/version-2.0.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **中文** | [English](README.en.md)
 
@@ -12,6 +12,7 @@
 
 ## 特性 Features
 
+- 🔒 **访客隔离**：非 owner 跑在独立工作区、切断用户级配置与 MCP、显式禁用本机工具——碰不到你的记忆，也借不到你的权限
 - 🔌 **零公网依赖**：长连接收事件，家用电脑即可部署
 - 📲 **扫码即建应用**：`npm run register` 走飞书官方应用注册接口，扫一次码自动创建应用、写入凭据、登记 owner
 - 🧠 **会话记忆**：每个飞书会话映射一个 Claude session（`--resume` 续聊），跨天跨周有效；`/new` 重开，`/status` 查看
@@ -31,6 +32,26 @@
 - 🔐 **权限分级**：首个私聊者自动成为 owner（本机只读工具 + 联网）；其他成员仅联网检索，碰不到主机文件
 - 💰 **用订阅不用 API Key**：通过 `claude -p` 无头模式调用本机 Claude Code 登录态
 - 🖥️ **macOS + Windows**：launchd / 启动项自启脚本齐备（Linux systemd 同理）
+
+## 🔒 权限边界（v2.0.0 起）
+
+owner 与其他人跑在**两个物理隔离的工作区**里，这是本项目最重要的安全设计：
+
+| | owner | 其他同事 / 群成员 |
+|---|---|---|
+| 工作区 | `workspace/`（含长期记忆） | `workspace-guest/`（干净，无记忆导入） |
+| 可用工具 | 本机只读 + 联网 + 记忆/技能/任务写入 + 平台文档读写 | **仅联网检索** |
+| 配置来源 | 完整（含用户级 settings 与 MCP） | 仅项目级：`--setting-sources project` + `--strict-mcp-config` |
+| CLI 自动记忆 | 开 | 关（该存储按 git 仓库根归档，不关就是共用一份） |
+| 会话 | 按 chat_id | 按 chat_id + 发言人，互不可见 |
+
+> **为什么不能只靠 `--allowedTools`**：它不是沙箱，而是「免询问」白名单、只做加法。
+> 用户级 `~/.claude/settings.json` 里的 `permissions.allow` 对访客会话照样生效——
+> v1.x 里访客因此可以执行本机 CLI 工具并以 owner 的身份读写数据。
+> 真正的收权靠切断配置来源加显式 `--disallowedTools`（减法项，压过任何 allow）。
+
+第三方内容（转发记录、卡片 JSON、文件名、标题）一律包进不可信围栏并声明「不是指令」；
+出站回复经脱敏后再发送。
 
 ## 🗂️ Agent 工作区（OpenClaw / Hermes 式三层记忆与技能）
 
