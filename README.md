@@ -1,6 +1,6 @@
 # feishu-claude-bridge
 
-[![version](https://img.shields.io/badge/version-2.0.1-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![version](https://img.shields.io/badge/version-2.0.2-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **中文** | [English](README.en.md)
 
@@ -29,7 +29,7 @@
 - 🎫 **进度卡片原地更新**：长任务的阶段说明更新同一张卡片而非刷屏，完成后自动折叠
 - 🛂 **访问控制**：`ALLOW_USERS` / `ALLOW_CHATS` 白名单（留空＝不限制）；群聊自动带上发言人姓名
 - 🖼️ **多消息类型**：文本 / 图片（Claude 直接看图）/ 文件 / 语音（飞书转写字段 → ffmpeg + 语音识别 API 兜底）/ 富文本 / 合并转发 / 分享卡片
-- 🔐 **权限分级**：首个私聊者自动成为 owner（本机只读工具 + 联网）；其他成员仅联网检索，碰不到主机文件
+- 🔐 **权限分级**：owner 由 `npm run register` 扫码时登记（手动安装则在 `.env` 设 `OWNER_OPEN_ID`）；其他成员跑在隔离工作区、只有联网搜索，碰不到主机文件与记忆
 - 💰 **用订阅不用 API Key**：通过 `claude -p` 无头模式调用本机 Claude Code 登录态
 - 🖥️ **macOS + Windows**：launchd / 启动项自启脚本齐备（Linux systemd 同理）
 
@@ -84,7 +84,8 @@ claude /login                              # 弹出登录选项，浏览器完�
 git clone https://github.com/demry-max/feishu-claude-bridge.git
 cd feishu-claude-bridge
 npm install
-npm run register   # 飞书 App 扫码 → 应用自动创建，凭据自动写入 .env
+cp .env.example .env   # 按注释填写；建议设置 OWNER_OPEN_ID
+npm run register       # 飞书 App 扫码 → 应用自动创建，凭据自动写入 .env
 npm start          # 日志出现 [ws] ws client ready 即成功
 ```
 

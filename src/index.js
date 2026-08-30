@@ -4,10 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runClaude, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession } from './claude.js';
 import { buildPrompt, cleanIncoming } from './messages.js';
-import { loadOwner, saveOwner } from './store.js';
+import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
 import { CronExpressionParser } from 'cron-parser';
-import { createProgressChannel, flushOutbox, resolveSenderName, redact, sendVoice } from './outbound.js';
+import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 
 const APP_ID = process.env.FEISHU_APP_ID;
@@ -54,12 +54,37 @@ setInterval(() => {
 // 退出前先给正在跑的子进程一点收尾时间，并对连环重启加阻尼：
 // 裸 exit(1) 配 launchd ThrottleInterval=10，遇到持续性故障就是每天 8640 次重启
 // 外加 8640 条飞书推送——比原来的「静默失聪」更糟。
+const BAIL_COUNT_FILE = path.join(DATA_DIR, 'bail-count.json');
+const BACKOFF_LADDER = [15_000, 60_000, 300_000, 900_000]; // 15s → 1m → 5m → 15m
+const startedAt = Date.now();
+
+// 连续失败次数跨重启累积：固定阻尼挡不住持续性故障，
+// 进程一起来就再死会形成稳定的高频重启 + 推送风暴
+function readBailCount() {
+  try {
+    const d = JSON.parse(fs.readFileSync(BAIL_COUNT_FILE, 'utf8'));
+    return Number(d?.n) || 0;
+  } catch { return 0; }
+}
+function bumpBailCount() {
+  const n = readBailCount() + 1;
+  try { fs.writeFileSync(BAIL_COUNT_FILE, JSON.stringify({ n, at: Date.now() })); } catch {}
+  return n;
+}
+// 稳定运行足够久即认为已恢复，清零阶梯
+setTimeout(() => {
+  try { fs.rmSync(BAIL_COUNT_FILE, { force: true }); } catch {}
+}, 5 * 60 * 1000).unref();
+
 let exiting = false;
 function bailOut(reason, delayMs = 0) {
   if (exiting) return;
   exiting = true;
-  console.error(`[exit] ${reason}`);
-  setTimeout(() => process.exit(1), delayMs).unref();
+  // 起来没多久就又要死＝持续故障，按阶梯拉长等待
+  const n = Date.now() - startedAt < 5 * 60 * 1000 ? bumpBailCount() : 1;
+  const wait = Math.max(delayMs, BACKOFF_LADDER[Math.min(n - 1, BACKOFF_LADDER.length - 1)]);
+  console.error(`[exit] ${reason}（第 ${n} 次连续失败，${Math.round(wait / 1000)}s 后退出）`);
+  setTimeout(() => process.exit(1), wait).unref();
 }
 
 // 进程级兜底：宁可重启，也不要带病静默运行（事件回调里的异常会直冲 uncaughtException）
@@ -278,7 +303,7 @@ async function handleMessage(data) {
 
   if (text === '/new') {
     resetSession(sessionKey);
-    if (isRunning(sessionKey)) cancelRun(sessionKey); // 否则旧任务收尾时会把会话写回来
+    if (isRunning(sessionKey)) { cancelRun(sessionKey); abortRetries(sessionKey); } // 否则旧任务收尾时会把会话写回来
     // 群里 owner 的 /new 一并清掉访客那条共用会话（访客自己在群里无权重置）
     if (isOwner && message.chat_type !== 'p2p') {
       for (const k of sessionKeysWithPrefix(`guest:${message.chat_id}:`)) {
@@ -383,6 +408,7 @@ async function handleMessage(data) {
       return;
     }
     cancelRun(sessionKey);
+    abortRetries(sessionKey); // 退避等待中没有子进程，但重试仍会发生
     prompt = extra; // 会话通过 --resume 保留，直接以新要求继续
   }
 
@@ -436,6 +462,10 @@ async function handleMessage(data) {
     } catch (e) {
       // 无论取消还是失败，都要把进度卡收尾，否则它永远停在「🔄 处理中」
       await progress.finish(e?.cancelled ? 'cancelled' : 'failed').catch(() => {});
+      // 失败轮里模型可能已经写了文件；不清掉会挂到下一次成功回答上一起发出
+      await flushOutbox(client, outboxDirFor(sessionKey, isOwner), (data) =>
+        client.im.v1.message.reply({ path: { message_id: message.message_id }, data })
+      ).catch(() => {});
       if (e?.cancelled) return; // /cancel 主动终止，不报错
       console.error('[claude]', e);
       const msg = String(e.message ?? e);
@@ -475,7 +505,7 @@ async function sendToChat(chatId, text) {
 }
 
 const SCHEDULES_DIR = path.join(WORKSPACE_DIR, 'schedules');
-const SCHED_STATE_FILE = path.join(WORKSPACE_DIR, '..', 'data', 'schedule-state.json');
+const SCHED_STATE_FILE = path.join(DATA_DIR, 'schedule-state.json');
 
 // 下次触发时间：/help 承诺了「上次/下次」，此前只实现了上次
 function nextFireAt(job) {
@@ -484,7 +514,9 @@ function nextFireAt(job) {
   if (!when) return null;
   try {
     if (!when.startsWith('@') && !when.includes(' ')) {
-      const t = new Date(when); // 一次性任务，本地时区
+      // 纯日期（2026-09-01）会被按 UTC 解析，补上时间部分强制走本地时区
+      const norm = /^\d{4}-\d{2}-\d{2}$/.test(when) ? `${when}T00:00` : when;
+      const t = new Date(norm); // 一次性任务，本地时区
       return !isNaN(t) && t > new Date() ? t : null;
     }
     return CronExpressionParser.parse(when, { currentDate: new Date() }).next().toDate();
@@ -495,8 +527,9 @@ function nextFireAt(job) {
 
 // /tasks：直读任务定义与触发状态，让 owner 随时能确认「它到底还在不在替我干活」
 function describeTasks() {
+  let state = {};
+  try { state = JSON.parse(fs.readFileSync(SCHED_STATE_FILE, 'utf8')); } catch { /* 尚未产生状态 */ }
   try {
-    const state = JSON.parse(fs.readFileSync(SCHED_STATE_FILE, 'utf8'));
     const files = fs.existsSync(SCHEDULES_DIR)
       ? fs.readdirSync(SCHEDULES_DIR).filter((f) => f.endsWith('.json') && !f.startsWith('._'))
       : [];
@@ -528,7 +561,7 @@ function describeTasks() {
 }
 
 // 启动通知：进程崩溃/重启此前完全静默，owner 无从知道自己发的消息其实没人接
-const STARTUP_STAMP = path.join(WORKSPACE_DIR, '..', 'data', 'last-startup-notice');
+const STARTUP_STAMP = path.join(DATA_DIR, 'last-startup-notice');
 async function announceStartup() {
   const owner = OWNER_OPEN_ID || loadOwner();
   if (!owner || process.env.STARTUP_NOTICE === 'false') return;
@@ -643,6 +676,10 @@ startScheduler({
     }
   },
 });
+
+// v1.x 遗留在 outbox 根目录的文件：归拢待处理，不会误发给任何人
+migrateLegacyOutbox(path.join(WORKSPACE_DIR, 'outbox'));
+migrateLegacyOutbox(path.join(GUEST_WORKSPACE_DIR, 'outbox'));
 
 // 附件目录只进不出会一直涨（实测累积到 24MB），启动时与每天各清一次
 cleanIncoming(WORKSPACE_DIR);

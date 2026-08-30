@@ -16,7 +16,7 @@
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ThrottleInterval</key><integer>60</integer>
   <key>StandardOutPath</key><string>/Users/USERNAME/Library/Logs/feishu-claude-bridge.log</string>
   <key>StandardErrorPath</key><string>/Users/USERNAME/Library/Logs/feishu-claude-bridge.log</string>
 </dict>
