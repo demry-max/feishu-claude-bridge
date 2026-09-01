@@ -692,3 +692,23 @@ setInterval(() => {
 console.log('启动飞书长连接…');
 wsClient.start({ eventDispatcher });
 announceStartup();
+
+// 启动时打印真正生效的配置：dotenv 不会覆盖已存在的环境变量，
+// 若在 shell 里 export 过 CLAUDE_MODEL/CLAUDE_EFFORT 再手动启动，.env 会被静默忽略
+{
+  const cfg = getRuntimeConfig();
+  const shadowed = ['CLAUDE_MODEL', 'CLAUDE_EFFORT', 'GUEST_TOOLS', 'OWNER_OPEN_ID']
+    .filter((k) => {
+      try {
+        const line = fs.readFileSync(path.resolve(process.cwd(), '.env'), 'utf8')
+          .split('\n').find((l) => l.startsWith(`${k}=`));
+        const inFile = line ? line.slice(k.length + 1).replace(/\s+#.*$/, '').trim() : null;
+        return inFile && process.env[k] && process.env[k] !== inFile;
+      } catch { return false; }
+    });
+  console.log(`[config] 生效配置：模型=${cfg.model || 'CLI 默认'} 思考档=${cfg.effort || 'CLI 默认'}`);
+  if (shadowed.length) {
+    console.error(`[config] ⚠️ 以下变量被 shell 环境覆盖，.env 里的值未生效：${shadowed.join(', ')}`);
+  }
+}
+
