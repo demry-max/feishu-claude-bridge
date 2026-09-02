@@ -2,7 +2,7 @@ import 'dotenv/config';
 import * as lark from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runClaude, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession } from './claude.js';
+import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession } from './claude.js';
 import { buildPrompt, cleanIncoming } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
@@ -354,6 +354,15 @@ async function handleMessage(data) {
     try {
       // 第一个参数若是思考档，则只改档位
       const first = args[0].toLowerCase();
+      if (!EFFORT_LEVELS.includes(first)) {
+        // 切换前先确认本机 CLI 跑得动这个模型，否则会切成功、然后每条消息都失败
+        const resolved = MODEL_ALIASES[first] ?? args[0];
+        const pre = checkCliEnvironment(resolved);
+        if (pre.problem) {
+          await reply(message.message_id, `⚠️ 未切换：${pre.problem}`);
+          return;
+        }
+      }
       const next = EFFORT_LEVELS.includes(first)
         ? setRuntimeConfig({ effort: first })
         : setRuntimeConfig({ model: args[0], effort: args[1] });
@@ -562,6 +571,8 @@ function describeTasks() {
 
 // 启动通知：进程崩溃/重启此前完全静默，owner 无从知道自己发的消息其实没人接
 const STARTUP_STAMP = path.join(DATA_DIR, 'last-startup-notice');
+let cliProblem = null; // 启动自检发现的 CLI 问题，随启动通知发给 owner
+
 async function announceStartup() {
   const owner = OWNER_OPEN_ID || loadOwner();
   if (!owner || process.env.STARTUP_NOTICE === 'false') return;
@@ -581,7 +592,9 @@ async function announceStartup() {
         receive_id: owner,
         msg_type: 'text',
         content: JSON.stringify({
-          text: `🤖 桥接已启动（${new Date().toLocaleString('zh-CN')}）。若此前发过消息没收到回复，请重发一次。`,
+          text:
+            `🤖 桥接已启动（${new Date().toLocaleString('zh-CN')}）。若此前发过消息没收到回复，请重发一次。` +
+            (cliProblem ? `\n\n⚠️ 启动自检发现问题，现在发消息会失败：\n${cliProblem}` : ''),
         }),
       },
     });
@@ -707,6 +720,14 @@ announceStartup();
       } catch { return false; }
     });
   console.log(`[config] 生效配置：模型=${cfg.model || 'CLI 默认'} 思考档=${cfg.effort || 'CLI 默认'}`);
+  // 桥接实际会调用哪个 claude、版本够不够跑当前模型——本机可能装了多份，
+  // PATH 里靠前的那份才生效，这正是 2026-09-02 每条消息报 400 的原因
+  const cli = checkCliEnvironment(cfg.model);
+  console.log(`[config] claude CLI：${cli.bin} (${cli.version ?? '版本未知'})`);
+  if (cli.problem) {
+    console.error(`[config] ⚠️ ${cli.problem}`);
+    cliProblem = cli.problem; // 启动通知里一并告知 owner
+  }
   if (shadowed.length) {
     console.error(`[config] ⚠️ 以下变量被 shell 环境覆盖，.env 里的值未生效：${shadowed.join(', ')}`);
   }
