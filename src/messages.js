@@ -191,7 +191,65 @@ function walkPost(content) {
  * 把一条飞书消息转成给 Claude 的提示词。
  * 返回 { prompt, attachments }；attachments 非空时需要给 Claude 开 Read(./incoming/**) 权限。
  */
-export async function buildPrompt(client, message, workspaceDir) {
+/**
+ * 拉取被引用（回复）的那条消息，作为上下文一并交给模型。
+ *
+ * 飞书的「回复」把被引用内容放在 parent_id 指向的另一条消息上，事件里只带 id。
+ * 不处理它的话，用户引用一份文档说「读一读」，机器人看到的只有「读一读」三个字，
+ * 只能回一句「你没给我链接」——用户却以为自己给了。
+ *
+ * 只向上取一层：引用链可以很长，取多了既费 token 又容易把无关内容拖进来。
+ */
+async function fetchQuoted(client, message, workspaceDir, senderOpenId) {
+  const parentId = message.parent_id;
+  if (!parentId) return null;
+  try {
+    const res = await withRetry('quote', () =>
+      client.im.v1.message.get({ path: { message_id: parentId } })
+    );
+    const item = (res?.data?.items ?? [])[0];
+    if (!item) return null;
+    // message.get 的形态与事件里的 message 不同（body.content / msg_type），转成同构对象后复用解析
+    const pseudo = {
+      message_id: item.message_id ?? parentId,
+      message_type: item.msg_type,
+      content: item.body?.content ?? '{}',
+      parent_id: undefined, // 只取一层，避免顺着引用链无限向上
+    };
+    const built = await buildPrompt(client, pseudo, workspaceDir);
+    if (!built?.prompt && !built?.attachments?.length) return null;
+    const quotedSender = item.sender?.id ?? item.sender_id?.open_id ?? null;
+    // 引用自己的消息＝用户自己提供的材料；引用别人的＝第三方内容，需要围栏
+    const isSelf = quotedSender && senderOpenId && quotedSender === senderOpenId;
+    return {
+      isSelf,
+      text: built.prompt ?? '',
+      attachments: built.attachments ?? [],
+      type: item.msg_type,
+    };
+  } catch (e) {
+    console.error('[quote] 拉取被引用消息失败:', e?.message ?? e?.code ?? e);
+    return null; // 取不到就当没有引用，正常处理本条消息
+  }
+}
+
+export async function buildPrompt(client, message, workspaceDir, senderOpenId = null) {
+  const quoted = await fetchQuoted(client, message, workspaceDir, senderOpenId);
+  const withQuote = (built) => {
+    if (!quoted) return built;
+    const head = quoted.isSelf
+      ? '（用户回复的是他此前发的这条消息，内容如下——这是他要你处理的材料）'
+      : '（用户引用了他人发的一条消息，内容如下）';
+    const body = quoted.isSelf
+      ? quoted.text
+      : fenceUntrusted('被引用的他人消息', quoted.text);
+    return {
+      ...built,
+      prompt: `${head}\n${body}\n\n（以上是被引用内容，以下是用户本次说的话）\n${built.prompt ?? ''}`,
+      attachments: [...(quoted.attachments ?? []), ...(built.attachments ?? [])],
+    };
+  };
+
   const type = message.message_type;
   const content = safeParse(message.content);
   const incomingDir = path.join(workspaceDir, 'incoming', message.message_id);
@@ -199,16 +257,16 @@ export async function buildPrompt(client, message, workspaceDir) {
 
   switch (type) {
     case 'text':
-      return { prompt: stripMentions(content.text), attachments: [] };
+      return withQuote({ prompt: stripMentions(content.text), attachments: [] });
 
     case 'image': {
       const p = await download(
         client, message.message_id, content.image_key, 'image', incomingDir, `${content.image_key}.png`
       );
-      return {
+      return withQuote({
         prompt: `用户发来一张图片，已保存为 ${rel(p)}。请用 Read 工具查看图片内容，然后回应用户。`,
         attachments: [p],
-      };
+      });
     }
 
     case 'file': {
@@ -218,13 +276,13 @@ export async function buildPrompt(client, message, workspaceDir) {
       const p = await download(
         client, message.message_id, content.file_key, 'file', incomingDir, name
       );
-      return {
+      return withQuote({
         prompt: `用户发来一个文件，已保存为 ${rel(p)}。\n\n${fenceUntrusted(
           '发送方提供的文件名',
           shownName
         )}\n\n请用 Read 工具查看文件内容，然后回应用户。`,
         attachments: [p],
-      };
+      });
     }
 
     case 'post': {
@@ -246,7 +304,7 @@ export async function buildPrompt(client, message, workspaceDir) {
           .map(rel)
           .join('、')}。请用 Read 工具查看后一并回应。）`;
       }
-      return { prompt, attachments };
+      return withQuote({ prompt, attachments });
     }
 
     case 'merge_forward': {
@@ -263,10 +321,10 @@ export async function buildPrompt(client, message, workspaceDir) {
         else if (item.msg_type === 'post') lines.push(walkPost(body).text);
         else lines.push(`[${item.msg_type} 消息]`);
       }
-      return {
+      return withQuote({
         prompt: `用户转发了一组聊天记录。\n\n${fenceUntrusted('飞书转发的聊天记录', lines.join('\n'))}\n\n请理解上述记录后回应用户。`,
         attachments: [],
-      };
+      });
     }
 
     case 'audio': {
@@ -303,12 +361,12 @@ export async function buildPrompt(client, message, workspaceDir) {
 
     default:
       // 分享卡片/邮件卡片等：把原始 JSON 交给 Claude 理解
-      return {
+      return withQuote({
         prompt: `用户发来一条「${type}」类型的飞书消息。\n\n${fenceUntrusted(
           `飞书 ${type} 消息的原始 JSON`,
           String(message.content).slice(0, 6000)
         )}\n\n请从中提取有用信息，理解后回应用户。`,
         attachments: [],
-      };
+      });
   }
 }

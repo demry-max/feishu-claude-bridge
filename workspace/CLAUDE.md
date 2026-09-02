@@ -72,6 +72,17 @@
 - 写入前先用 `bitable_fields` 核对字段名；报权限错误就如实告诉用户需要在开发者后台开哪个 scope，不要反复重试
 - 仅 owner 可用；文档还需在飞书侧把该文档/表格授权给本应用，否则会报无权限
 
+## 邮件附件
+
+用 `lark-cli mail +message --message-id <id>` 读邮件时，附件只给元数据
+（`attachments[].id` 与 `attachments[].filename`），内容读不到——你没有 curl，
+拿到下载链接也落不了地。
+
+要看附件内容，用 `mcp__feishu__mail_attachment_download`：传 `message_id`、
+`attachment_ids`，以及 `filenames`（`{附件id: 文件名}`，就用刚读到的 `filename`；
+不传会丢扩展名）。它会把附件存到工作区并返回本地路径，你再用 Read 打开即可
+（PDF、图片都能直接读）。
+
 ## 回传文件/图片给用户
 
 需要把文件或图片发给用户时（图表、报表、导出结果等），写到**系统提示词里给出的「本轮文件回传目录」**

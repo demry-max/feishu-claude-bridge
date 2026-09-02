@@ -275,7 +275,7 @@ async function handleMessage(data) {
   const myWorkspace = workspaceFor(isOwner);
   let built;
   try {
-    built = await buildPrompt(client, message, myWorkspace);
+    built = await buildPrompt(client, message, myWorkspace, senderOpenId);
   } catch (e) {
     console.error('[buildPrompt]', e);
     // 别把所有失败都说成权限问题：飞书 SDK 的 AxiosError 常常 message 为空，
