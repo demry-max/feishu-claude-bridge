@@ -3,7 +3,7 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession } from './claude.js';
-import { buildPrompt, cleanIncoming } from './messages.js';
+import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
 import { CronExpressionParser } from 'cron-parser';
@@ -278,9 +278,12 @@ async function handleMessage(data) {
     built = await buildPrompt(client, message, myWorkspace);
   } catch (e) {
     console.error('[buildPrompt]', e);
+    // 别把所有失败都说成权限问题：飞书 SDK 的 AxiosError 常常 message 为空，
+    // 早先的提示会渲染成「处理该消息失败：」后面一片空白，还附带一句误导性的权限建议
+    const d = describeError(e);
     await reply(
       message.message_id,
-      `⚠️ 处理该消息失败：${e?.message ?? e}\n（若是图片/文件，请确认应用已开通 im:resource 权限并发布版本）`
+      `⚠️ 处理该消息失败：${d.text}${d.hint ? `\n${d.hint}` : ''}`
     );
     return;
   }

@@ -37,6 +37,60 @@ async function feishuAsr(client, audioPath) {
   return String(res?.recognition_text ?? res?.data?.recognition_text ?? '').trim();
 }
 
+// 瞬时网络故障：附件下载是幂等的，抖一下就该自己重试，
+// 而不是把「EHOSTUNREACH」变成用户面前的一句「处理失败」
+const TRANSIENT = /EHOSTUNREACH|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network|timeout/i;
+export function isTransientNetworkError(e) {
+  const code = e?.code ?? e?.errno ?? '';
+  const msg = String(e?.message ?? '');
+  return TRANSIENT.test(String(code)) || TRANSIENT.test(msg);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 网络类失败重试（默认 2 次，退避 1s/3s）；非网络错误立即抛出，不做无谓重试 */
+async function withRetry(label, fn, attempts = 2) {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (i >= attempts || !isTransientNetworkError(e)) throw e;
+      const wait = [1000, 3000][i] ?? 3000;
+      console.log(`[${label}] 网络失败（${e?.code ?? e?.message}），${wait / 1000}s 后重试（${i + 1}/${attempts}）`);
+      await sleep(wait);
+    }
+  }
+}
+
+/**
+ * 从错误里提取「人能看懂且能据此行动」的描述。
+ * 飞书 SDK 的 AxiosError 常常 message 为空，直接 ?? 出来是一片空白——
+ * 用户看到的就是「处理该消息失败：」后面什么都没有。
+ */
+export function describeError(e) {
+  const code = e?.code ?? e?.errno;
+  const apiCode = e?.response?.data?.code ?? e?.response?.data?.error?.code;
+  const apiMsg = e?.response?.data?.msg ?? e?.response?.data?.error?.message;
+  const status = e?.response?.status;
+  const msg = String(e?.message ?? '').trim();
+
+  if (isTransientNetworkError(e)) {
+    return {
+      kind: 'network',
+      text: `网络暂时不可达（${code || msg || '连接失败'}）`,
+      hint: '这通常是临时的，请重发一次。',
+    };
+  }
+  if (apiCode || status === 403 || status === 401) {
+    return {
+      kind: 'permission',
+      text: `飞书接口返回错误${apiCode ? ` ${apiCode}` : ''}${apiMsg ? `：${apiMsg}` : status ? `（HTTP ${status}）` : ''}`,
+      hint: '若是图片/文件，请确认应用已开通 im:resource 权限并发布版本。',
+    };
+  }
+  return { kind: 'unknown', text: msg || code || String(e).slice(0, 200) || '未知错误', hint: '' };
+}
+
 function safeParse(json) {
   try {
     return JSON.parse(json);
@@ -105,12 +159,14 @@ function stripMentions(text) {
 async function download(client, messageId, fileKey, type, incomingDir, fileName) {
   fs.mkdirSync(incomingDir, { recursive: true });
   const dest = path.join(incomingDir, path.basename(fileName));
-  const res = await client.im.v1.messageResource.get({
-    path: { message_id: messageId, file_key: fileKey },
-    params: { type },
+  return withRetry('download', async () => {
+    const res = await client.im.v1.messageResource.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type },
+    });
+    await res.writeFile(dest);
+    return dest;
   });
-  await res.writeFile(dest);
-  return dest;
 }
 
 // 从 post 富文本节点树提取文字与图片 key
@@ -195,7 +251,9 @@ export async function buildPrompt(client, message, workspaceDir) {
 
     case 'merge_forward': {
       // 合并转发：拉取子消息逐条拼接
-      const res = await client.im.v1.message.get({ path: { message_id: message.message_id } });
+      const res = await withRetry('merge_forward', () =>
+        client.im.v1.message.get({ path: { message_id: message.message_id } })
+      );
       const items = res?.data?.items ?? [];
       const lines = [];
       for (const item of items) {
