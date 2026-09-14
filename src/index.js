@@ -2,13 +2,14 @@ import 'dotenv/config';
 import * as lark from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession } from './claude.js';
+import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession, routeTurn } from './claude.js';
 import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice } from './outbound.js';
 import { recallHint } from './memory-recall.js';
+import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -119,6 +120,8 @@ const HELP_TEXT = [
   '- `/redirect <新要求>` 中断当前任务并按新要求重来',
   '- `/voice` 切换语音回复（回答附带一条语音）',
   '- `/model [模型] [思考档]` 查看或切换模型，如 `/model fable high`（仅 owner）',
+  '- `/model exec <模型|off>` 设置执行模型，如 `/model exec sonnet`（仅 owner）',
+  '- `/do <任务>` 用执行模型跑这一轮；说「执行」「去做」也一样，会话上下文保留',
   '- `/tasks` 查看定时任务：上次/下次触发时间（仅 owner）',
   '',
   '**能做什么**',
@@ -344,14 +347,43 @@ async function handleMessage(data) {
       await reply(
         message.message_id,
         [
-          `**当前模型**：\`${cur.model || '（CLI 默认）'}\``,
+          `**聊天/规划模型**：\`${cur.model || '（CLI 默认）'}\``,
           `**思考深度**：\`${cur.effort || '（CLI 默认）'}\``,
+          `**执行模型**：\`${cur.execModel || '（未设，执行也用上面的模型）'}\`` +
+            (cur.execModel ? `（思考深度 \`${cur.execEffort || cur.effort || 'CLI 默认'}\`）` : ''),
           '',
           `用法：\`/model <模型> [思考档]\`，例如 \`/model fable high\``,
+          `执行模型：\`/model exec <模型|off> [思考档]\`，例如 \`/model exec sonnet\``,
           `可用简称：${Object.keys(MODEL_ALIASES).join(' / ')}（也可写完整模型名）`,
           `思考档：${EFFORT_LEVELS.join(' / ')}`,
         ].join('\n')
       );
+      return;
+    }
+    // /model exec <模型|off> [思考档]：只改执行车道，聊天模型不动
+    if (args[0].toLowerCase() === 'exec') {
+      if (!args[1]) {
+        await reply(message.message_id, '用法：`/model exec <模型|off> [思考档]`，例如 `/model exec sonnet`');
+        return;
+      }
+      try {
+        if (!/^(off|none|无|关闭)$/i.test(args[1])) {
+          const pre = checkCliEnvironment(MODEL_ALIASES[args[1].toLowerCase()] ?? args[1]);
+          if (pre.problem) {
+            await reply(message.message_id, `⚠️ 未切换：${pre.problem}`);
+            return;
+          }
+        }
+        const next = setRuntimeConfig({ execModel: args[1], execEffort: args[2] });
+        await reply(
+          message.message_id,
+          next.execModel
+            ? `✅ 执行模型 \`${next.execModel}\`（思考深度 \`${next.execEffort || next.effort || 'CLI 默认'}\`）。说「执行」或发 \`/do <任务>\` 即走该模型；聊天/规划仍用 \`${next.model || 'CLI 默认'}\`。`
+            : `✅ 已关闭模型分工，所有轮次都用 \`${next.model || 'CLI 默认'}\`。`
+        );
+      } catch (e) {
+        await reply(message.message_id, `⚠️ ${e?.message ?? e}`);
+      }
       return;
     }
     try {
@@ -424,6 +456,12 @@ async function handleMessage(data) {
     prompt = extra; // 会话通过 --resume 保留，直接以新要求继续
   }
 
+  // 车道判定：/do、「执行」等触发词把这一轮切到执行模型（会话通过 --resume 保留，
+  // 执行模型看得见聊天模型刚谈妥的计划）。必须在 /redirect 之后判定，
+  // 这样 `/redirect 执行` 也能走执行车道。
+  const route = routeTurn(prompt);
+  prompt = route.prompt;
+
   // 群聊带上发言人姓名，机器人才知道是谁在说话。
   // 注意用 prompt 而不是 text——否则 /redirect 刚设好的新要求会被这里覆盖掉
   if (message.chat_type !== 'p2p') {
@@ -454,11 +492,11 @@ async function handleMessage(data) {
   }
 
   enqueue(sessionKey, async () => {
-    console.log(`[msg] ${isOwner ? 'owner' : senderOpenId} @ ${message.chat_type} [${message.message_type}]: ${text.slice(0, 80)}`);
+    console.log(`[msg] ${isOwner ? 'owner' : senderOpenId} @ ${message.chat_type} [${message.message_type}]${route.lane === 'exec' ? ' [exec]' : ''}: ${text.slice(0, 80)}`);
     await react(message.message_id, 'OnIt');
     const progress = createProgressChannel(client, message.message_id);
     try {
-      const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update);
+      const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });
       await progress.finish();
       await reply(message.message_id, answer || '（Claude 返回了空回复）');
       // 机器人写进本轮专属 outbox 的图片/文件随本轮一起回传
@@ -597,7 +635,8 @@ async function announceStartup() {
         content: JSON.stringify({
           text:
             `🤖 桥接已启动（${new Date().toLocaleString('zh-CN')}）。若此前发过消息没收到回复，请重发一次。` +
-            (cliProblem ? `\n\n⚠️ 启动自检发现问题，现在发消息会失败：\n${cliProblem}` : ''),
+            (cliProblem ? `\n\n⚠️ 启动自检发现问题，现在发消息会失败：\n${cliProblem}` : '') +
+            (scopeProblem ? `\n\n⚠️ ${scopeProblem}` : ''),
         }),
       },
     });
@@ -614,10 +653,14 @@ startScheduler({
     // 动作型任务：切换模型/思考档，不走 Claude 调用
     if (job.action === 'set-model') {
       try {
-        const next = setRuntimeConfig({ model: job.model, effort: job.effort });
-        console.log(`[sched] 已切换模型 → ${next.model} / ${next.effort}`);
+        // 任务可写 model/effort（聊天车道）与 exec_model/exec_effort（执行车道），各自可省略
+        const next = setRuntimeConfig({
+          model: job.model, effort: job.effort, execModel: job.exec_model, execEffort: job.exec_effort,
+        });
+        console.log(`[sched] 已切换模型 → ${next.model} / ${next.effort}（执行 ${next.execModel || '关'}）`);
         if (chatId) {
-          await sendToChat(chatId, `🔀 **${job.name ?? '定时切换'}**：模型 \`${next.model || 'CLI 默认'}\`，思考深度 \`${next.effort || 'CLI 默认'}\``);
+          await sendToChat(chatId, `🔀 **${job.name ?? '定时切换'}**：模型 \`${next.model || 'CLI 默认'}\`，思考深度 \`${next.effort || 'CLI 默认'}\`` +
+            (next.execModel ? `；执行模型 \`${next.execModel}\`` : ''));
         }
       } catch (e) {
         console.error('[sched] 切换模型失败:', e?.message ?? e);
@@ -707,7 +750,26 @@ setInterval(() => {
 
 console.log('启动飞书长连接…');
 wsClient.start({ eventDispatcher });
-announceStartup();
+
+// 飞书 scope 自检：register 创建的应用是零权限，文档/多维表格工具会静默失效。
+// 只读查询，失败不影响启动；结果并入启动通知，让 owner 在手机上就看到该去后台开哪些权限。
+let scopeProblem = null;
+async function scopeSelfCheck() {
+  if (process.env.FEISHU_TOOLS === 'false') return;
+  try {
+    const granted = await fetchGrantedScopes({ appId: APP_ID, appSecret: APP_SECRET, domain: process.env.FEISHU_DOMAIN });
+    const result = evaluateScopes(granted);
+    const report = formatScopeReport(result);
+    (result.ok ? console.log : console.error)(report);
+    if (!result.ok) {
+      scopeProblem =
+        `飞书工具有 ${result.unavailable.length} 个不可用（${result.unavailable.map((u) => u.tool).join('、')}）。` +
+        `请到开发者后台「权限管理 → 批量导入」开通：${result.missingScopes.join(' ')}，发布版本后重启。`;
+    }
+  } catch (e) {
+    console.error('[scope] 自检失败（不影响启动）：', e?.message ?? e);
+  }
+}
 
 // 启动时打印真正生效的配置：dotenv 不会覆盖已存在的环境变量，
 // 若在 shell 里 export 过 CLAUDE_MODEL/CLAUDE_EFFORT 再手动启动，.env 会被静默忽略
@@ -722,7 +784,8 @@ announceStartup();
         return inFile && process.env[k] && process.env[k] !== inFile;
       } catch { return false; }
     });
-  console.log(`[config] 生效配置：模型=${cfg.model || 'CLI 默认'} 思考档=${cfg.effort || 'CLI 默认'}`);
+  console.log(`[config] 生效配置：模型=${cfg.model || 'CLI 默认'} 思考档=${cfg.effort || 'CLI 默认'}` +
+    (cfg.execModel ? ` 执行模型=${cfg.execModel} 执行思考档=${cfg.execEffort || cfg.effort || 'CLI 默认'}` : ' 执行模型=（未分工）'));
   // 桥接实际会调用哪个 claude、版本够不够跑当前模型——本机可能装了多份，
   // PATH 里靠前的那份才生效，这正是 2026-09-02 每条消息报 400 的原因
   const cli = checkCliEnvironment(cfg.model);
@@ -731,8 +794,19 @@ announceStartup();
     console.error(`[config] ⚠️ ${cli.problem}`);
     cliProblem = cli.problem; // 启动通知里一并告知 owner
   }
+  // 执行模型也要过一遍版本要求，否则「执行」那一轮才报错
+  if (cfg.execModel) {
+    const cliExec = checkCliEnvironment(cfg.execModel);
+    if (cliExec.problem) {
+      console.error(`[config] ⚠️ 执行模型：${cliExec.problem}`);
+      cliProblem = [cliProblem, `执行模型：${cliExec.problem}`].filter(Boolean).join('\n');
+    }
+  }
   if (shadowed.length) {
     console.error(`[config] ⚠️ 以下变量被 shell 环境覆盖，.env 里的值未生效：${shadowed.join(', ')}`);
   }
 }
 
+// 启动通知放在全部自检之后：此前 announceStartup() 在 config 块之前调用，
+// cliProblem 在发通知那一刻永远是 null，「启动自检发现问题」那段文案从未真正发出过
+scopeSelfCheck().finally(() => announceStartup());

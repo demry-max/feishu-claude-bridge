@@ -5,6 +5,8 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { RECOMMENDED_SCOPES } from '../src/feishu-scopes.js';
+import { patchEnvFile } from '../src/env-file.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -23,19 +25,7 @@ async function post(body) {
   return res.json(); // pending/error 状态也带 JSON body
 }
 
-function upsertEnv(appId, appSecret) {
-  const envPath = path.join(ROOT, '.env');
-  let env = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-  const set = (key, val) => {
-    const line = `${key}=${val}`;
-    env = new RegExp(`^${key}=`, 'm').test(env)
-      ? env.replace(new RegExp(`^${key}=.*$`, 'm'), line)
-      : env + (env.endsWith('\n') || env === '' ? '' : '\n') + line + '\n';
-  };
-  set('FEISHU_APP_ID', appId);
-  set('FEISHU_APP_SECRET', appSecret);
-  fs.writeFileSync(envPath, env);
-}
+const ENV_PATH = path.join(ROOT, '.env');
 
 const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
@@ -78,8 +68,14 @@ while (Date.now() < deadline) {
     continue; // 网络抖动继续轮询
   }
   if (p.client_id && p.client_secret) {
-    upsertEnv(p.client_id, p.client_secret);
     const openId = p.user_info?.open_id;
+    // open_id 同时写进 .env：只写 data/owner.json 的话，盘故障/误删后 owner 身份就丢了，
+    // 而多数人不会自己再去把它复制进 OWNER_OPEN_ID
+    patchEnvFile(ENV_PATH, {
+      FEISHU_APP_ID: p.client_id,
+      FEISHU_APP_SECRET: p.client_secret,
+      ...(openId ? { OWNER_OPEN_ID: openId } : {}),
+    });
     if (openId) {
       const ownerPath = path.join(ROOT, 'data', 'owner.json');
       if (!fs.existsSync(ownerPath)) {
@@ -87,9 +83,16 @@ while (Date.now() < deadline) {
         fs.writeFileSync(ownerPath, JSON.stringify({ open_id: openId }, null, 2));
         console.log(`✅ 已将扫码人设为 owner（${openId}）`);
       }
+      console.log(`✅ OWNER_OPEN_ID=${openId} 已写入 .env`);
     }
     console.log(`✅ 应用创建成功：${p.client_id}，凭据已写入 .env`);
-    console.log('下一步：npm start 启动机器人，到飞书私聊它发「你好」。');
+    // 注册接口创建出来的应用是零权限状态：文档/多维表格/电子表格工具会静默失效，
+    // 而这一步只能在开发者后台手工做（接口不提供开通 scope 的能力）
+    console.log('\n⚠️ 还差一步（必须手工）：应用目前是零权限，飞书文档/多维表格/电子表格工具用不了。');
+    console.log('   开发者后台 https://open.feishu.cn/app → 该应用 → 权限管理 → 批量导入，粘贴：');
+    console.log('   ' + JSON.stringify({ scopes: { tenant: RECOMMENDED_SCOPES, user: [] } }));
+    console.log('   然后「创建版本」→ 发布。之后 npm start 的启动日志会自检并告诉你哪些工具已可用。');
+    console.log('\n下一步：npm start 启动机器人，到飞书私聊它发「你好」。');
     process.exit(0);
   }
   if (p.error === 'authorization_pending') continue;

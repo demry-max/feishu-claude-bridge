@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 参考用。推荐 `npm run install-service`：用当前 node、仓库目录与 which claude 的结果自动生成，不用手改占位符 -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.USERNAME.feishu-claude-bridge</string>

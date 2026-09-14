@@ -1,9 +1,14 @@
 import spawn from 'cross-spawn'; // Windows 下 claude 是 .cmd，原生 spawn 会 EINVAL
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { loadSessions, saveSessions } from './store.js';
+import { ensureOwnerWorkspace } from './workspace.js';
+import { patchEnvFile } from './env-file.js';
+import { routeTurn, DEFAULT_EXEC_TRIGGERS } from './lanes.js';
+export { routeTurn, DEFAULT_EXEC_TRIGGERS };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -73,8 +78,26 @@ function ensureGuestWorkspace() {
   }
 }
 ensureGuestWorkspace();
-const ALLOWED_TOOLS =
-  process.env.ALLOWED_TOOLS ?? 'Read,Grep,Glob,WebSearch,WebFetch';
+// owner 工作区同样在启动时建好：memory/journal、skills、schedules、outbox、incoming，
+// 以及 CLAUDE.md @import 指向的 USER.md / MEMORY.md 种子（已有内容不动）
+{
+  const r = ensureOwnerWorkspace(WORKSPACE_DIR);
+  if (!r.ok) console.error('[owner-workspace]', r.problem);
+}
+// owner 默认工具集。写权限必须包含工作区里的四个目录，否则 CLAUDE.md 承诺的三层记忆、
+// 技能沉淀、自建定时任务、文件回传在开箱状态下全部写不进去（2026-09-13 安装反馈 P0）。
+// 文件权限规则只认 Edit(path)——它覆盖 Write/NotebookEdit 等所有编辑工具；
+// Write(path) 写法不会被文件权限检查匹配，等于没配。
+// 显式配置 ALLOWED_TOOLS 时完全以配置为准，不做合并（用户收窄了就不该再暗中扩回来）。
+export const DEFAULT_OWNER_TOOLS =
+  'Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**)';
+const ALLOWED_TOOLS = process.env.ALLOWED_TOOLS ?? DEFAULT_OWNER_TOOLS;
+// 可选：飞书官方 lark-cli（22 个业务域 200+ 命令，用户 OAuth 身份，凭据在系统钥匙串）。
+// 覆盖面比手写的 10 个 MCP 工具大得多（审批/日历/任务/OKR…），且用户维度的查询
+// （「我有什么待审批」）只有用户身份答得了。规则精确到 `Bash(lark-cli:*)`：
+// 实测 `lark-cli x && whoami` 这类拼接被挡、`env`/`ps`/`curl` 被拒。
+// 独立开关而非默认值的一部分：显式配了 ALLOWED_TOOLS 也能叠加。精确等于 true 才开。
+const LARK_CLI_TOOLS = process.env.LARK_CLI === 'true' ? 'Bash(lark-cli:*)' : '';
 // 非 owner（同事/群成员）不给本机文件工具，只允许联网检索
 const NON_OWNER_TOOLS = process.env.NON_OWNER_TOOLS ?? 'WebSearch';
 // 访客可用的内置工具**白名单**（--tools）。
@@ -117,6 +140,11 @@ if (CLAUDE_MAX_MS < CLAUDE_IDLE_TIMEOUT_MS) {
 let CLAUDE_MODEL = process.env.CLAUDE_MODEL || '';
 // 思考深度：low/medium/high/xhigh/max，留空=CLI 默认
 let CLAUDE_EFFORT = process.env.CLAUDE_EFFORT || '';
+// 模型分工（2026-09-14）：平常聊天与规划走 CLAUDE_MODEL（旗舰），「执行」走 CLAUDE_EXEC_MODEL。
+// 留空=不分工，所有轮次都用 CLAUDE_MODEL（老配置行为字节不变）。
+// 执行车道的思考档留空则沿用 CLAUDE_EFFORT。
+let CLAUDE_EXEC_MODEL = '';
+let CLAUDE_EXEC_EFFORT = '';
 
 // 模型短名 → 全名（也允许直接写全名）
 // 注意：fable 默认指向 5.1，需要 Claude Code CLI ≥ 2.1.251；
@@ -151,6 +179,9 @@ export function normalizeEffort(v) {
   }
   return e;
 }
+
+CLAUDE_EXEC_MODEL = normalizeModel(process.env.CLAUDE_EXEC_MODEL) ?? '';
+CLAUDE_EXEC_EFFORT = normalizeEffort(process.env.CLAUDE_EXEC_EFFORT) ?? '';
 
 // 模型对 CLI 版本的最低要求。写在这里而不是靠试错，是因为版本不够时
 // 报错发生在**用户发消息那一刻**，而不是启动时——桥接看着一切正常，人却收到 400。
@@ -208,39 +239,36 @@ export function checkCliEnvironment(model = CLAUDE_MODEL) {
 }
 
 export function getRuntimeConfig() {
-  return { model: CLAUDE_MODEL, effort: CLAUDE_EFFORT };
+  return { model: CLAUDE_MODEL, effort: CLAUDE_EFFORT, execModel: CLAUDE_EXEC_MODEL, execEffort: CLAUDE_EXEC_EFFORT };
 }
 
-// 只改 .env 里的这两行，其余内容与注释原样保留
-function patchEnvFile(updates) {
-  const envPath = path.resolve(__dirname, '..', '.env');
-  try {
-    if (!fs.existsSync(envPath)) return;
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const [key, val] of Object.entries(updates)) {
-      const i = lines.findIndex((l) => l.startsWith(`${key}=`));
-      // 保留行尾注释
-      const comment = i >= 0 ? (lines[i].match(/\s+#.*$/)?.[0] ?? '') : '';
-      const line = `${key}=${val}${comment}`;
-      if (i >= 0) lines[i] = line;
-      else lines.push(line);
-    }
-    // 原子替换：.env 是启动必需文件，写到一半被打断（掉电/拔盘）会截断成半截，
-    // 下次启动即 exit(1)，launchd 会陷入每 10 秒拉起-退出的死循环
-    const tmp = `${envPath}.tmp`;
-    fs.writeFileSync(tmp, lines.join('\n'));
-    fs.renameSync(tmp, envPath);
-  } catch (e) {
-    console.error('[config] 回写 .env 失败:', e?.message ?? e);
-  }
-}
+const ENV_PATH = path.resolve(__dirname, '..', '.env');
 
 /**
  * 运行时切换模型/思考档。立即生效（下一次调用即用新值），并回写 .env 让重启后保持。
  * 返回 { model, effort } 或抛错（取值非法时）。
  */
-export function setRuntimeConfig({ model, effort } = {}) {
+export function setRuntimeConfig({ model, effort, execModel, execEffort } = {}, { persist = true } = {}) {
   const updates = {};
+  // 执行模型：off/none 表示关闭分工（回到单模型）
+  if (execModel !== undefined && execModel !== null && execModel !== '') {
+    const raw = String(execModel).trim();
+    if (/^(off|none|无|关闭)$/i.test(raw)) {
+      CLAUDE_EXEC_MODEL = '';
+      updates.CLAUDE_EXEC_MODEL = '';
+    } else {
+      const resolved = MODEL_ALIASES[raw.toLowerCase()] ?? raw;
+      if (!/^[a-zA-Z0-9._-]+$/.test(resolved)) throw new Error(`执行模型名不合法：${execModel}`);
+      CLAUDE_EXEC_MODEL = resolved;
+      updates.CLAUDE_EXEC_MODEL = resolved;
+    }
+  }
+  if (execEffort !== undefined && execEffort !== null && execEffort !== '') {
+    const e = String(execEffort).toLowerCase().trim();
+    if (!EFFORT_LEVELS.includes(e)) throw new Error(`执行思考档不合法：${execEffort}（可选 ${EFFORT_LEVELS.join('/')}）`);
+    CLAUDE_EXEC_EFFORT = e;
+    updates.CLAUDE_EXEC_EFFORT = e;
+  }
   if (model !== undefined && model !== null && model !== '') {
     const resolved = MODEL_ALIASES[String(model).toLowerCase()] ?? String(model).trim();
     if (!/^[a-zA-Z0-9._-]+$/.test(resolved)) throw new Error(`模型名不合法：${model}`);
@@ -253,7 +281,7 @@ export function setRuntimeConfig({ model, effort } = {}) {
     CLAUDE_EFFORT = e;
     updates.CLAUDE_EFFORT = e;
   }
-  if (Object.keys(updates).length) patchEnvFile(updates);
+  if (persist && Object.keys(updates).length && fs.existsSync(ENV_PATH)) patchEnvFile(ENV_PATH, updates);
   return getRuntimeConfig();
 }
 // 上下文接近压缩点时提醒机器人先固化记忆的阈值（0 = 关闭）
@@ -353,6 +381,7 @@ export function sessionInfo(chatId, isOwner = false) {
     `- 工作目录: \`${workspaceFor(isOwner)}\``,
     `- 你的身份: ${isOwner ? 'owner' : '普通成员'}`,
     `- 模型: ${CLAUDE_MODEL || '（CLI 默认）'}`,
+    `- 执行模型: ${CLAUDE_EXEC_MODEL ? `${CLAUDE_EXEC_MODEL}（说「执行」或 /do 时使用）` : '（未分工）'}`,
     (() => {
       const cli = checkCliEnvironment();
       return `- CLI: ${cli.version ?? '未知'} @ ${cli.bin}${cli.problem ? ' ⚠️ ' + cli.problem : ''}`;
@@ -379,7 +408,21 @@ function syncSkills() {
 // 运行配置改为随每次调用注入系统提示词，而不是写共享的 runtime.md：
 // 定时任务与聊天是并发的两个 claude 进程、共享同一工作区，写文件必然互相覆盖，
 // 模型会读到别人的 chat_id（进而把排期发错会话）。逐次注入天然无竞态。
-function runtimeSystemPrompt(chatId, model, effort, isOwner) {
+function laneLines(lane) {
+  if (!CLAUDE_EXEC_MODEL) return [];
+  return lane === 'exec'
+    ? [
+        `- 本轮车道：**执行**（模型 ${CLAUDE_EXEC_MODEL}）。用户已经决定要做，直接执行、少讨论、产出结果；`,
+        '  只有缺关键信息时才追问。聊天与规划由另一模型负责，不要在本轮重开规划。',
+      ]
+    : [
+        `- 本轮车道：聊天/规划（模型 ${CLAUDE_MODEL || 'CLI 默认'}）。执行由 ${CLAUDE_EXEC_MODEL} 负责：`,
+        '  用户说「执行」或发 `/do <任务>` 时下一轮会自动切到执行模型，会话上下文保留。',
+        '  计划谈妥后可以提醒用户「说“执行”即开始」。',
+      ];
+}
+
+function runtimeSystemPrompt(chatId, model, effort, isOwner, lane = 'chat') {
   // 访客只需要知道自己跑在什么模型上；outbox、定时任务、chat_id 都是 owner 侧的概念，
   // 讲给访客听既没用又会诱导它去尝试没有的能力
   if (!isOwner) {
@@ -397,6 +440,7 @@ function runtimeSystemPrompt(chatId, model, effort, isOwner) {
     '# 当前运行配置（由桥接注入，权威来源）',
     `- 模型：${model || '（未指定，走 claude CLI 默认）'}`,
     `- 思考深度 effort：${effort || '（未指定，走 CLI 默认）'}`,
+    ...laneLines(lane),
     `- 当前会话 chat_id：${realChat ?? '（本次为定时任务，无对应会话）'}`,
     `- 本轮文件回传目录：\`${outboxRel}\`（要发给用户的图片/文件写到**这个目录**，`,
     '  本轮结束后桥接会自动上传并清空；写到别处或 outbox 根目录都不会被发送）',
@@ -423,10 +467,18 @@ function runtimeSystemPrompt(chatId, model, effort, isOwner) {
  */
 export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts = {}) {
   const cwd = workspaceFor(isOwner);
+  // 车道：调用方显式给 lane；没给时定时任务默认执行车道（它们是「跑一个任务」，不是聊天），
+  // 自诊断（sched-diag）由调用方显式指定 DIAG_MODEL，本就不走车道。
+  // 没配执行模型时车道概念不存在——退回单模型，且不在提示词里谎称有分工。
+  const wantExec = opts.lane === 'exec'
+    || (opts.lane === undefined && typeof chatId === 'string' && chatId.startsWith('sched:'));
+  const lane = wantExec && CLAUDE_EXEC_MODEL ? 'exec' : 'chat';
+  const laneModel = lane === 'exec' ? CLAUDE_EXEC_MODEL : CLAUDE_MODEL;
+  const laneEffort = lane === 'exec' ? (CLAUDE_EXEC_EFFORT || CLAUDE_EFFORT) : CLAUDE_EFFORT;
   // 任务里写的 "haiku" 这类别名要和 /model、set-model 走同一套解析与校验，
   // 否则同一个词在三条路径上行为不一致（一处生效、一处原样传给 CLI 报错）
-  const model = normalizeModel(opts.model) ?? CLAUDE_MODEL;
-  const effort = normalizeEffort(opts.effort) ?? CLAUDE_EFFORT;
+  const model = normalizeModel(opts.model) ?? laneModel;
+  const effort = normalizeEffort(opts.effort) ?? laneEffort;
   const resumeId = opts.resumeId ?? sessions[chatId];
   // 提示词走 stdin：--allowedTools 等可变参数选项会吞掉后置的位置参数
   const args = ['-p', '--output-format', 'stream-json', '--verbose'];
@@ -435,6 +487,7 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
   if (resumeId && !isEphemeral(chatId)) args.push('--resume', resumeId);
   const tools = [
     isOwner ? ALLOWED_TOOLS : NON_OWNER_TOOLS,
+    isOwner ? LARK_CLI_TOOLS : '',
     ...extraTools,
     isOwner && FEISHU_TOOLS ? 'mcp__feishu' : '',
   ]
@@ -475,10 +528,13 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
   }
   if (model) args.push('--model', model);
   if (effort) args.push('--effort', effort);
-  args.push('--append-system-prompt', runtimeSystemPrompt(chatId, model, effort, isOwner));
-  // 飞书文档/多维表格工具：只用应用自己的租户凭据，且仅 owner 可用
+  args.push('--append-system-prompt', runtimeSystemPrompt(chatId, model, effort, isOwner, lane));
+  // 飞书文档/多维表格工具：只用应用自己的租户凭据，且仅 owner 可用。
+  // 凭据不能拼进 argv——`ps aux` 对本机任何进程可见、截屏终端也会带出去（2026-09-13 反馈 P2）。
+  // 写成 0600 的临时文件传路径，子进程结束即删（cleanup 由 runClaudeOnce 在 close/error 时调用）。
+  let cleanup = () => {};
   if (isOwner && FEISHU_TOOLS) {
-    args.push('--mcp-config', JSON.stringify({
+    const mcpConfig = JSON.stringify({
       mcpServers: {
         feishu: {
           type: 'stdio',
@@ -491,14 +547,21 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
           },
         },
       },
-    }));
+    });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-mcp-'));
+    const file = path.join(dir, 'mcp.json');
+    fs.writeFileSync(file, mcpConfig, { mode: 0o600 });
+    args.push('--mcp-config', file);
+    cleanup = () => {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 已删 */ }
+    };
   }
-  return { args, cwd, model, effort };
+  return { args, cwd, model, effort, lane, cleanup };
 }
 
 function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgress = null, opts = {}) {
   if (isOwner) syncSkills(); // 访客工作区没有技能目录，也不该有
-  const { args, cwd, effort } = buildClaudeArgs(chatId, isOwner, extraTools, opts);
+  const { args, cwd, effort, cleanup } = buildClaudeArgs(chatId, isOwner, extraTools, opts);
   const ephemeralChat = isEphemeral(chatId);
   // 本轮专属回传目录必须先存在，否则模型写入时会失败
   try {
@@ -597,6 +660,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
 
     child.stderr.on('data', (d) => { stderr += d; lastActivity = Date.now(); });
     child.on('error', (e) => {
+      cleanup(); // 凭据临时文件
       clearInterval(timer);
       running.delete(chatId);
       reject(new Error(`claude CLI 启动失败: ${e.message}`));
@@ -607,6 +671,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       if (e?.code !== 'EPIPE') console.error('[stdin]', e?.message ?? e);
     });
     child.on('close', (code) => {
+      cleanup(); // 凭据临时文件：无论成败都删
       clearInterval(timer);
       running.delete(chatId);
       if (child.__cancelled) {

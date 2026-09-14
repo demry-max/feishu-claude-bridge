@@ -2,6 +2,54 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.0] - 2026-09-14
+
+### 新增
+
+- **聊天/规划与执行分工两个模型**：`CLAUDE_MODEL`（如 fable 5.1）负责平常对话与规划，
+  `CLAUDE_EXEC_MODEL`（如 sonnet 5）负责执行。消息以 `/do` `/exec` `/run` 开头、或句首是
+  「执行」「开始执行」「去做」「动手」「go」「do it」等触发词时，这一轮切到执行模型，
+  会话通过 `--resume` 保留——执行模型看得见刚谈妥的计划。判定是确定性的（前缀/句首词边界），
+  不靠模型猜：「执行力很重要」「google 一下」都不会误切；`EXEC_TRIGGERS` 可整体覆盖。
+  定时任务默认走执行车道（任务自带 `model` 优先）。`/model` 显示两个模型，`/model exec <模型|off>`
+  随时切换；`set-model` 定时动作支持 `exec_model` / `exec_effort`。留空 `CLAUDE_EXEC_MODEL` 即关闭，
+  老配置行为字节不变。
+- **`npm run doctor` 安装体检**：Node ≥ 18（失败给免 sudo 的 tarball 安装命令）、npm ≥ 11 的
+  install-scripts 警告说明、claude CLI 版本与登录态（`claude auth status`）、`.env` 必填项
+  （`OWNER_OPEN_ID` 为空而 `data/owner.json` 有值时自动补写）、owner 工作区目录、飞书 scope 探测。
+- **启动时自检飞书 scope**：`GET /application/v6/scopes` 查已开通权限，对照 10 个 MCP 工具逐个判定，
+  不可用的列进日志与启动通知，附可直接粘贴到「权限管理 → 批量导入」的 JSON。
+  `npm run register` 成功后同样打印这段——注册接口建出来的应用是**零权限**，此前没有任何提示，
+  10 个工具里 7 个静默失效。
+- **`npm run install-service` / `uninstall-service`（macOS）**：用当前 `node`、本仓库目录与
+  `which claude` 的结果生成 plist 并 `launchctl bootstrap`，不再手改 5 处占位符；PATH 把 node
+  与 claude 所在目录排最前，消除「launchd 用到另一份 claude」的坑。`LAUNCHD_LABEL` 可指定 label。
+- **可选 lark-cli 集成**：`LARK_CLI=true` 只给 owner 加一条 `Bash(lark-cli:*)`（拼接命令与其他
+  Bash 仍被拒，访客永远拿不到），覆盖审批/日历/任务等租户身份答不了的查询。
+- README 新增「飞书侧能做什么、不能做什么」表格与两模型分工说明；前置条件挪到快速开始代码块之前。
+
+### 修复
+
+- **owner 工作区从不被创建**：仓库只带 `workspace/CLAUDE.md`，`memory/`、`skills/` 要靠机器人
+  第一次写入时自己建，而它没有建目录的权限；`CLAUDE.md` 里 `@memory/USER.md`、`@memory/MEMORY.md`
+  两行 `@import` 一直悬空。现在启动时建好 `memory/journal`、`skills`、`schedules`、`outbox`、`incoming`
+  并写入 `USER.md` / `MEMORY.md` 种子（已有内容一个字节不动）。
+- **默认工具集没有任何写入工具**：`ALLOWED_TOOLS` 默认值只有 `Read,Grep,Glob,WebSearch,WebFetch`，
+  README 与 CLAUDE.md 承诺的三层记忆、技能沉淀、自建定时任务、文件回传在开箱状态下全部写不进去。
+  默认值改为含 `Edit(./memory/**)`、`Edit(./skills/**)`、`Edit(./schedules/**)`、`Edit(./outbox/**)`。
+  注意 CLI 的文件权限规则只认 `Edit(path)`（覆盖 Write 等全部编辑工具），`Write(path)` 写法不会被匹配。
+- **`register.js` 拿到 open_id 却不写 `OWNER_OPEN_ID`**：现在与凭据一起写入 `.env`；
+  `.env` 回写统一为一份实现（`src/env-file.js`，原子替换、保留注释）。
+- **App Secret 出现在进程命令行**：`--mcp-config` 此前把凭据 JSON 拼进 argv，`ps aux` 可见。
+  改为 0600 临时文件，子进程结束即删。
+- **启动通知从未带上自检结果**：`announceStartup()` 在 config 块之前调用，`cliProblem` 在发通知那一刻
+  永远是 null——「启动自检发现问题」那段文案从未真正发出过。现改为所有自检完成后再发。
+
+### 测试
+
+- 新增 8 个测试文件、73 条测试（45 → 118；车道判定/模型选择、工作区种子、默认工具集、scope 判定与
+  桩 fetch、.env 回写、凭据不进 argv、plist 生成与 `--dry-run` 真跑、doctor 单项与真跑）。
+
 ## [2.2.0] - 2026-09-02
 
 ### 新增

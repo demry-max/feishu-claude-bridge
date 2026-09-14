@@ -6,7 +6,9 @@
 // 需要的权限（开发者后台「权限管理」→ 批量导入后发布版本）：
 //   docx:document:readonly / docx:document        （读/写云文档）
 //   bitable:app:readonly    / bitable:app         （读/写多维表格）
+//   sheets:spreadsheet:readonly / sheets:spreadsheet（读/写电子表格）
 //   wiki:wiki:readonly                            （知识库节点解析）
+// 桥接启动时与 npm run doctor 会用 GET /application/v6/scopes 自检并列出不可用的工具（src/feishu-scopes.js）。
 import 'dotenv/config';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';

@@ -1,6 +1,6 @@
 # feishu-claude-bridge
 
-[![version](https://img.shields.io/badge/version-2.2.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![version](https://img.shields.io/badge/version-2.3.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [中文](README.md) | **English**
 
@@ -74,6 +74,17 @@ workspace/
 
 ## Quick Start
 
+**Prerequisite: Node ≥ 18** (the very first command needs it). No Node and no Homebrew? Install the official tarball without sudo:
+
+```bash
+V=v24.21.0   # check https://nodejs.org/dist/ for the current LTS; verify SHASUMS256.txt if you like
+curl -fsSL -o node.tar.xz "https://nodejs.org/dist/$V/node-$V-darwin-arm64.tar.xz"   # darwin-x64 on Intel
+mkdir -p ~/.local && tar -xJf node.tar.xz -C ~/.local && mv ~/.local/node-$V-darwin-arm64 ~/.local/node
+echo 'export PATH="$HOME/.local/node/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
+
+Optional: ffmpeg for the voice-transcription fallback.
+
 ```bash
 npm install -g @anthropic-ai/claude-code   # install/update Claude Code CLI
 claude /login                              # complete browser login (subscription account)
@@ -81,16 +92,51 @@ claude /login                              # complete browser login (subscriptio
 git clone https://github.com/demry-max/feishu-claude-bridge.git
 cd feishu-claude-bridge
 npm install
-npm run register   # scan the QR with the Feishu app → app auto-created, .env auto-filled
+npm run register   # scan the QR → app auto-created; credentials and OWNER_OPEN_ID written to .env
+#   ↑ prints a scope JSON at the end: paste it in the developer console (Permissions → Bulk import) and publish a version.
+#     Apps created via the registration API have ZERO scopes — skip this and the doc/bitable tools silently fail (chat still works).
+npm run doctor     # preflight: Node / npm / claude login / .env / workspace / Feishu scopes; auto-fixes what it can
 npm start          # "[ws] ws client ready" in the log = connected
 ```
 
-Then DM the bot in Feishu. Prerequisites: Node ≥ 18; optional ffmpeg for the voice-transcription fallback. For international Lark, add `FEISHU_DOMAIN=lark` to `.env` before registering.
+Then DM the bot in Feishu. For international Lark, add `FEISHU_DOMAIN=lark` to `.env` before registering.
 
-- Auto-start on macOS: see [examples/launchd.example.plist](examples/launchd.example.plist)
+> On npm ≥ 11, `npm install` prints `npm warn install-scripts …` for `@anthropic-ai/claude-code` and `protobufjs`. That is npm 11's default notice about dependency install scripts, **not a failure** — if `claude --version` works, you're fine.
+
+- Auto-start on macOS: `npm run install-service` generates the plist from the running node, this repo's directory and `which claude` (no placeholders to edit) and bootstraps it; `npm run uninstall-service` removes it; `LAUNCHD_LABEL` overrides the label. ([examples/launchd.example.plist](examples/launchd.example.plist) is reference only.)
 - Auto-start on Windows: `powershell -ExecutionPolicy Bypass -File scripts\windows\install-startup.ps1`
 - Full deployment runbook (hand it to Claude Code and say "deploy per this manual", in Chinese): [docs](docs/飞书-Claude-机器人架设方案.md)
 - If QR registration fails, the runbook's Appendix A covers manual console setup
+
+## 🚦 Two models: chat/planning vs execution
+
+```
+CLAUDE_MODEL=fable           # everyday chat, discussion, planning (default lane)
+CLAUDE_EXEC_MODEL=sonnet     # execution; empty = no split, every turn uses CLAUDE_MODEL
+CLAUDE_EXEC_EFFORT=          # effort for the exec lane; empty = same as CLAUDE_EFFORT
+```
+
+- A turn goes to the exec lane when the message starts with `/do`, `/exec` or `/run` (prefix stripped), or with a trigger word such as 执行 / 去做 / go / "do it" (`EXEC_TRIGGERS` overrides the list). Bare `/do` means "execute the plan we just agreed on".
+- Detection is deterministic (prefix / sentence-initial word boundary), never left to the model: "google this" or "执行力" won't switch lanes.
+- Exec turns `--resume` the same session, so sonnet sees the plan fable just made. The bridge tells the model which lane it is on via the system prompt.
+- Scheduled tasks default to the exec lane (a task's own `model` overrides); failure self-diagnosis still uses `DIAG_MODEL`.
+- `/model` shows both models; `/model exec sonnet` changes the exec model, `/model exec off` disables the split; the `set-model` scheduled action accepts `exec_model` / `exec_effort`.
+
+## 🧰 What the Feishu tools can and cannot do
+
+The built-in MCP exposes exactly 10 tools (`src/mcp-feishu.js`), using the **app's own tenant credentials**; what they can touch is governed by the scopes granted in the developer console:
+
+| Supported | Tools | Scopes |
+|---|---|---|
+| Docs | `doc_read` / `doc_append` | `docx:document:readonly` / `docx:document` |
+| Wiki link resolution | `/wiki/` URL → document | `wiki:wiki:readonly` |
+| Bitable | `bitable_tables` / `bitable_fields` / `bitable_records` / `bitable_create_record` / `bitable_update_record` | `bitable:app:readonly` / `bitable:app` |
+| Sheets | `sheet_read` / `sheet_write` | `sheets:spreadsheet:readonly` / `sheets:spreadsheet` |
+| Mail attachments | `mail_attachment_download` (needs a lark-cli user login) | — |
+
+**Not supported** (tenant identity can't answer them, or simply not implemented): approvals, calendar, tasks, contacts, drive listing, message history search, video meetings, attendance, OKR.
+
+For those, use Feishu's official [lark-cli](https://github.com/larksuite/cli) (22 domains, 200+ commands, **user OAuth**, credentials in the system keychain): `npx @larksuite/cli@latest install`, log in, then set `LARK_CLI=true` in `.env`. The bridge adds exactly one rule for the owner, `Bash(lark-cli:*)` — chaining like `lark-cli x && whoami` is blocked, `env` / `ps aux` / `curl` are denied, so the bot cannot read the App Secret from `.env`; the CLI's built-in harmless read-only commands (`whoami`, `pwd`) pass. Guests never get it.
 
 ## Architecture
 

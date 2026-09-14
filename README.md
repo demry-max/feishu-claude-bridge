@@ -1,6 +1,6 @@
 # feishu-claude-bridge
 
-[![version](https://img.shields.io/badge/version-2.2.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![version](https://img.shields.io/badge/version-2.3.0-blue)](CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **中文** | [English](README.en.md)
 
@@ -24,6 +24,8 @@
 - 🩺 **定时任务自诊断**：任务失败自动分析原因并给出建议动作
 - 🧷 **压缩前固化记忆**：上下文接近上限时自动提醒机器人把该留的写进 `memory/`，避免自动压缩后细节流失
 - 🔀 **模型随时切换**：`/model fable high` 一句话切换模型与思考档，立即生效无需重启；也可设定时自动切换（如早八点切回便宜档）
+- 🚦 **聊天/规划与执行分工两个模型**：`CLAUDE_MODEL` 负责平常对话与规划（如 fable 5.1），`CLAUDE_EXEC_MODEL` 负责执行（如 sonnet 5）——说「执行」「去做」或发 `/do <任务>` 时下一轮自动切到执行模型，会话上下文保留（执行模型看得见刚谈妥的计划）；定时任务默认走执行模型。`/model exec sonnet` 随时改，留空即关闭分工
+- 🩺 **安装体检**：`npm run doctor` 检查 Node / npm / claude 登录 / `.env` / 工作区 / 飞书 scope，能自动修的直接修；启动日志也会自检 scope，告诉你哪些飞书工具因权限未开而不可用
 - 📄 **飞书文档 / 多维表格读写**：内置 MCP 工具（读文档、追加段落、多维表格查表/读记录/增改记录）；用**机器人应用自己的租户权限**，能碰什么由飞书后台 scope 精确控制，仅 owner 可用
 - 🖼️ **回传图片与文件**：机器人写进 `workspace/outbox/` 的文件自动上传发送（图片可直接预览）
 - 🎫 **进度卡片原地更新**：长任务的阶段说明更新同一张卡片而非刷屏，完成后自动折叠
@@ -77,6 +79,17 @@ workspace/
 
 ## 快速开始 Quick Start
 
+**前置条件：Node ≥ 18**（下面第一条命令就要用到）。没有 Node 也没有 Homebrew 时，用官方 tarball 免 sudo 安装：
+
+```bash
+V=v24.21.0   # 到 https://nodejs.org/dist/ 看最新 LTS；建议同时校验 SHASUMS256.txt
+curl -fsSL -o node.tar.xz "https://nodejs.org/dist/$V/node-$V-darwin-arm64.tar.xz"   # Intel Mac 换 darwin-x64
+mkdir -p ~/.local && tar -xJf node.tar.xz -C ~/.local && mv ~/.local/node-$V-darwin-arm64 ~/.local/node
+echo 'export PATH="$HOME/.local/node/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
+
+可选：ffmpeg（语音兜底转写）。
+
 ```bash
 npm install -g @anthropic-ai/claude-code   # 安装/更新 Claude Code CLI
 claude /login                              # 弹出登录选项，浏览器完成授权
@@ -84,17 +97,52 @@ claude /login                              # 弹出登录选项，浏览器完�
 git clone https://github.com/demry-max/feishu-claude-bridge.git
 cd feishu-claude-bridge
 npm install
-cp .env.example .env   # 按注释填写；建议设置 OWNER_OPEN_ID
-npm run register       # 飞书 App 扫码 → 应用自动创建，凭据自动写入 .env
-npm start          # 日志出现 [ws] ws client ready 即成功
+npm run register       # 飞书 App 扫码 → 应用自动创建，凭据与 OWNER_OPEN_ID 自动写入 .env
+#   ↑ 结束时会打印一段 scope JSON：到开发者后台「权限管理 → 批量导入」粘贴并发布版本
+#     （注册接口建出来的应用是零权限，不做这步文档/多维表格工具用不了；聊天不受影响）
+npm run doctor         # 体检：Node / npm / claude 登录 / .env / 工作区 / 飞书 scope，能自动修的直接修
+npm start              # 日志出现 [ws] ws client ready 即成功
 ```
 
-然后在飞书里私聊机器人发「你好」。前置条件：Node ≥ 18；可选 ffmpeg（语音兜底转写）。
+然后在飞书里私聊机器人发「你好」。
 
-- 开机自启（macOS）：参考 [examples/launchd.example.plist](examples/launchd.example.plist)
+> `npm install` 在 npm ≥ 11 上会打印 `npm warn install-scripts …`（`@anthropic-ai/claude-code`、`protobufjs`）——
+> 这是 npm 11 起对依赖 install 脚本的默认提示，**不是安装失败**，`claude --version` 能跑即可。
+
+- 开机自启（macOS）：`npm run install-service`——用当前 node、本仓库目录与 `which claude` 的结果生成 plist 并立即启动，不用手改占位符；`npm run uninstall-service` 卸载；`LAUNCHD_LABEL` 可指定 label。（[examples/launchd.example.plist](examples/launchd.example.plist) 仅供参考）
 - 开机自启（Windows）：`powershell -ExecutionPolicy Bypass -File scripts\windows\install-startup.ps1`
 - 完整部署手册（可直接丢给 Claude Code 执行）：[docs/飞书-Claude-机器人架设方案.md](docs/飞书-Claude-机器人架设方案.md)
 - 扫码注册失败时的手动配置：见手册附录 A
+
+## 🚦 模型分工：聊天/规划 vs 执行
+
+```
+CLAUDE_MODEL=fable           # 平常聊天、讨论、规划（默认车道）
+CLAUDE_EXEC_MODEL=sonnet     # 执行；留空 = 不分工，所有轮次都用 CLAUDE_MODEL
+CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EFFORT
+```
+
+- 触发执行车道：消息以 `/do`、`/exec`、`/run` 开头（前缀会被剥掉），或句首是「执行」「开始执行」「去做」「动手」「go」「do it」等触发词（`EXEC_TRIGGERS` 可整体覆盖）。裸 `/do` = 「按上面已确认的计划执行」。
+- 判定是**确定性的**（前缀/句首词边界），不靠模型猜：「执行力很重要」「google 一下」都不会误切。
+- 执行轮通过 `--resume` 复用同一会话：sonnet 看得见 fable 刚谈妥的计划。桥接会在系统提示词里告诉模型本轮车道与分工。
+- 定时任务默认走执行车道（任务定义里写 `model` 可覆盖）；失败自诊断仍用 `DIAG_MODEL`。
+- `/model` 查看两个模型；`/model exec sonnet` 改执行模型、`/model exec off` 关闭分工；`set-model` 定时动作支持 `exec_model` / `exec_effort` 字段。
+
+## 🧰 飞书侧能做什么、不能做什么
+
+内置 MCP 工具只有这 10 个（`src/mcp-feishu.js`），用**应用自己的租户凭据**，能碰什么由飞书后台 scope 决定：
+
+| 支持 | 工具 | 需要的 scope |
+|---|---|---|
+| 云文档 | `doc_read` / `doc_append` | `docx:document:readonly` / `docx:document` |
+| 知识库链接解析 | `/wiki/` 链接 → 文档 | `wiki:wiki:readonly` |
+| 多维表格 | `bitable_tables` / `bitable_fields` / `bitable_records` / `bitable_create_record` / `bitable_update_record` | `bitable:app:readonly` / `bitable:app` |
+| 电子表格 | `sheet_read` / `sheet_write` | `sheets:spreadsheet:readonly` / `sheets:spreadsheet` |
+| 邮件附件 | `mail_attachment_download`（需 lark-cli 用户登录） | — |
+
+**不支持**（租户身份答不了，或根本没做）：审批、日历、任务、通讯录、云盘文件列表、消息历史检索、视频会议、打卡、OKR。
+
+想要这些，接飞书官方 [lark-cli](https://github.com/larksuite/cli)（22 个业务域 200+ 命令，走**用户 OAuth**，凭据在系统钥匙串）：`npx @larksuite/cli@latest install` 登录后，在 `.env` 设 `LARK_CLI=true`。桥接只给 owner 加一条 `Bash(lark-cli:*)`——实测 `lark-cli x && whoami` 这类拼接被挡，`env` / `ps aux` / `curl` 被拒，机器人读不到 `.env` 里的 App Secret；`whoami` / `pwd` 这类 CLI 内置的无害只读命令会放行。访客永远拿不到它。
 
 ## 架构 Architecture
 
