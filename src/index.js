@@ -7,7 +7,7 @@ import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
 import { CronExpressionParser } from 'cron-parser';
-import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice } from './outbound.js';
+import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
 
@@ -492,7 +492,13 @@ async function handleMessage(data) {
   }
 
   enqueue(sessionKey, async () => {
-    console.log(`[msg] ${isOwner ? 'owner' : senderOpenId} @ ${message.chat_type} [${message.message_type}]${route.lane === 'exec' ? ' [exec]' : ''}: ${text.slice(0, 80)}`);
+    console.log(formatInboundLog({
+      who: isOwner ? 'owner' : senderOpenId,
+      chatType: message.chat_type,
+      messageType: message.message_type,
+      exec: route.lane === 'exec',
+      text,
+    }));
     await react(message.message_id, 'OnIt');
     const progress = createProgressChannel(client, message.message_id);
     try {
@@ -518,15 +524,8 @@ async function handleMessage(data) {
       ).catch(() => {});
       if (e?.cancelled) return; // /cancel 主动终止，不报错
       console.error('[claude]', e);
-      const msg = String(e.message ?? e);
-      if (msg.includes('401') || /re-?authenticate/i.test(msg)) {
-        await reply(
-          message.message_id,
-          '⚠️ Mac 上的 Claude 登录已过期。请在 Mac 终端运行 `claude /login` 重新登录后再试。'
-        );
-      } else {
-        await reply(message.message_id, `⚠️ Claude 调用失败：${msg}`);
-      }
+      // 登录类失败（含钥匙串锁住）给确定性修复步骤；瞬时刷新不算登录失效；其余原样报错
+      await reply(message.message_id, await claudeFailureReply(String(e.message ?? e)));
     }
   });
 }
@@ -700,12 +699,15 @@ startScheduler({
         client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } })
       );
     } catch (e) {
-      // 失败自诊断：让 Claude 判断是什么原因、能否自行修复
+      // 失败自诊断：让 Claude 判断是什么原因、能否自行修复。
+      // 登录类故障例外：诊断本身也要调 claude，只会同样失败（9/20–9/21 两天里每次都是
+      // 「诊断也失败了」），所以直接发确定性修复步骤。
       const err = String(e?.message ?? e).slice(0, 800);
-      console.error(`[sched] 任务失败，启动自诊断: ${err}`);
-      let diag = '';
-      try {
-        diag = await runClaude(
+      await handleScheduledFailure({
+        err,
+        jobName: job.name ?? job._file,
+        send: (text) => sendToChat(chatId, text),
+        runDiagnosis: () => runClaude(
           `sched-diag:${job._file}`,
           // 自诊断是模板化的短任务，没必要用旗舰模型
           [
@@ -720,14 +722,8 @@ startScheduler({
           [],
           null,
           { model: process.env.DIAG_MODEL || 'claude-haiku-4-5-20251001', effort: 'low' }
-        );
-      } catch (e2) {
-        diag = `（诊断也失败了：${String(e2?.message ?? e2).slice(0, 200)}）`;
-      }
-      await sendToChat(
-        chatId,
-        `⚠️ **定时任务失败**：${job.name ?? job._file}\n\n报错：\`${err.slice(0, 300)}\`\n\n**自诊断**\n${diag}`
-      );
+        ),
+      });
       // 失败时也要清空本任务的回传目录，否则残留文件会搭下一次报告一起发出
       await flushOutbox(client, outboxDirFor(schedChatId, true), (data) =>
         client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } })

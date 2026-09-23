@@ -6,7 +6,8 @@ import path from 'node:path';
 // ---- 出站脱敏：回复送出前抹掉密钥/令牌/内网地址，避免误发到群里 ----
 const SECRET_PATTERNS = [
   [/\bsk-ant-[A-Za-z0-9_-]{10,}/g, 'sk-ant-***'],
-  [/\bbms_sk_[A-Za-z0-9_-]{8,}/g, 'bms_sk_***'],
+  // 不加前导 \b：密钥紧贴在 ASCII 字母/数字/下划线后面（如 KEY_bms_sk_…、xbms_sk_…）时 \b 不成立会漏抹
+  [/bms_sk_[A-Za-z0-9_-]{8,}/g, 'bms_sk_***'],
   [/\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}/g, 'github_token_***'],
   [/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA***'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, 'jwt_***'],
@@ -270,4 +271,135 @@ export async function sendVoice(client, text, sendRaw) {
   } finally {
     for (const f of [aiff, opus]) fs.rmSync(f, { force: true });
   }
+}
+
+// ---- Claude 登录故障：分类与话术 ----
+// 与 ~/claude-login-watchdog 的 src/signatures.js 是同一套规则、同一套修复话术（跨仓不共享代码，各自实现）；
+// 两边各用 test/fixtures/claude-auth-signatures.js（逐字节相同的夹具）钉一遍，改规则要两边一起改。
+// 顺序有意义：瞬时刷新的文案里含「OAuth」「refresh」，必须先于登录失效判定。
+const CLAUDE_TRANSIENT_REFRESH_RE = /another Claude Code process is refreshing/i;
+const CLAUDE_KEYCHAIN_RE = /Keychain is not writable/i;
+const CLAUDE_AUTH_RE =
+  /Not logged in|Please run \/login|Failed to authenticate|OAuth (?:session|access token)[^\n]*expired|could not be refreshed|Invalid authentication credentials|re-?authenticate|OAuth authentication is currently not allowed|Invalid (?:API key|auth token)|API Error: 401\b|does not have access to Claude|OAuth token (?:has been )?revoked|disabled Claude subscription access/i;
+// 登录故障里「组织停用了订阅访问」一类：重新登录解决不了，要找管理员 / 查订阅
+const CLAUDE_SUBSCRIPTION_DISABLED_RE = /disabled Claude subscription access|OAuth authentication is currently not allowed/i;
+const CLAUDE_NETWORK_RE =
+  /API Error: 5\d\d\b|\b(?:502|503|504|529)\b|overloaded|Internal server error|Service Unavailable|Bad Gateway|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|fetch failed|Connection (?:error|lost|closed|reset)|network error|timed out|timeout|超时/i;
+
+/** @returns {'transient_refresh'|'keychain'|'auth'|'network'|'none'} */
+export function classifyClaudeError(text) {
+  const s = String(text ?? '');
+  if (CLAUDE_TRANSIENT_REFRESH_RE.test(s)) return 'transient_refresh';
+  if (CLAUDE_KEYCHAIN_RE.test(s)) return 'keychain';
+  if (CLAUDE_AUTH_RE.test(s)) return 'auth';
+  if (CLAUDE_NETWORK_RE.test(s)) return 'network';
+  return 'none';
+}
+
+/** 要人去重新登录 / 解锁钥匙串的那一类；瞬时刷新与网络都不算 */
+export const isClaudeLoginFailure = (kind) => kind === 'auth' || kind === 'keychain';
+
+/** 登录故障的修复方向：subscription＝组织停用了订阅访问（找管理员 / 查订阅），relogin＝重新登录 */
+export function loginFixVariant(text) {
+  return CLAUDE_SUBSCRIPTION_DISABLED_RE.test(String(text ?? '')) ? 'subscription' : 'relogin';
+}
+
+export const UNLOCK_KEYCHAIN_CMD = 'security unlock-keychain ~/Library/Keychains/login.keychain-db';
+const LOGIN_KEYCHAIN = path.join(os.homedir(), 'Library', 'Keychains', 'login.keychain-db');
+
+/**
+ * 登录钥匙串是否锁住：security show-keychain-info 退出码 ≠ 0 即锁住（9/21 实测 51）。
+ * 查不了（非 macOS / 命令缺失 / 超时）返回 null，话术按「未知」处理。只读，不解锁、不改任何东西。
+ */
+export async function isLoginKeychainLocked({ exec = execFileP, keychainPath = LOGIN_KEYCHAIN } = {}) {
+  try {
+    await exec('/usr/bin/security', ['show-keychain-info', keychainPath], { timeout: 5000 });
+    return false;
+  } catch (e) {
+    return typeof e?.code === 'number' ? true : null;
+  }
+}
+
+/** 确定性修复步骤（与看门狗同一套意思）。variant=subscription：组织停用了订阅访问，重新登录解决不了 */
+export function loginFixLines({ kind, keychainLocked, variant = 'relogin' }) {
+  if (variant === 'subscription') {
+    return [
+      '这不是本机登录问题：组织停用了 Claude Code 的订阅访问。联系组织管理员恢复访问，或到 claude.ai 检查订阅状态。',
+      '恢复后在 Mac 终端运行 `claude auth login`，再用 `claude auth status` 确认。',
+    ];
+  }
+  if (keychainLocked === true || kind === 'keychain') {
+    return [
+      '需要你本人在 Mac 前输入登录密码：',
+      `\`${UNLOCK_KEYCHAIN_CMD}\``,
+      '然后运行 `claude auth login`。',
+      '密码被拒绝＝钥匙串密码和开机密码不同步：打开「钥匙串访问」→ 选中「登录」钥匙串 → 编辑 →「更改钥匙串“登录”的密码」，改完再解锁。',
+    ];
+  }
+  const lines = ['在 Mac 终端运行 `claude auth login` 重新登录，再用 `claude auth status` 确认 loggedIn 为 true。'];
+  if (keychainLocked == null) lines.push(`若 \`claude auth login\` 报钥匙串错误，先运行 \`${UNLOCK_KEYCHAIN_CMD}\`（需要你本人输入登录密码）。`);
+  return lines;
+}
+
+const errHead = (msg) => String(msg ?? '').trim().split('\n')[0].slice(0, 200);
+
+/** 私聊里 Claude 调用失败时回给用户的话 */
+export async function claudeFailureReply(msg, { checkKeychain = isLoginKeychainLocked } = {}) {
+  const kind = classifyClaudeError(msg);
+  if (kind === 'transient_refresh') {
+    return '⚠️ Claude 的登录令牌正在由另一个 claude 进程刷新（瞬时状态，不是登录失效）。过半分钟再发一次。';
+  }
+  if (!isClaudeLoginFailure(kind)) return `⚠️ Claude 调用失败：${msg}`;
+  const variant = loginFixVariant(msg);
+  if (variant === 'subscription') {
+    return ['⚠️ Claude 的订阅访问被组织停用了。', `报错：\`${errHead(msg)}\``, '', ...loginFixLines({ kind, variant }), '', '恢复后重发这条消息。'].join('\n');
+  }
+  const keychainLocked = kind === 'keychain' ? true : await checkKeychain();
+  const head = keychainLocked === true
+    ? '⚠️ Mac 的登录钥匙串被锁住了，Claude 读不到登录凭据。'
+    : '⚠️ Mac 上的 Claude 登录失效了。';
+  return [head, `报错：\`${errHead(msg)}\``, '', ...loginFixLines({ kind, keychainLocked }), '', '修好后重发这条消息。'].join('\n');
+}
+
+/**
+ * 定时任务失败的收尾：登录类故障跳过 haiku 自诊断（它也要调 claude，只会同样失败），
+ * 直接发确定性修复步骤；其它失败照旧自诊断。
+ * @returns {Promise<{diagnosed:boolean, kind:string}>}
+ */
+export async function handleScheduledFailure({ err, jobName, send, runDiagnosis, checkKeychain = isLoginKeychainLocked, log = console.error }) {
+  const kind = classifyClaudeError(err);
+  if (isClaudeLoginFailure(kind)) {
+    log(`[sched] 任务失败（Claude 登录故障，跳过自诊断）: ${redact(err)}`);
+    const variant = loginFixVariant(err);
+    const keychainLocked = variant === 'subscription' ? null : kind === 'keychain' ? true : await checkKeychain();
+    await send([
+      `⚠️ **定时任务失败**：${jobName}（Claude 登录故障，已跳过自诊断）`,
+      '',
+      `报错：\`${String(err).slice(0, 300)}\``,
+      '',
+      '**修复**',
+      ...loginFixLines({ kind, keychainLocked, variant }),
+      '',
+      '修好后这个任务下次到点照常运行。',
+    ].join('\n'));
+    return { diagnosed: false, kind };
+  }
+  log(`[sched] 任务失败，启动自诊断: ${redact(err)}`);
+  let diag = '';
+  try {
+    diag = await runDiagnosis();
+  } catch (e2) {
+    diag = `（诊断也失败了：${String(e2?.message ?? e2).slice(0, 200)}）`;
+  }
+  await send(`⚠️ **定时任务失败**：${jobName}\n\n报错：\`${String(err).slice(0, 300)}\`\n\n**自诊断**\n${diag}`);
+  return { diagnosed: true, kind };
+}
+
+/**
+ * 入站消息日志行：先脱敏再截断（反过来会把截断后不足 8 位的密钥尾巴留在日志里），换行折成 ⏎ 保持一行。
+ * 起因：owner 私聊贴过一整把 bms_sk_… 密钥，旧写法原样记进了 ~/Library/Logs/feishu-claude-bridge.log。
+ */
+export function formatInboundLog({ who, chatType, messageType, exec = false, text }) {
+  const body = redact(text).replace(/\r?\n/g, ' ⏎ ').slice(0, 80);
+  return `[msg] ${who} @ ${chatType} [${messageType}]${exec ? ' [exec]' : ''}: ${body}`;
 }
