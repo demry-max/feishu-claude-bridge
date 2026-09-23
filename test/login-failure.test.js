@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   classifyClaudeError, isClaudeLoginFailure, claudeFailureReply, handleScheduledFailure,
-  formatInboundLog, isLoginKeychainLocked, loginFixLines, redact, UNLOCK_KEYCHAIN_CMD,
+  formatInboundLog, isLoginKeychainLocked, loginFixLines, loginFixVariant, redact, UNLOCK_KEYCHAIN_CMD,
 } from '../src/outbound.js';
 import { CLAUDE_AUTH_SIGNATURES } from './fixtures/claude-auth-signatures.js';
 
@@ -29,6 +29,12 @@ describe('登录故障签名（共享夹具）', () => {
       assert.equal(classifyClaudeError(text), kind);
     });
   }
+  test('登录故障的修复方向与夹具 fix 字段一致（组织停用订阅 → subscription，其余 → relogin）', () => {
+    for (const { text, kind, fix } of CLAUDE_AUTH_SIGNATURES) {
+      if (kind === 'auth') assert.equal(loginFixVariant(text), fix ?? 'relogin', text);
+    }
+  });
+
   test('只有 auth / keychain 算登录故障', () => {
     for (const { text, kind } of CLAUDE_AUTH_SIGNATURES) {
       assert.equal(isClaudeLoginFailure(classifyClaudeError(text)), kind === 'auth' || kind === 'keychain', text);
@@ -37,14 +43,14 @@ describe('登录故障签名（共享夹具）', () => {
 });
 
 describe('(b) 私聊失败回复', () => {
-  const REAL_AUTH = CLAUDE_AUTH_SIGNATURES.filter((s) => s.kind === 'auth').map((s) => s.text);
+  const REAL_AUTH = CLAUDE_AUTH_SIGNATURES.filter((s) => s.kind === 'auth');
 
   test('每条鉴权签名都给修复步骤，而不是原样甩报错（旧匹配器漏了 Not logged in / OAuth session expired）', async () => {
-    for (const msg of REAL_AUTH) {
+    for (const { text: msg, fix } of REAL_AUTH) {
       const r = await claudeFailureReply(msg, { checkKeychain: keychainStub(false) });
       assert.ok(!r.startsWith('⚠️ Claude 调用失败'), `${msg} 被当成普通错误了`);
       assert.ok(r.includes('claude auth login'), msg);
-      assert.match(r, /Claude 登录失效了/);
+      assert.match(r, fix === 'subscription' ? /订阅访问被组织停用/ : /Claude 登录失效了/, msg);
     }
   });
 
@@ -87,6 +93,56 @@ describe('(b) 私聊失败回复', () => {
       const t = loginFixLines({ kind: 'auth', keychainLocked }).join('\n');
       for (const w of ['可能', '也许', '或许', '大概']) assert.ok(!t.includes(w), w);
     }
+  });
+});
+
+describe('返工 R1：2.1.280 -p 真实鉴权文案（复审 HIGH-1）', () => {
+  const REVOKED_P = 'Your account does not have access to Claude. Please login again or contact your administrator.';
+  const ORG_DISABLED = 'Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access';
+
+  test('(b) 吊销令牌（-p）→ 重新登录的修复步骤，不再原样甩报错', async () => {
+    const r = await claudeFailureReply(REVOKED_P, { checkKeychain: keychainStub(false) });
+    assert.match(r, /Claude 登录失效了/);
+    assert.ok(r.includes('claude auth login'));
+    assert.ok(!r.includes('联系组织管理员'));
+  });
+
+  test('(b) 组织停用订阅 → 找管理员 / 查订阅，不查钥匙串、不叫人只重新登录', async () => {
+    const stub = keychainStub(true);
+    const r = await claudeFailureReply(ORG_DISABLED, { checkKeychain: stub });
+    assert.match(r, /订阅访问被组织停用/);
+    assert.match(r, /联系组织管理员恢复访问，或到 claude\.ai 检查订阅状态/);
+    assert.ok(!r.includes(UNLOCK_KEYCHAIN_CMD));
+    assert.equal(stub.calls.length, 0);
+  });
+
+  test('(a) 定时任务遇到吊销令牌 / 组织停用：都不跑自诊断', async () => {
+    for (const err of [REVOKED_P, ORG_DISABLED]) {
+      const diagCalls = [];
+      const sent = [];
+      const out = await handleScheduledFailure({
+        err, jobName: 'job', send: async (t) => { sent.push(t); },
+        runDiagnosis: async () => { diagCalls.push(1); return 'x'; }, checkKeychain: keychainStub(false), log: () => {},
+      });
+      assert.equal(diagCalls.length, 0, err);
+      assert.equal(out.diagnosed, false);
+      assert.match(sent[0], /已跳过自诊断/);
+    }
+  });
+
+  test('(a) 组织停用的定时任务话术是找管理员', async () => {
+    const sent = [];
+    await handleScheduledFailure({
+      err: ORG_DISABLED, jobName: 'job', send: async (t) => { sent.push(t); },
+      runDiagnosis: async () => 'x', checkKeychain: keychainStub(true), log: () => {},
+    });
+    assert.match(sent[0], /联系组织管理员/);
+    assert.ok(!sent[0].includes(UNLOCK_KEYCHAIN_CMD));
+  });
+
+  test('套餐问题（Opus 不在 Pro 套餐里）不是登录失效，原样报', async () => {
+    const msg = 'Claude Opus is not available with the Claude Pro plan. If you have updated your subscription plan recently, run /logout and /login for the plan to take effect.';
+    assert.equal(await claudeFailureReply(msg, { checkKeychain: keychainStub(false) }), `⚠️ Claude 调用失败：${msg}`);
   });
 });
 

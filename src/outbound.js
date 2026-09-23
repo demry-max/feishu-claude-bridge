@@ -280,7 +280,9 @@ export async function sendVoice(client, text, sendRaw) {
 const CLAUDE_TRANSIENT_REFRESH_RE = /another Claude Code process is refreshing/i;
 const CLAUDE_KEYCHAIN_RE = /Keychain is not writable/i;
 const CLAUDE_AUTH_RE =
-  /Not logged in|Please run \/login|Failed to authenticate|OAuth (?:session|access token)[^\n]*expired|could not be refreshed|Invalid authentication credentials|re-?authenticate|OAuth authentication is currently not allowed|Invalid (?:API key|auth token)|API Error: 401\b/i;
+  /Not logged in|Please run \/login|Failed to authenticate|OAuth (?:session|access token)[^\n]*expired|could not be refreshed|Invalid authentication credentials|re-?authenticate|OAuth authentication is currently not allowed|Invalid (?:API key|auth token)|API Error: 401\b|does not have access to Claude|OAuth token (?:has been )?revoked|disabled Claude subscription access/i;
+// 登录故障里「组织停用了订阅访问」一类：重新登录解决不了，要找管理员 / 查订阅
+const CLAUDE_SUBSCRIPTION_DISABLED_RE = /disabled Claude subscription access|OAuth authentication is currently not allowed/i;
 const CLAUDE_NETWORK_RE =
   /API Error: 5\d\d\b|\b(?:502|503|504|529)\b|overloaded|Internal server error|Service Unavailable|Bad Gateway|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|fetch failed|Connection (?:error|lost|closed|reset)|network error|timed out|timeout|超时/i;
 
@@ -296,6 +298,11 @@ export function classifyClaudeError(text) {
 
 /** 要人去重新登录 / 解锁钥匙串的那一类；瞬时刷新与网络都不算 */
 export const isClaudeLoginFailure = (kind) => kind === 'auth' || kind === 'keychain';
+
+/** 登录故障的修复方向：subscription＝组织停用了订阅访问（找管理员 / 查订阅），relogin＝重新登录 */
+export function loginFixVariant(text) {
+  return CLAUDE_SUBSCRIPTION_DISABLED_RE.test(String(text ?? '')) ? 'subscription' : 'relogin';
+}
 
 export const UNLOCK_KEYCHAIN_CMD = 'security unlock-keychain ~/Library/Keychains/login.keychain-db';
 const LOGIN_KEYCHAIN = path.join(os.homedir(), 'Library', 'Keychains', 'login.keychain-db');
@@ -313,8 +320,14 @@ export async function isLoginKeychainLocked({ exec = execFileP, keychainPath = L
   }
 }
 
-/** 确定性修复步骤（与看门狗同一套意思） */
-export function loginFixLines({ kind, keychainLocked }) {
+/** 确定性修复步骤（与看门狗同一套意思）。variant=subscription：组织停用了订阅访问，重新登录解决不了 */
+export function loginFixLines({ kind, keychainLocked, variant = 'relogin' }) {
+  if (variant === 'subscription') {
+    return [
+      '这不是本机登录问题：组织停用了 Claude Code 的订阅访问。联系组织管理员恢复访问，或到 claude.ai 检查订阅状态。',
+      '恢复后在 Mac 终端运行 `claude auth login`，再用 `claude auth status` 确认。',
+    ];
+  }
   if (keychainLocked === true || kind === 'keychain') {
     return [
       '需要你本人在 Mac 前输入登录密码：',
@@ -337,6 +350,10 @@ export async function claudeFailureReply(msg, { checkKeychain = isLoginKeychainL
     return '⚠️ Claude 的登录令牌正在由另一个 claude 进程刷新（瞬时状态，不是登录失效）。过半分钟再发一次。';
   }
   if (!isClaudeLoginFailure(kind)) return `⚠️ Claude 调用失败：${msg}`;
+  const variant = loginFixVariant(msg);
+  if (variant === 'subscription') {
+    return ['⚠️ Claude 的订阅访问被组织停用了。', `报错：\`${errHead(msg)}\``, '', ...loginFixLines({ kind, variant }), '', '恢复后重发这条消息。'].join('\n');
+  }
   const keychainLocked = kind === 'keychain' ? true : await checkKeychain();
   const head = keychainLocked === true
     ? '⚠️ Mac 的登录钥匙串被锁住了，Claude 读不到登录凭据。'
@@ -353,14 +370,15 @@ export async function handleScheduledFailure({ err, jobName, send, runDiagnosis,
   const kind = classifyClaudeError(err);
   if (isClaudeLoginFailure(kind)) {
     log(`[sched] 任务失败（Claude 登录故障，跳过自诊断）: ${redact(err)}`);
-    const keychainLocked = kind === 'keychain' ? true : await checkKeychain();
+    const variant = loginFixVariant(err);
+    const keychainLocked = variant === 'subscription' ? null : kind === 'keychain' ? true : await checkKeychain();
     await send([
       `⚠️ **定时任务失败**：${jobName}（Claude 登录故障，已跳过自诊断）`,
       '',
       `报错：\`${String(err).slice(0, 300)}\``,
       '',
       '**修复**',
-      ...loginFixLines({ kind, keychainLocked }),
+      ...loginFixLines({ kind, keychainLocked, variant }),
       '',
       '修好后这个任务下次到点照常运行。',
     ].join('\n'));
