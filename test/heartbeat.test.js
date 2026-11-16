@@ -130,17 +130,19 @@ describe('测试 1：HEARTBEAT_ENABLED 未设时不启动', () => {
     hb.stop();
   });
 
-  test('默认值：30 分钟 / 每日 12 次 / claude-sonnet-5 / low / 22-08 / none；WATCH 其它值记一行日志按 none', () => {
+  test('默认值：30 分钟 / 每日 12 次 / claude-sonnet-5-5 / low / 22-08 / none；WATCH 的 chat_reply / approval 生效，calendar 和其他值按 none', () => {
     const c = heartbeatConfig({}, quietLog);
     assert.equal(c.intervalMin, 30);
     assert.equal(c.maxRunsPerDay, 12);
-    assert.equal(c.model, 'claude-sonnet-5');
+    assert.equal(c.model, 'claude-sonnet-5-5');
     assert.equal(c.effort, 'low');
     assert.deepEqual(c.quietHours, parseQuietHours('22-08', quietLog));
     assert.equal(c.watch, 'none');
+    assert.equal(heartbeatConfig({ HEARTBEAT_WATCH: 'chat_reply,approval' }, quietLog).watch, 'chat_reply,approval');
     const logs = [];
-    assert.equal(heartbeatConfig({ HEARTBEAT_WATCH: 'im,approval' }, (...a) => logs.push(a.join(' '))).watch, 'none');
+    assert.equal(heartbeatConfig({ HEARTBEAT_WATCH: 'calendar' }, (...a) => logs.push(a.join(' '))).watch, 'none');
     assert.equal(logs.filter((l) => l.includes('HEARTBEAT_WATCH')).length, 1, '只记一行');
+    assert.equal(heartbeatConfig({ HEARTBEAT_WATCH: 'im' }, quietLog).watch, 'none');
   });
 });
 
@@ -197,7 +199,7 @@ describe('测试 3：一个到期项只调一次', () => {
     assert.deepEqual(extra, []);
     assert.equal(onProgress, null, '心跳不发中间进度');
     assert.equal(opts.toolProfile, 'heartbeat');
-    assert.equal(opts.model, 'claude-sonnet-5');
+    assert.equal(opts.model, 'claude-sonnet-5-5');
     assert.equal(opts.effort, 'low');
     assert.ok(!built.args.includes('--resume'), '每拍都是全新上下文');
     assert.ok(prompt.includes('tasks/quote.json'));

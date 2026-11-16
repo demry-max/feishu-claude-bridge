@@ -109,7 +109,7 @@ describe('车道 → 模型（buildClaudeArgs 行为断言）', () => {
       const chat = mod.buildClaudeArgs('oc_x', true, [], { lane: 'chat' });
       const exec = mod.buildClaudeArgs('oc_x', true, [], { lane: 'exec' });
       assert.equal(argVal(chat.args, '--model'), 'claude-fable-5-1');
-      assert.equal(argVal(exec.args, '--model'), 'claude-sonnet-5');
+      assert.equal(argVal(exec.args, '--model'), 'claude-sonnet-5-5');
       assert.equal(chat.lane, 'chat');
       assert.equal(exec.lane, 'exec');
     } finally { restore(); }
@@ -140,7 +140,7 @@ describe('车道 → 模型（buildClaudeArgs 行为断言）', () => {
     const { mod, restore } = await freshClaude(ENV);
     try {
       const s = mod.buildClaudeArgs('sched:weekly.json', true, []);
-      assert.equal(argVal(s.args, '--model'), 'claude-sonnet-5');
+      assert.equal(argVal(s.args, '--model'), 'claude-sonnet-5-5');
       const own = mod.buildClaudeArgs('sched:weekly.json', true, [], { model: 'haiku' });
       assert.equal(argVal(own.args, '--model'), 'claude-haiku-4-5-20251001');
       // 自诊断任务由调用方显式指定 DIAG_MODEL，不受车道影响
@@ -183,9 +183,9 @@ describe('运行时切换执行模型', () => {
     try {
       // 不回写 .env（persist=false），避免测试污染真实配置
       const next = mod.setRuntimeConfig({ execModel: 'sonnet' }, { persist: false });
-      assert.equal(next.execModel, 'claude-sonnet-5');
-      assert.equal(mod.getRuntimeConfig().execModel, 'claude-sonnet-5');
-      assert.equal(argVal(mod.buildClaudeArgs('oc_x', true, [], { lane: 'exec' }).args, '--model'), 'claude-sonnet-5');
+      assert.equal(next.execModel, 'claude-sonnet-5-5');
+      assert.equal(mod.getRuntimeConfig().execModel, 'claude-sonnet-5-5');
+      assert.equal(argVal(mod.buildClaudeArgs('oc_x', true, [], { lane: 'exec' }).args, '--model'), 'claude-sonnet-5-5');
       const off = mod.setRuntimeConfig({ execModel: 'off' }, { persist: false });
       assert.equal(off.execModel, '');
       assert.equal(argVal(mod.buildClaudeArgs('oc_x', true, [], { lane: 'exec' }).args, '--model'), 'claude-fable-5-1');
@@ -196,7 +196,7 @@ describe('运行时切换执行模型', () => {
     const { mod, restore } = await freshClaude({ CLAUDE_MODEL: 'claude-fable-5-1', CLAUDE_EXEC_MODEL: 'sonnet' });
     try {
       assert.throws(() => mod.setRuntimeConfig({ execModel: 'bad name;rm' }, { persist: false }), /不合法/);
-      assert.equal(mod.getRuntimeConfig().execModel, 'claude-sonnet-5');
+      assert.equal(mod.getRuntimeConfig().execModel, 'claude-sonnet-5-5');
     } finally { restore(); }
   });
 });

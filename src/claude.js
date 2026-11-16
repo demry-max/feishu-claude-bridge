@@ -156,7 +156,7 @@ export const MODEL_ALIASES = {
   'fable5': 'claude-fable-5',
   'fable5.1': 'claude-fable-5-1',
   opus: 'claude-opus-5',
-  sonnet: 'claude-sonnet-5',
+  sonnet: 'claude-sonnet-5-5',
   haiku: 'claude-haiku-4-5-20251001',
 };
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];

@@ -7,6 +7,7 @@ import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
 import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand } from './heartbeat.js';
+import { createEventHandlers, heartbeatReplyShortcut, sendCardWithFallback } from './events.js'; import { createWatchSources, createLarkRunner } from './watch-sources.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
@@ -342,6 +343,18 @@ async function handleMessage(data) {
     await reply(message.message_id, out);
     return;
   }
+  // 引用回复心跳消息（BRIDGE-EV-1，HEARTBEAT_REPLY_SHORTCUTS=true 才生效；关时恒为 null，逐字走原流程）：
+  // 正文恰好是「知道了」「推迟一天」「不做了」→ 桥接确定性回写并回一句确认，不进模型；
+  // 其余 → 照常进 owner 对话，ledgerHint 在下面拼提示词时加在末尾
+  let ledgerHint = '';
+  if (isOwner && message.chat_type === 'p2p' && message.parent_id) {
+    const shortcut = await heartbeatReplyShortcut({ message, isOwner, heartbeat });
+    if (shortcut?.reply) {
+      await reply(message.message_id, shortcut.reply);
+      return;
+    }
+    ledgerHint = shortcut?.hint ?? '';
+  }
   if (text === '/status') {
     await reply(message.message_id, sessionInfo(sessionKey, isOwner));
     return;
@@ -486,6 +499,7 @@ async function handleMessage(data) {
     const name = await resolveSenderName(client, senderOpenId);
     if (name) prompt = `[群成员 ${name}]：${prompt}`;
   }
+  if (ledgerHint) prompt += `\n${ledgerHint}`; // 引用回复心跳消息时的台账提示行（BRIDGE-EV-1，见 /heartbeat 块后的引用回复块）
 
   // 记忆自动召回：把可能相关的记忆文件路径提示给模型（只有 owner 有 memory/）
   if (isOwner) {
@@ -551,6 +565,17 @@ async function handleMessage(data) {
 
 const eventDispatcher = new lark.EventDispatcher({}).register({
   'im.message.receive_v1': handleMessage,
+  // 机器人事件 → 「光总对心跳消息的操作」信号（BRIDGE-EV-1）：表情 / 已读 / 撤回原本到达即丢，卡片按钮回调是新增的。
+  // 全部由桥接按确定规则处理：不调模型、永不抛出；按钮回调同步校验后立即回 toast，回写异步排队
+  ...(() => {
+    const ev = createEventHandlers({ getOwner: () => OWNER_OPEN_ID || loadOwner(), heartbeat: () => heartbeat, log: console.log });
+    return {
+      'im.message.reaction.created_v1': ev.reaction,
+      'im.message.message_read_v1': ev.read,
+      'im.message.recalled_v1': ev.recalled,
+      'card.action.trigger': ev.cardAction,
+    };
+  })(),
 });
 
 // ---- 定时任务：到点跑 Claude，把结果主动发到指定会话 ----
@@ -565,29 +590,21 @@ async function sendToChat(chatId, text) {
   return sendMarkdown('chat_id', chatId, text);
 }
 
-// 以应用身份私聊 owner（与启动通知同一条路：receive_id_type=open_id），桥接心跳用
-async function sendToOwner(text) {
+// 以应用身份私聊 owner（与启动通知同一条路：receive_id_type=open_id），桥接心跳用。
+// 返回飞书的 message_id（心跳记消息索引用）；opts.actions 是心跳按钮（HEARTBEAT_BUTTONS=true 才会传）
+async function sendToOwner(text, opts) {
   const owner = OWNER_OPEN_ID || loadOwner();
   if (!owner) throw new Error('还没有 owner open_id（owner 首次私聊机器人后自动绑定）');
-  return sendMarkdown('open_id', owner, text);
+  return sendMarkdown('open_id', owner, text, opts);
 }
 
-async function sendMarkdown(receiveIdType, receiveId, text) {
+// 没有 actions 时卡片逐字是原来的 1.0 markdown 卡片；卡片失败降级纯文本。两条路都返回 message_id（拿不到为 undefined）
+async function sendMarkdown(receiveIdType, receiveId, text, opts = {}) {
   const body = (data) =>
     client.im.v1.message.create({ params: { receive_id_type: receiveIdType }, data: { receive_id: receiveId, ...data } });
   const chunk = redact(text).slice(0, 20000);
-  try {
-    await body({
-      msg_type: 'interactive',
-      content: JSON.stringify({
-        config: { wide_screen_mode: true },
-        elements: [{ tag: 'markdown', content: chunk }],
-      }),
-    });
-  } catch (e) {
-    console.error(`[send] 卡片发送失败（${receiveIdType}），降级纯文本:`, e?.message ?? e);
-    await body({ msg_type: 'text', content: JSON.stringify({ text: chunk }) });
-  }
+  return sendCardWithFallback(body, chunk, opts, (e) =>
+    console.error(`[send] 卡片发送失败（${receiveIdType}），降级纯文本:`, e?.message ?? e));
 }
 
 const SCHEDULES_DIR = path.join(WORKSPACE_DIR, 'schedules');
@@ -796,6 +813,10 @@ const heartbeat = startHeartbeat({
   send: sendToOwner,
   isQuiet: isQuietAnswer,
   describeFailure: describeHeartbeatFailure,
+  // BRIDGE-EV-1：HEARTBEAT_WATCH 的只读拉取（以 owner 身份跑冻结的 lark-cli 只读命令；HEARTBEAT_WATCH 没配时一次都不跑）
+  collectDeltas: createWatchSources({ runner: createLarkRunner(), getOwner: () => OWNER_OPEN_ID || loadOwner(), log: console.log }),
+  // 按钮 / 引用回复回写后在当天 journal 记一行（与提示词里的 memory/journal/ 同一目录）
+  journalDir: path.join(WORKSPACE_DIR, 'memory', 'journal'),
 });
 
 console.log('启动飞书长连接…');
