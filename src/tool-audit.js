@@ -5,8 +5,9 @@
 // 原始工具输入只留在进程内存里给本轮回执用（回执同样先 redact、只露目标尾号与正文前 20 字）。
 // 本模块加载时没有副作用（不读环境变量、不建目录、不开定时器）：claude.js、index.js、mcp-feishu.js 都可以直接 import。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { classifyCommand, classifySegments, auditName, safeToolName, STRICT_TOOLS, FEISHU_MCP_READ } from './tool-policy.js';
+import { classifyCommand, classifySegments, auditName, safeToolName, STRICT_TOOLS, FEISHU_MCP_READ, checkOutputTargets } from './tool-policy.js';
 import { fenceUntrusted } from './messages.js';
 
 const MAX_AUDIT_BYTES = 5 * 1024 * 1024;
@@ -15,11 +16,29 @@ const nameOrNull = (v) => (v == null ? null : auditName(v));
 const SCHED_TOOLS = new Set(['Read', 'Grep', 'Glob', 'Edit', 'Write', 'ToolSearch', 'Skill']);
 const SCHED_MCP = new Set(FEISHU_MCP_READ.map((t) => `mcp__feishu__${t}`));
 
+// BRIDGE-PERM-2：strict/audit 的输出路径提权闸用的注入项。owner 写文件只能落在 workspace 的 outbox/ 或系统临时目录；
+// .claude / CLAUDE.md / skills / schedules / tasks 一律不可作为落点（判定逻辑在纯函数 checkOutputTargets 里）。
+// 真实 fs 每次判定时现取，模块加载时不碰文件系统（与本模块「加载无副作用」的约定一致）。
+function guardOptions(workspace) {
+  const readlink = (p) => {
+    try { return fs.readlinkSync(p); } catch { return null; }
+  };
+  return {
+    cwd: workspace,
+    workspace,
+    tmpDirs: [os.tmpdir(), '/tmp'],
+    realpath: fs.realpathSync,
+    readlink,
+    home: os.homedir(),
+    vars: { HOME: process.env.HOME, TMPDIR: process.env.TMPDIR },
+  };
+}
+
 /**
  * 按 strict 档的规则预判一次调用（audit 档用它预演 strict；strict 档用它和真实的 permission_denials 对账）。
- * 只返回安全名，不返回任何参数。
+ * 只返回安全名，不返回任何参数。workspace 非空时再过一道输出路径闸：写到 outbox/临时目录之外（或保护区）判拒。
  */
-function judge(use, kind, profile, confirm) {
+function judge(use, kind, profile, confirm, workspace = null) {
   const name = use?.name;
   if (name === 'Bash') {
     const command = typeof use?.input?.command === 'string' ? use.input.command : '';
@@ -28,6 +47,8 @@ function judge(use, kind, profile, confirm) {
     if (kind === 'sched') decision = c.profileAllowed.sched ? 'allow' : 'deny';
     else if (c.class === 'confirm') decision = profile === 'strict' && confirm === true ? 'allow' : 'confirm';
     else decision = c.decision;
+    // 输出路径提权闸：strict 真拒（PreToolUse 钩子落地），audit 记「将拒绝」。已判 deny 的不必再过。
+    if (workspace && decision !== 'deny' && !checkOutputTargets(command, guardOptions(workspace)).ok) decision = 'deny';
     if (c.lark) return { tool: 'Bash', domain: nameOrNull(c.domain), cmd: nameOrNull(c.cmd), method: nameOrNull(c.method), decision };
     return { tool: 'Bash', domain: null, cmd: nameOrNull(c.program), method: null, decision };
   }
@@ -42,7 +63,7 @@ function judge(use, kind, profile, confirm) {
  * result 事件（带 permission_denials）到了才落盘；进程中途退出没有 result 时由 flush() 补写。flush 幂等。
  * onToolEvent 收到 {phase:'use'|'result'|'denied', …}（含原始输入，只在进程内给回执用）。
  */
-export function createToolRecorder({ kind = 'chat', profile = 'audit', confirm = false, file, onToolEvent = null, now = () => new Date(), log = console } = {}) {
+export function createToolRecorder({ kind = 'chat', profile = 'audit', confirm = false, workspace = null, file, onToolEvent = null, now = () => new Date(), log = console } = {}) {
   const uses = [];
   const seen = new Set();
   const denied = new Set();
@@ -61,7 +82,7 @@ export function createToolRecorder({ kind = 'chat', profile = 'audit', confirm =
     const records = uses.map((u) => ({
       ts: u.ts,
       kind,
-      ...judge(u, kind, profile, confirm),
+      ...judge(u, kind, profile, confirm, workspace),
       denied: u.fromDenial === true || (typeof u.id === 'string' && denied.has(u.id)),
     }));
     if (records.length) appendToolAudit(file, records, { log });
@@ -389,6 +410,7 @@ export function formatReceipt(events, { redact = String, detail = true } = {}) {
 /**
  * index.js 的一轮 owner 对话包装：audit/strict 下收集工具事件、给回复附回执；strict 的 owner 私聊处理「确认」。
  * legacy 与访客原样透传（同一个 runClaude、prompt 不变、回执恒等）。不改调用方传入的 opts。
+ * BRIDGE-PERM-2 Q3：回执只在 owner 私聊出现；群里 owner 轮次不附回执（写动作照常进审计），避免在群里回放目标与正文。
  */
 export function createToolTurn({ profile, isOwner, chatType, prompt, confirm, runClaude, redact = String } = {}) {
   if (isOwner !== true || (profile !== 'audit' && profile !== 'strict')) {
@@ -408,7 +430,8 @@ export function createToolTurn({ profile, isOwner, chatType, prompt, confirm, ru
     prompt: confirmOn ? confirm.prompt : prompt,
     runClaude: wrapped,
     withReceipt: (answer) => {
-      const r = formatReceipt(events, { redact, detail: chatType === 'p2p' });
+      if (chatType !== 'p2p') return answer; // Q3：群聊不附回执
+      const r = formatReceipt(events, { redact, detail: true });
       return r ? `${answer}\n\n${r}` : answer;
     },
   };

@@ -1,0 +1,176 @@
+// BRIDGE-PERM-2：strict/audit 下写文件落点闸。纯函数 checkOutputTargets/outputTargets 的合成用例、
+// 真实目录树里的符号链接逃逸、经审计收集器的 judge 闸（有/无 workspace）、output-guard 钩子子进程、
+// 以及词法器改动后分类结果对基线的逐字回归（语料在夹具里，断言从不回显命令本身）。
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { checkOutputTargets, outputTargets, classifySegments, classifyCommand } from '../src/tool-policy.js';
+import { createToolRecorder } from '../src/tool-audit.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO = path.resolve(__dirname, '..');
+
+// ---------- 纯词法用例：realpath/readlink 注入 null → 纯词法解析，不碰 fs ----------
+const PURE = { cwd: '/ws', workspace: '/ws', tmpDirs: ['/tmp'], realpath: null, readlink: null, home: '/home/u', vars: {} };
+const run = (cmd, opts = PURE) => checkOutputTargets(cmd, opts);
+
+test('测PERM2-out1 outputTargets：hasLark 识别与落点抽取', () => {
+  assert.equal(outputTargets('lark-cli im +chat-list > a.json').hasLark, true);
+  assert.equal(outputTargets('echo hi > a.json').hasLark, false, '非 lark 命令不算 lark');
+  assert.deepEqual(outputTargets('lark-cli im +chat-list > a.json').targets.map((t) => t.target), ['a.json']);
+  assert.deepEqual(outputTargets('lark-cli im +chat-list --output b.json').targets.map((t) => t.target), ['b.json']);
+  assert.deepEqual(outputTargets('cd skills && lark-cli im +chat-list > a').cds.map((c) => c.target), ['skills']);
+});
+
+test('测PERM2-out2 lark 读命令：落点在 outbox/临时目录放行，其它一律拒', () => {
+  // 放行
+  for (const cmd of [
+    'lark-cli im +chat-list > outbox/a.json',
+    'lark-cli im +chat-list >> outbox/a.json',
+    'lark-cli im +chat-list --output outbox/a.json',
+    'lark-cli im +chat-list -o outbox/a.json',
+    'lark-cli im +chat-list | tee outbox/a.json',
+    'lark-cli im +chat-list > /tmp/a.json',
+  ]) {
+    const r = run(cmd);
+    assert.equal(r.ok, true, `应放行：${cmd.replace(/lark-cli.*?list/, 'lark …')}`);
+    assert.equal(r.deny.length, 0);
+  }
+  // 拒绝 + 原因
+  const want = [
+    ['lark-cli im +chat-list > a.json', 'not-outbox'],
+    ['lark-cli im +chat-list > .claude/x', 'protected'],
+    ['lark-cli im +chat-list > skills/x', 'protected'],
+    ['lark-cli im +chat-list > schedules/x', 'protected'],
+    ['lark-cli im +chat-list > tasks/x', 'protected'],
+    ['lark-cli im +chat-list > CLAUDE.md', 'protected'],
+    ['lark-cli im +chat-list > .mcp.json', 'protected'],
+    ['lark-cli im +chat-list -o skills/x', 'protected'],
+    ['lark-cli im +chat-list | tee skills/x', 'protected'],
+    ['lark-cli im +chat-list > /etc/x', 'outside'],
+    ['lark-cli im +chat-list > "$HOME/x"', 'dynamic'],
+    ['lark-cli im +chat-list > outbox/../skills/x', 'protected'],
+  ];
+  for (const [cmd, reason] of want) {
+    const r = run(cmd);
+    assert.equal(r.ok, false, `应拒绝：落点 ${reason}`);
+    assert.ok(r.deny.some((d) => d.reason === reason), `原因含 ${reason}（实得 ${r.deny.map((d) => d.reason).join('/')}）`);
+  }
+});
+
+test('测PERM2-out3 非 lark 命令：只有写进保护区才拒，写别处不管', () => {
+  assert.equal(run('echo hi > a.json').ok, true, '非 lark 写工作区普通文件不限制');
+  assert.equal(run('echo hi > /etc/a').ok, true, '非 lark 写区外不限制');
+  const prot = run('echo hi > .claude/x');
+  assert.equal(prot.ok, false);
+  assert.ok(prot.deny.some((d) => d.reason === 'protected'));
+});
+
+test('测PERM2-out4 cd 进保护区：相对写一律拒（cwd-protected）', () => {
+  const r = run('cd skills && lark-cli im +chat-list > a');
+  assert.equal(r.ok, false);
+  assert.ok(r.deny.some((d) => d.reason === 'cwd-protected' || d.reason === 'protected'));
+});
+
+test('测PERM2-out5 真实目录树：符号链接逃逸按物理路径判', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-sym-'));
+  const ws = path.join(tmp, 'ws');
+  for (const d of ['.claude', 'skills', 'outbox']) fs.mkdirSync(path.join(ws, d), { recursive: true });
+  fs.symlinkSync(path.join(ws, '.claude'), path.join(ws, 'esc')); // esc → .claude
+  fs.symlinkSync(path.join(ws, 'skills'), path.join(ws, 'outbox', 'up')); // outbox/up → skills
+  const opts = {
+    cwd: ws, workspace: ws, tmpDirs: [os.tmpdir(), '/tmp'],
+    realpath: fs.realpathSync, readlink: (p) => { try { return fs.readlinkSync(p); } catch { return null; } },
+    home: os.homedir(), vars: { HOME: process.env.HOME, TMPDIR: process.env.TMPDIR },
+  };
+  try {
+    assert.equal(checkOutputTargets('lark-cli im +chat-list > outbox/real.json', opts).ok, true, 'outbox 真实文件放行');
+    assert.equal(checkOutputTargets('lark-cli im +chat-list > esc/x', opts).ok, false, 'esc→.claude 逃逸拒绝');
+    assert.equal(checkOutputTargets('lark-cli im +chat-list > outbox/up/x', opts).ok, false, 'outbox/up→skills 逃逸拒绝');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------- 经审计收集器走 judge 闸：workspace 非空才过落点闸 ----------
+test('测PERM2-out6 judge 闸：有 workspace 时 read 级 lark 写保护区落 deny；无 workspace 时按类放行', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-judge-'));
+  const ws = path.join(tmp, 'ws');
+  fs.mkdirSync(ws, { recursive: true });
+  const decisionFor = (workspace) => {
+    const file = path.join(tmp, `audit-${workspace ? 'ws' : 'nows'}.jsonl`);
+    const rec = createToolRecorder({ kind: 'chat', profile: 'strict', confirm: false, workspace, file, log: { error() {} } });
+    rec.assistant({ message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'lark-cli im +chat-list > .claude/x' } }] } });
+    rec.flush();
+    const rows = fs.readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    return rows[0].decision;
+  };
+  try {
+    assert.equal(decisionFor(ws), 'deny', 'read 级 lark 写 .claude：有 workspace 时被落点闸判 deny');
+    assert.equal(decisionFor(null), 'allow', '无 workspace 时不过落点闸，按命令分类放行');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------- output-guard 钩子子进程：一律 fail closed，绝不 allow ----------
+const GUARD = path.join(REPO, 'src', 'hooks', 'output-guard.js');
+const runGuard = (argv, input) => spawnSync(process.execPath, [GUARD, ...argv], { input, encoding: 'utf8' });
+
+test('测PERM2-out7 output-guard 钩子：越界写 deny JSON、合规静默、非 Bash 放行', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-guard-'));
+  try {
+    const deny = runGuard([ws], JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'lark-cli im +chat-list > .claude/x' }, cwd: ws }));
+    assert.equal(deny.status, 0);
+    const j = JSON.parse(deny.stdout);
+    assert.equal(j.hookSpecificOutput.hookEventName, 'PreToolUse');
+    assert.equal(j.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(j.hookSpecificOutput.permissionDecisionReason, /outbox/);
+
+    const ok = runGuard([ws], JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'lark-cli im +chat-list > outbox/x.json' }, cwd: ws }));
+    assert.equal(ok.status, 0);
+    assert.equal(ok.stdout.trim(), '', '合规落点静默放行，不输出 allow');
+
+    const nonbash = runGuard([ws], JSON.stringify({ tool_name: 'Read', tool_input: { file_path: '/x' }, cwd: ws }));
+    assert.equal(nonbash.status, 0);
+    assert.equal(nonbash.stdout.trim(), '', '非 Bash 放行');
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('测PERM2-out8 output-guard 钩子 fail closed：坏输入 / 缺 workspace / 缺 command 都 exit 2', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-guard2-'));
+  try {
+    assert.equal(runGuard([ws], 'not json').status, 2, '坏输入 exit 2');
+    assert.equal(runGuard([ws], JSON.stringify(['array'])).status, 2, '非对象 exit 2');
+    assert.equal(runGuard([], JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'x' } })).status, 2, '缺 workspace exit 2');
+    assert.equal(runGuard(['relative/path'], JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'x' } })).status, 2, 'workspace 非绝对 exit 2');
+    assert.equal(runGuard([ws], JSON.stringify({ tool_name: 'Bash', tool_input: {} })).status, 2, 'Bash 缺 command exit 2');
+    // 绝不输出 allow（无论哪条分支）
+    for (const out of [runGuard([ws], 'x').stdout, runGuard([ws], JSON.stringify({ tool_name: 'Bash', tool_input: {} })).stdout]) {
+      assert.ok(!/allow/.test(out), '任何分支都不得 allow');
+    }
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+// ---------- 分类回归：词法器加了重定向记录后，分类结果必须与基线逐字相同 ----------
+// 语料在夹具里（可能含攻击形状命令）；断言只比对 JSON 串、失败只报漂移下标，从不回显命令本身。
+test('测PERM2-out9 分类回归：classifySegments/classifyCommand 对基线语料逐字不变', () => {
+  const FIXTURE = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'owner-perm2-legacy-16c0757.json'), 'utf8'));
+  assert.ok(Array.isArray(FIXTURE.classify) && FIXTURE.classify.length >= 40, '语料至少 40 条');
+  const driftSeg = [];
+  const driftCmd = [];
+  FIXTURE.classify.forEach((e, i) => {
+    if (JSON.stringify(classifySegments(e.cmd)) !== JSON.stringify(e.segments)) driftSeg.push(i);
+    if (JSON.stringify(classifyCommand(e.cmd)) !== JSON.stringify(e.command)) driftCmd.push(i);
+  });
+  assert.deepEqual(driftSeg, [], 'classifySegments 漂移的用例下标');
+  assert.deepEqual(driftCmd, [], 'classifyCommand 漂移的用例下标');
+});

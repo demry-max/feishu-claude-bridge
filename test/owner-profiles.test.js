@@ -118,7 +118,8 @@ const prefixRules = (e) => ['', '--as user ', '--as bot ']
 const rulesOfClass = (...cls) => LARK_POLICY.filter((e) => cls.includes(e.class)).flatMap(prefixRules);
 
 const STRICT_TOOLS = 'Read,Grep,Glob,Edit,Write,Bash,WebSearch,ToolSearch,Skill';
-const CHAT_BASE = ['Read', 'Grep', 'Glob', 'WebSearch', 'Edit(./memory/**)', 'Edit(./skills/**)', 'Edit(./schedules/**)',
+// BRIDGE-PERM-2 Q1-B：strict 对话不再放行 Edit(./skills/**)（技能提权路）
+const CHAT_BASE = ['Read', 'Grep', 'Glob', 'WebSearch', 'Edit(./memory/**)', 'Edit(./schedules/**)',
   'Edit(./outbox/**)', 'Edit(./tasks/**)'];
 const ACCOUNT = ['Artifact', 'CronCreate', 'CronDelete', 'CronList', 'RemoteTrigger', 'PushNotification', 'SendMessage',
   'Workflow', 'ListAgents', 'ScheduleWakeup', 'DesignSync', 'Monitor', 'EnterWorktree', 'ExitWorktree', 'NotebookEdit', 'Agent', 'Task'];
@@ -219,7 +220,8 @@ test('测3 strict 对话：9 个内置工具、lark 按子命令放行（无确�
   assert.equal(val(r.args, '--tools'), STRICT_TOOLS);
   const allowed = list(r.args, '--allowedTools');
   assert.deepEqual(sorted(allowed), sorted([...CHAT_BASE, ...larkRules('chat'), 'mcp__feishu']));
-  for (const t of ['Bash(lark-cli:*)', 'Bash(lark-cli)', 'Bash', 'WebFetch']) assert.ok(!allowed.includes(t), t);
+  // Q1-B：技能写入路（Edit/Write(./skills/**)）不在对话白名单里
+  for (const t of ['Bash(lark-cli:*)', 'Bash(lark-cli)', 'Bash', 'WebFetch', 'Edit(./skills/**)', 'Write(./skills/**)']) assert.ok(!allowed.includes(t), t);
   assert.ok(allowed.includes('Bash(lark-cli im +messages-send:*)'));
   assert.ok(allowed.includes('Bash(lark-cli --as user im +messages-send:*)'));
   for (const rule of rulesOfClass('confirm', 'deny')) assert.ok(!allowed.includes(rule), rule);
@@ -363,13 +365,32 @@ test('测5 确认通道：strict 私聊「确认 发吧」本轮加确认级规�
 });
 
 // ---------- 测 14：心跳、访客、sched-diag ----------
-test('测14 心跳与访客 argv 三档都不变；sched-diag 三档都等于 legacy', async () => {
+test('测14 心跳与访客 argv 三档都不变；sched-diag legacy 等于基线、audit/strict 走无工具档', async () => {
+  // 心跳 / 访客：三档 argv 逐字不变
   for (const profile of ['legacy', 'audit', 'strict']) {
-    for (const name of ['heartbeat', 'guest', 'guestFile', 'schedDiag']) {
+    for (const name of ['heartbeat', 'guest', 'guestFile']) {
       const c = CASES[name];
       const m = await load({ ...c.env, OWNER_TOOL_PROFILE: profile });
       assert.deepEqual(snap(m.buildClaudeArgs(...structuredClone(c.call))), fixtureOf(name), `${profile}/${name}`);
     }
+  }
+  // sched-diag：legacy 逐字等于基线；audit/strict 改走「无任何工具」的自诊断档（BRIDGE-PERM-2 Q2）
+  const d = CASES.schedDiag;
+  const legacy = await load({ ...d.env, OWNER_TOOL_PROFILE: 'legacy' });
+  assert.deepEqual(snap(legacy.buildClaudeArgs(...structuredClone(d.call))), fixtureOf('schedDiag'), 'legacy/schedDiag');
+  for (const profile of ['audit', 'strict']) {
+    const m = await load({ ...d.env, OWNER_TOOL_PROFILE: profile });
+    const r = m.buildClaudeArgs(...structuredClone(d.call));
+    const args = r.args;
+    r.cleanup();
+    assert.equal(r.cwd, ws, `${profile}/schedDiag 在 workspace 里跑`);
+    assert.equal(val(args, '--tools'), '', `${profile}/schedDiag 不带任何工具`);
+    assert.equal(val(args, '--setting-sources'), '', `${profile}/schedDiag 不读项目设置`);
+    assert.ok(args.includes('--strict-mcp-config'), `${profile}/schedDiag --strict-mcp-config`);
+    assert.ok(!args.includes('--mcp-config'), `${profile}/schedDiag 不挂 MCP`);
+    assert.ok(!args.includes('--allowedTools'), `${profile}/schedDiag 不预批工具`);
+    assert.equal(val(args, '--model'), 'claude-test-diag', `${profile}/schedDiag 透传模型`);
+    assert.match(val(args, '--append-system-prompt'), /没有任何工具/, `${profile}/schedDiag 系统提示标明无工具`);
   }
 });
 

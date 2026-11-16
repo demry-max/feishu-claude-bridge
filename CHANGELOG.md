@@ -74,6 +74,32 @@
 - 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md`（本版不改 `workspace/CLAUDE.md`）。
 - 测试：新增 `test/tool-policy.test.js`、`test/owner-profiles.test.js`、`test/tool-audit.test.js` 与两个夹具；既有测试一个未改。
 
+### BRIDGE-PERM-2
+
+> strict 档补洞：技能 / `.claude` 提权路、写文件落点、排查诊断工具面、群聊回执。全部只在 `audit` / `strict` 下生效，`legacy` 逐字不变。
+
+- **技能提权封堵（audit / strict）**：同步技能时，`SKILL.md` 的 frontmatter 顶层键若是 `allowed-tools` / `hooks`
+  （含 `"allowed-tools"` 引号写法、`allowed_tools` 下划线变体、`disallowed-tools`）连同其缩进续行一起剥掉，正文一字不动、无 frontmatter 原样保留；
+  技能树里的符号链接（含指向目录的）整棵跳过。用户级 `lark-*` 技能（`syncExtraSkills`）同样剥。
+- **`.claude` 外来文件隔离（audit / strict）**：工作区 `.claude/` 下除桥接自己同步的真目录 `skills/` 外，
+  `settings*.json` / `hooks/` / `commands/` / `agents/` / `CLAUDE.md` 等一律移进 `workspace/.claude-quarantine/`（带时间戳改名、不加载也不删）。
+  strict 下隔离失败即 fail closed——抛「claude CLI 启动失败」（命中 `NEVER_RETRY`，不重试、宁可本轮不跑）；audit 兜底继续并记「无法隔离」日志。
+  `skills/` 被换成软链或文件时同样隔离。legacy 仍是逐字节 `cpSync`，不隔离、不剥 frontmatter、不同步用户级技能。
+- **strict 对话去掉 `skills/` 写权（Q1-B）**：strict 对话档 `--allowedTools` 不再含 `Edit(./skills/**)` / `Write(./skills/**)`，
+  仍保留 `memory/` / `schedules/` / `outbox/` / `tasks/` 的写权。技能只能由桥接单向同步进来。
+- **写文件落点闸（audit / strict）**：`lark-cli` 读类子命令若带 `--output` / `-o` / `>` / `>>` / `| tee`，落点必须在工作区 `outbox/`
+  或系统临时目录，否则 strict 拒绝、audit 记「将会拒绝」；`.claude/`、`CLAUDE.md`、`schedules/`、`skills/`、`tasks/`、`.mcp.json`
+  永不是合法落点；`cd` 进保护区后的相对落点、`../` 与符号链接逃逸都按物理路径判。纯函数 `checkOutputTargets` / `outputTargets`
+  （`src/tool-policy.js`）可注入 `realpath`/`readlink`；内联 PreToolUse 钩子 `src/hooks/output-guard.js` 一律 fail closed（坏输入 / 缺 workspace / 缺命令都 `exit 2`，任何分支都不输出 `allow`）。
+- **排查诊断（sched-diag）无工具档（audit / strict，Q2）**：定时任务排查诊断轮用 `--setting-sources ''` + `--strict-mcp-config` + `--tools ''`
+  （外加 `--disallowedTools` 黑名单兜底、`autoMemoryEnabled:false`），`job.prompt` 与报错包进随机 nonce 的不可信围栏；legacy 的排查诊断逐字不变。
+- **群聊不附回执（Q3）**：owner 以名义对外的动作，回执「— 本轮以你名义：…」只在 owner 私聊（`p2p`）末尾追加；
+  群聊轮不附回执（群里的写动作仍照常记审计）。
+- 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md` §五（本版不改 `workspace/CLAUDE.md`）。本卡未引入新 `.env` 项。
+- 测试：新增 `test/owner-profiles-perm2.test.js`（legacy 全矩阵回归、同步树、隔离 + 剥键、fail-closed、Q1-B、sched-diag）、
+  `test/tool-policy-output.test.js`（落点闸纯函数 / 真实软链逃逸 / 审计 judge 闸 / 钩子子进程 / 词法分类对基线逐字回归）与两个夹具；
+  既有 `test/owner-profiles.test.js`、`test/tool-audit.test.js` 各补测。
+
 ## [2.3.0] - 2026-09-14
 
 ### 新增

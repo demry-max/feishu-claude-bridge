@@ -338,7 +338,7 @@ test('测13 回执：成功的写/确认级调用按类计数；失败/被拒/�
     '— 本轮以你名义：发邮件 1 封、处理审批 2 项、审批实例操作 1 项、撤回消息 1 条、建群 1 个、改群 1 次、群成员变更 1 次');
 });
 
-test('测13 createToolTurn：strict/audit 的 owner 轮次收集事件并附回执；群聊只给计数；legacy 与访客原样透传', async () => {
+test('测13 createToolTurn：strict/audit 的 owner 轮次收集事件并附回执；群聊不附回执（仍审计）；legacy 与访客原样透传', async () => {
   const fakeRun = (events) => async (chatId, prompt, isOwner, extra, onProgress, opts) => {
     for (const e of events) opts.onToolEvent(e);
     return `答:${prompt}`;
@@ -352,9 +352,10 @@ test('测13 createToolTurn：strict/audit 的 owner 轮次收集事件并附回�
   assert.deepEqual(opts, { lane: 'chat' }, '不改调用方的 opts');
   assert.equal(t.withReceipt(ans), `答:x\n\n${formatReceipt(RECEIPT_EVENTS, { redact })}`);
 
+  // BRIDGE-PERM-2 Q3：群聊里 owner 轮次不附任何回执（连计数也不给），但写操作仍照常审计
   const g = createToolTurn({ profile: 'audit', isOwner: true, chatType: 'group', prompt: 'x', confirm: none, runClaude: fakeRun(RECEIPT_EVENTS), redact });
   await g.runClaude('oc_g', g.prompt, true, [], null, { lane: 'chat' });
-  assert.equal(g.withReceipt('答'), '答\n\n— 本轮以你名义：发消息 2 条、导入文档 1 个、建日程 1 个、发邮件 1 封', '群聊不露目标与正文');
+  assert.equal(g.withReceipt('答'), '答', '群聊不附回执');
 
   const q = createToolTurn({ profile: 'strict', isOwner: true, chatType: 'p2p', prompt: 'x', confirm: none, runClaude: fakeRun([use('r', 'lark-cli im +chat-list'), res('r')]), redact });
   await q.runClaude('oc_x', q.prompt, true, [], null, {});

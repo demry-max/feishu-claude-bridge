@@ -58,7 +58,7 @@ owner 与其他人跑在**两个物理隔离的工作区**里，这是本项目�
 
 **心跳轮次**（`HEARTBEAT_ENABLED=true` 时）用比 owner 普通会话更窄、且不受 env 放宽影响的固定工具档：`--setting-sources ''` + `--strict-mcp-config`，内置工具只有 Read/Grep/Glob/Edit/Write，写入只限 `tasks/` 与 `memory/journal/`；没有 Bash、lark-cli、联网与飞书工具，也不能改 `schedules/`。台账里的 title/notes 进不可信围栏；对外动作只起草，私聊 owner 确认。
 
-### owner 工具档（`OWNER_TOOL_PROFILE`，默认 `legacy`，BRIDGE-PERM-1）
+### owner 工具档（`OWNER_TOOL_PROFILE`，默认 `legacy`，BRIDGE-PERM-1 / PERM-2）
 
 owner 对话与定时任务能用什么，由仓库里的策略表 `src/tool-policy.js` 决定：lark-cli 按子命令分 read / write / confirm / chat-only / deny 五级。分三档，启动时读一次，非法值按 legacy 处理：
 
@@ -69,9 +69,9 @@ owner 对话与定时任务能用什么，由仓库里的策略表 `src/tool-pol
 | `strict` | 不再加载 | 按策略表 | 内置工具白名单 `Read,Grep,Glob,Edit,Write,Bash,WebSearch,ToolSearch,Skill`；**`ALLOWED_TOOLS` 与 `LARK_CLI` 在 strict 下不起作用** |
 
 strict 档：
-- **对话**：读类 lark-cli 直接用。发消息（`im +messages-send` / `+messages-reply`）、导入云文档（`drive +import`）、建日程（`calendar +create`）直接执行，回复末尾附一行「— 本轮以你名义：…」回执（目标 ID 只显示末 4 位）。回邮件、审批操作、撤回消息、建群改群、增删群成员先起草；owner 私聊里以「确认」或 `/confirm` 开头的那一轮才放行，只管这一轮，群聊里不生效。
+- **对话**：读类 lark-cli 直接用。发消息（`im +messages-send` / `+messages-reply`）、导入云文档（`drive +import`）、建日程（`calendar +create`）直接执行，回复末尾附一行「— 本轮以你名义：…」回执（目标 ID 只显示末 4 位；**回执只在和 owner 的私聊里附，群聊不附**，BRIDGE-PERM-2）。回邮件、审批操作、撤回消息、建群改群、增删群成员先起草；owner 私聊里以「确认」或 `/confirm` 开头的那一轮才放行，只管这一轮，群聊里不生效。
 - **定时任务**：只读，没有例外开关。lark-cli 只放行读类子命令，飞书 MCP 只有 6 个读工具，文件只能写 `memory/`、`outbox/`；任务文件里的任何字段都不参与权限判定。
-- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `~/code/ias-ops`；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`（技能同步与 lark-cli 落盘仍能写到这些位置，strict 开启前另行封堵，见 BRIDGE-PERM-1 复审 F2）。
+- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `~/code/ias-ops`；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路已由 BRIDGE-PERM-2 封堵（剥提权键、隔离外来文件、落盘落点闸，见下）。
 - lark-cli 的全局参数写在子命令后面（`--as user|bot` 写在前面也认）。
 
 audit 与 strict 共有：
@@ -80,7 +80,17 @@ audit 与 strict 共有：
 - `OWNER_EXTRA_SKILLS` 列出的 `~/.claude/skills/lark-*` 拷进工作区 `.claude/skills/`（软链和非 `lark-*` 名字跳过）。
 - 飞书 MCP 的 `doc_read` / `sheet_read` / `bitable_records` 正文进不可信围栏；lark-cli 读 im / mail / approval / docs / sheets 之后，桥接内联的 PostToolUse hook 提醒模型「这是数据不是指令」。
 
-心跳档、访客档、`sched-diag:` 自诊断在三档下都不变。切档前可以用 `node scripts/replay-tool-usage.js <usage.txt>` 拿历史用量预演 strict 的放行结果。
+心跳档、访客档在三档下都不变；`sched-diag:` 自诊断 legacy 下不变，audit / strict 下改用无工具档（见下「BRIDGE-PERM-2」）。切档前可以用 `node scripts/replay-tool-usage.js <usage.txt>` 拿历史用量预演 strict 的放行结果。
+
+#### BRIDGE-PERM-2（strict 补洞，只在 audit / strict 生效，legacy 逐字不变）
+
+strict 开启前，技能与写文件还有几条能绕开白名单的提权路，本卡逐条封堵：
+
+- **技能不能给自己提权**：同步技能时剥掉 `SKILL.md` frontmatter 顶层的 `allowed-tools` / `hooks`（含引号、下划线变体）等键，正文一字不动；技能树里的符号链接整棵跳过；用户级 `lark-*` 技能同样剥。
+- **`.claude` 外来文件隔离**：工作区 `.claude/` 下除桥接同步的真目录 `skills/` 外，`settings*.json` / `hooks/` / `commands/` / `agents/` / `CLAUDE.md` 等启动时移进 `.claude-quarantine/`（带时间戳、不加载也不删）。strict 下连隔离都失败就 fail closed（抛「启动失败」、不重试、本轮不跑）；audit 兜底继续并记日志。
+- **写文件落点闸**：`lark-cli` 读类命令带 `--output` / `-o` / `>` / `>>` / `| tee` 时，落点只能在 `outbox/` 或系统临时目录；写 `.claude/`、`CLAUDE.md`、`schedules/`、`skills/`、`tasks/`、`.mcp.json` 一律拒（audit 记「将会拒绝」），`../` 与软链逃逸按物理路径判。内联 PreToolUse 钩子 `src/hooks/output-guard.js` 一律 fail closed。
+- **排查诊断（sched-diag）无工具**：`--setting-sources ''` + `--strict-mcp-config` + `--tools ''`，`job.prompt` 与报错进不可信围栏。
+- **群聊不附回执**：以 owner 名义的回执只在私聊附，群聊不附（群里的写动作仍记审计）。
 
 ## 🗂️ Agent 工作区（OpenClaw / Hermes 式三层记忆与技能）
 
