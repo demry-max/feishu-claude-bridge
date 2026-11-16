@@ -715,3 +715,358 @@ describe('合并补发分包', () => {
     assert.ok(st.sent['seed-0'] !== undefined);
   });
 });
+
+// ================================================================ BRIDGE-HB-1B：复审遗留 LOW 项
+
+// 10:00 起每分钟一拍：退避按「拍」计，与心跳间隔无关
+const minute = (b) => new Date(at(2026, 11, 16, 10, 0).getTime() + b * 60_000);
+// 预置待发队列（当天、额度未用、无台账状态）
+function seedQueue(env, bodies) {
+  fs.mkdirSync(path.dirname(env.stateFile), { recursive: true });
+  const pending = bodies.map((body, i) => ({ at: '2026-11-16T01:00:00.000Z', hash: `seed-${i}`, body, slugs: [] }));
+  fs.writeFileSync(env.stateFile, JSON.stringify({ version: 1, day: '2026-11-16', runs: 0, tasks: {}, sent: {}, pending }));
+  return pending;
+}
+// 首尾各带唯一标记的长正文：每包（≤ 18,000）恰好装 3 条
+const big = (tag, len = 5000) => `${tag}-START ${'y'.repeat(len - tag.length * 2 - 12)} ${tag}-END`;
+async function beatAt(h, d) {
+  h.setNow(d);
+  const before = h.calls.length;
+  const { action } = await h.hb.beat();
+  return { action, ran: h.calls.length > before };
+}
+
+describe('BRIDGE-HB-1B 第 1 项：时钟回拨不清零', () => {
+  test('日期变早时沿用原计数并记日志；时钟追回同一天仍按原计数；本地日期真正越过才清零', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask());
+    let n = 0;
+    const h = harness(env, {
+      config: CFG({ maxRunsPerDay: 2 }),
+      // 桩模型每次都改一下台账（仍然到期）：哈希一直在变，不会落进退避，这里只看每日上限
+      answer: () => {
+        n += 1;
+        writeTask(env, 'quote', dueTask({ notes: `第 ${n} 次检查，对方仍未回复` }));
+        return 'HEARTBEAT_OK';
+      },
+    });
+    // REVIEW LOW-1 探针 P3：00:30 → 01:00 → 回拨到前一天 23:50 → 23:55 → 追回 01:30 → 02:00（修复前共调 6 次）
+    const seq = [at(2026, 11, 17, 0, 30), at(2026, 11, 17, 1, 0), at(2026, 11, 16, 23, 50), at(2026, 11, 16, 23, 55),
+      at(2026, 11, 17, 1, 30), at(2026, 11, 17, 2, 0)];
+    const actions = [];
+    for (const d of seq) {
+      h.setNow(d);
+      actions.push((await h.hb.beat()).action);
+    }
+    assert.equal(h.calls.length, 2, `上限 2：回拨到前一天不得重新放出额度（各拍：${actions.join(',')}）`);
+    assert.deepEqual(actions, ['quiet', 'quiet', 'budget', 'budget', 'budget', 'budget']);
+    const st = h.readState();
+    assert.equal(st.day, '2026-11-17', '状态里的日期不随回拨倒退');
+    assert.equal(st.runs, 2);
+    const rollback = h.logs.filter((l) => l.includes('回拨'));
+    assert.equal(rollback.length, 2, `回拨期间每拍各记一行：${rollback.join(' | ')}`);
+    for (const l of rollback) assert.ok(l.includes('2026-11-17') && l.includes('2026-11-16'), l);
+
+    h.setNow(at(2026, 11, 16, 23, 58)); // 回拨期间 status 也按原计数显示（只读，不另记日志）
+    assert.match(h.hb.statusText(), /今日调用：2\/2/);
+    assert.equal(h.logs.filter((l) => l.includes('回拨')).length, 2, 'status 只读，不记回拨日志');
+
+    h.setNow(at(2026, 11, 18, 9, 0));
+    assert.equal((await h.hb.beat()).action, 'quiet', '本地日期越过记录日期才翻日');
+    assert.equal(h.calls.length, 3);
+    assert.equal(h.readState().day, '2026-11-18');
+    assert.equal(h.readState().runs, 1);
+  });
+});
+
+describe('BRIDGE-HB-1B 第 2 项：/heartbeat 只在 owner 私聊生效', () => {
+  const untouchable = () => ({
+    config: { enabled: true },
+    setActive: () => { throw new Error('群聊里不得改心跳状态'); },
+    statusText: () => { throw new Error('群聊里不得读心跳状态'); },
+    isActive: () => true,
+  });
+  const CMDS = ['/heartbeat', '/heartbeat status', '/heartbeat on', '/heartbeat off', '/heartbeat bogus'];
+
+  test('群聊（含 owner 本人）返回 null＝不回复，不读不改状态；chat_type 缺失或不认识也按群聊处理', () => {
+    for (const chatType of ['group', 'topic', undefined, null, '', 'P2P']) {
+      for (const isOwner of [true, false]) {
+        for (const t of CMDS) {
+          const out = hbm.privateHeartbeatCommand(chatType, t, { isOwner, heartbeat: untouchable() });
+          assert.equal(out, null, `${String(chatType)} / owner=${isOwner} / ${t}`);
+        }
+      }
+    }
+  });
+
+  test('私聊：owner 照常 status/off/on；非 owner 仍被拒且不碰状态', () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask());
+    const hb = createHeartbeat({
+      config: CFG(), tasksDir: env.tasksDir, stateFile: env.stateFile,
+      runClaude: async () => 'HEARTBEAT_OK', send: async () => {}, isQuiet, now: () => at(2026, 11, 16, 10), log: quietLog,
+    });
+    const cmd = (t, isOwner = true, heartbeat = hb) => hbm.privateHeartbeatCommand('p2p', t, { isOwner, heartbeat });
+    assert.match(cmd('/heartbeat status'), /今日调用：0\/12/);
+    assert.equal(cmd('/heartbeat'), cmd('/heartbeat status'));
+    assert.match(cmd('/heartbeat off'), /暂停/);
+    assert.equal(hb.isActive(), false);
+    assert.match(cmd('/heartbeat on'), /恢复/);
+    assert.equal(hb.isActive(), true);
+    for (const t of CMDS) assert.match(cmd(t, false, untouchable()), /只有 owner/);
+  });
+
+  // 源码断言：index.js 一 import 就起长连接，测试没法驱动它的消息分支——这里只证明写法，不证明行为
+  test('index.js 的 /heartbeat 分支按 message.chat_type 走私聊判定；null 时直接 return（不回复、不落到 Claude）', () => {
+    const src = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+    const start = src.indexOf("if (text === '/heartbeat' || text.startsWith('/heartbeat '))");
+    assert.ok(start > 0, '找不到 /heartbeat 分支');
+    const branch = src.slice(start, src.indexOf("if (text === '/status')", start));
+    assert.match(branch, /privateHeartbeatCommand\(message\.chat_type, text, \{ isOwner, heartbeat \}\)/);
+    assert.match(branch, /if \(out === null\) \{[^}]*return;\s*\}/, 'null 分支里直接 return');
+    assert.ok(!/[^.\w]heartbeatCommand\(/.test(src), 'index.js 不得绕过私聊判定直接调 heartbeatCommand');
+  });
+});
+
+describe('BRIDGE-HB-1B 第 3 项：反复到期退避', () => {
+  const MANY = () => CFG({ maxRunsPerDay: 1000 }); // 额度放开，只看退避
+  // S＝本拍把台账送进了模型，K＝本拍被退避跳过（必须是 backoff，不能是别的原因没调）
+  async function trace(h, beats, from = 0) {
+    let p = '';
+    for (let b = from; b < from + beats; b++) {
+      const r = await beatAt(h, minute(b));
+      if (!r.ran) assert.equal(r.action, 'backoff', `第 ${b} 拍没调模型，应是 backoff（实际 ${r.action}）`);
+      p += r.ran ? 'S' : 'K';
+    }
+    return p;
+  }
+
+  test('台账一直不变：连送 3 拍后按 1 → 2 → 4 → 8 拍递增跳过、封顶 8 拍；跳过的拍不调模型、不占每日次数', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask()); // 桩模型不推进台账：每拍都到期、哈希不变
+    const h = harness(env, { config: MANY() });
+    const p = await trace(h, 40);
+    const K = (n) => 'K'.repeat(n);
+    assert.equal(p, `SSS${K(1)}S${K(2)}S${K(4)}S${K(8)}S${K(8)}S${K(8)}S`);
+    assert.equal(h.calls.length, 9);
+    assert.equal(h.readState().runs, 9, '退避跳过的拍不占每日次数');
+    assert.ok(h.logs.some((l) => l.includes('退避')), '跳过要记日志');
+    assert.match(h.hb.statusText(), /退避中 1 条/);
+  });
+
+  test('台账文件一变，退避立刻清零：那一拍照常送模型，之后从头计', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask());
+    const h = harness(env, { config: MANY() });
+    assert.equal(await trace(h, 6), 'SSSKSK'); // 第 6 拍本该接着跳
+    writeTask(env, 'quote', dueTask({ notes: '对方说周五前回复' }));
+    assert.equal(await trace(h, 6, 6), 'SSSKSK', '文件一变马上送模型，退避从头计');
+  });
+
+  test('退避状态在 heartbeat-state.json 里：新实例（模拟重启）接着退避；删掉状态文件才从头来', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask());
+    const h = harness(env, { config: MANY() });
+    assert.equal(await trace(h, 5), 'SSSKS'); // 第 4 拍送完后该跳 2 拍
+    const h2 = harness(env, { config: MANY() });
+    assert.equal(await trace(h2, 3, 5), 'KKS', '新实例从状态文件读到退避，接着跳满 2 拍');
+    fs.rmSync(env.stateFile);
+    const h3 = harness(env, { config: MANY() });
+    assert.equal(await trace(h3, 1, 8), 'S', '对照：没有状态文件就没有退避');
+  });
+
+  test('escalate_after 首次越过的那一拍不受退避影响；之后照常退避', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask({ escalate_after: '2026-11-16T10:05' })); // 第 5 拍首次越过；台账始终不变
+    const h = harness(env, { config: MANY() });
+    // 不带 escalate_after 时第 5 拍是 K（见上：SSSKSK…）；首次越过的那一拍照送，之后不再豁免
+    assert.equal(await trace(h, 11), 'SSSKS' + 'S' + 'KKKK' + 'S');
+    assert.ok(h.calls[4][1].includes('escalate_after = 2026-11-16T10:05'), '那一拍的提示词带上越过的 escalate_after');
+  });
+
+  test('退避项与其它到期项同拍：只把不在退避的那条送进模型', async () => {
+    const env = mkEnv();
+    writeTask(env, 'stale', dueTask({ title: '一直推不动的事' }));
+    const h = harness(env, { config: MANY() });
+    assert.equal(await trace(h, 3), 'SSS'); // stale 下一拍该跳
+    writeTask(env, 'fresh', dueTask({ title: '新来的报价单' }));
+    assert.ok((await beatAt(h, minute(3))).ran);
+    const prompt = h.calls.at(-1)[1];
+    assert.ok(prompt.includes('tasks/fresh.json'));
+    assert.ok(!prompt.includes('tasks/stale.json'), '退避中的条目不进提示词');
+    assert.match(prompt, /到期条目（1 条）/);
+  });
+});
+
+describe('BRIDGE-HB-1B 第 4 项：发送顺序与单拍条数', () => {
+  const NEW = 'NEW-ANSWER：报价单今天到期，要不要我起草一条催办？';
+  // 桩模型答一句话并把台账推到以后：后面几拍只做补发
+  const answerOnce = (env) => () => {
+    writeTask(env, 'quote', dueTask({ next_check_at: '2026-11-20T09:00' }));
+    return NEW;
+  };
+  const tag = (i) => `Q${String(i).padStart(2, '0')}`;
+
+  test('补发没发完：本拍新消息排到队尾、不插队；一拍合计最多 3 条，之后按原顺序发完', async () => {
+    const env = mkEnv();
+    seedQueue(env, Array.from({ length: 20 }, (_, i) => big(tag(i))));
+    writeTask(env, 'quote', dueTask());
+    const h = harness(env, { answer: answerOnce(env) });
+    assert.equal((await h.hb.beat()).action, 'queued', '队列没发完，新消息排队');
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.sent.length, 3, '一拍合计最多 3 条：补发 3 包后新消息不另发');
+    assert.ok(!h.sent.some((t) => t.includes('NEW-ANSWER')), '新消息不得插到队列前面');
+    assert.ok(h.readState().pending.at(-1).body.includes('NEW-ANSWER'), '新消息排在队尾');
+    const perBeat = [3];
+    for (let b = 1; b < 8 && h.readState().pending.length; b++) {
+      h.setNow(at(2026, 11, 16, 10, 30 * b));
+      const before = h.sent.length;
+      await h.hb.beat();
+      perBeat.push(h.sent.length - before);
+    }
+    assert.ok(perBeat.every((k) => k <= 3), `每拍 ≤ 3 条：${perBeat}`);
+    assert.equal(h.readState().pending.length, 0);
+    const all = h.sent.join('\n');
+    const pos = [...Array(20).keys()].map((i) => all.indexOf(`${tag(i)}-START`));
+    assert.ok(pos.every((p, i) => p >= 0 && (i === 0 || p > pos[i - 1])), `原队列按原顺序发出：${pos}`);
+    assert.ok(all.indexOf(`${tag(19)}-END`) < all.indexOf('NEW-ANSWER'), '新消息在原有队列之后');
+    assert.equal(h.sent.filter((t) => t.includes('NEW-ANSWER')).length, 1);
+    assert.ok(h.sent.at(-1).includes('NEW-ANSWER'));
+  });
+
+  test('补发恰好 3 包发完：队列空了但本拍已发满 3 条，新消息进队列，下一拍再发', async () => {
+    const env = mkEnv();
+    seedQueue(env, Array.from({ length: 9 }, (_, i) => big(`R${i}`))); // 每包 3 条 → 恰好 3 包
+    writeTask(env, 'quote', dueTask());
+    const h = harness(env, { answer: answerOnce(env) });
+    assert.equal((await h.hb.beat()).action, 'queued');
+    assert.equal(h.sent.length, 3);
+    assert.ok(h.sent[2].includes('R8-END'), '前提：3 包正好把 9 条发完');
+    assert.ok(!h.sent.some((t) => t.includes('NEW-ANSWER')));
+    assert.deepEqual(h.readState().pending.map((p) => p.body), [NEW]);
+    h.setNow(at(2026, 11, 16, 10, 30));
+    await h.hb.beat();
+    assert.equal(h.sent.length, 4);
+    assert.ok(h.sent[3].includes('NEW-ANSWER'));
+    assert.equal(h.readState().pending.length, 0);
+  });
+
+  test('补发首包失败：新消息也排到队尾，不趁机直发；下一拍按原顺序一起补发', async () => {
+    const env = mkEnv();
+    seedQueue(env, ['甲：第一条待发', '乙：第二条待发']);
+    writeTask(env, 'quote', dueTask());
+    let n = 0;
+    const delivered = [];
+    const h = harness(env, {
+      answer: answerOnce(env),
+      sendImpl: async (t) => {
+        n += 1;
+        if (n === 1) throw new Error('飞书 500');
+        delivered.push(t);
+      },
+    });
+    assert.equal((await h.hb.beat()).action, 'queued');
+    assert.equal(n, 1, '补发失败后本拍不再发任何消息');
+    assert.deepEqual(h.readState().pending.map((p) => p.body), ['甲：第一条待发', '乙：第二条待发', NEW]);
+    h.setNow(at(2026, 11, 16, 10, 30));
+    await h.hb.beat();
+    assert.equal(delivered.length, 1);
+    const t = delivered[0];
+    assert.ok(t.indexOf('甲：') >= 0 && t.indexOf('甲：') < t.indexOf('乙：') && t.indexOf('乙：') < t.indexOf('NEW-ANSWER'), t);
+    assert.equal(h.readState().pending.length, 0);
+  });
+
+  test('补发一包就清空：本拍新消息照常直发，排在补发之后（合计 2 条）', async () => {
+    const env = mkEnv();
+    seedQueue(env, ['甲：第一条待发']);
+    writeTask(env, 'quote', dueTask());
+    const h = harness(env, { answer: answerOnce(env) });
+    assert.equal((await h.hb.beat()).action, 'sent');
+    assert.equal(h.sent.length, 2);
+    assert.ok(h.sent[0].includes('甲：第一条待发'));
+    assert.ok(h.sent[1].includes('NEW-ANSWER'));
+    assert.equal(h.readState().pending.length, 0);
+  });
+});
+
+describe('BRIDGE-HB-1B 第 5 项：补测', () => {
+  // REVERIFY LOW-7：把 flush 开头改成 st.pending = [] 的变异此前没被任何用例抓到
+  test('唯一一包发送失败：待发队列原样保留（条目、顺序、正文不变），不记已发；下一拍补发', async () => {
+    const env = mkEnv();
+    const seeded = seedQueue(env, ['甲：第一条待发', '乙：第二条待发']);
+    let fail = true;
+    let attempts = 0;
+    const delivered = [];
+    const h = harness(env, {
+      now: at(2026, 11, 16, 9, 0),
+      sendImpl: async (t) => {
+        attempts += 1;
+        if (fail) throw new Error('飞书 500');
+        delivered.push(t);
+      },
+    });
+    assert.equal((await h.hb.beat()).action, 'no-due');
+    assert.equal(attempts, 1);
+    let st = h.readState();
+    assert.deepEqual(st.pending, seeded, '队列完整保留');
+    assert.deepEqual(st.sent, {}, '没发出去的不记已发');
+    assert.equal(st.last_notified_at, null);
+    fail = false;
+    h.setNow(at(2026, 11, 16, 9, 30));
+    await h.hb.beat();
+    assert.equal(delivered.length, 1);
+    assert.ok(delivered[0].indexOf('甲：') >= 0 && delivered[0].indexOf('甲：') < delivered[0].indexOf('乙：'));
+    st = h.readState();
+    assert.equal(st.pending.length, 0);
+    assert.deepEqual(Object.keys(st.sent).sort(), ['seed-0', 'seed-1']);
+  });
+
+  test('多包时首包就失败：整个队列原样保留，本拍不试后面的包；下一拍从头补发、每条一次', async () => {
+    const env = mkEnv();
+    const seeded = seedQueue(env, Array.from({ length: 9 }, (_, i) => big(`P${i}`))); // 3 包
+    let fail = true;
+    let attempts = 0;
+    const delivered = [];
+    const h = harness(env, {
+      now: at(2026, 11, 16, 9, 0),
+      sendImpl: async (t) => {
+        attempts += 1;
+        if (fail) throw new Error('飞书 500');
+        delivered.push(t);
+      },
+    });
+    await h.hb.beat();
+    assert.equal(attempts, 1, '首包失败就停');
+    assert.deepEqual(h.readState().pending, seeded, '队列完整保留');
+    assert.deepEqual(h.readState().sent, {});
+    fail = false;
+    h.setNow(at(2026, 11, 16, 9, 30));
+    await h.hb.beat();
+    assert.equal(delivered.length, 3);
+    for (let i = 0; i < 9; i++) assert.equal(delivered.filter((t) => t.includes(`P${i}-END`)).length, 1, `P${i} 恰好一次`);
+    assert.equal(h.readState().pending.length, 0);
+  });
+
+  // SMOKE INFO-1：-p 模式下提示词开头的 / 会被 CLI 当成斜杠命令展开
+  test('心跳提示词永远不以 / 开头：台账标题、备注、外部增量以斜杠命令开头也一样', async () => {
+    const firstChars = (p) => [p[0], p.trimStart()[0]];
+    const env = mkEnv();
+    writeTask(env, 'a', dueTask({ title: '/new 清空会话', notes: '/compact\n/clear' }));
+    const h = harness(env, { collectDeltas: async () => [{ slug: 'a', source: 'chat_reply', text: '/clear 然后 /new' }] });
+    await h.hb.beat();
+    const env2 = mkEnv(); // 只有外部增量、没有到期项
+    const h2 = harness(env2, { collectDeltas: async () => [{ slug: 'x', source: 'chat_reply', text: '/compact' }] });
+    await h2.hb.beat();
+    const prompts = [
+      h.calls[0]?.[1],
+      h2.calls[0]?.[1],
+      hbm.buildHeartbeatPrompt({ due: [], now: at(2026, 11, 16, 10) }),
+      hbm.buildHeartbeatPrompt({ due: [], omitted: 3, deltas: [{ slug: 'x', source: 's', text: '/new' }], now: at(2026, 11, 16, 10) }),
+    ];
+    for (const [k, p] of prompts.entries()) {
+      assert.equal(typeof p, 'string', `第 ${k + 1} 份提示词没生成`);
+      for (const c of firstChars(p)) assert.notEqual(c, '/', `第 ${k + 1} 份提示词以 / 开头：${p.slice(0, 40)}`);
+    }
+    assert.ok(prompts[0].includes('/new 清空会话'), '前提：斜杠开头的标题确实进了提示词（在围栏里）');
+  });
+});

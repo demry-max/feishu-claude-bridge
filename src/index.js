@@ -6,7 +6,7 @@ import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeys
 import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
-import { startHeartbeat, heartbeatConfig, heartbeatCommand } from './heartbeat.js';
+import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand } from './heartbeat.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
@@ -124,7 +124,7 @@ const HELP_TEXT = [
   '- `/model exec <模型|off>` 设置执行模型，如 `/model exec sonnet`（仅 owner）',
   '- `/do <任务>` 用执行模型跑这一轮；说「执行」「去做」也一样，会话上下文保留',
   '- `/tasks` 查看定时任务：上次/下次触发时间（仅 owner）',
-  '- `/heartbeat on|off|status` 心跳开关与状态（仅 owner；只改运行时开关，不写 .env）',
+  '- `/heartbeat on|off|status` 心跳开关与状态（仅 owner 私聊；只改运行时开关，不写 .env）',
   '',
   '**能做什么**',
   '- 直接对话；群里 @我 即可',
@@ -330,9 +330,15 @@ async function handleMessage(data) {
     await reply(message.message_id, describeTasks());
     return;
   }
-  // 心跳开关只改运行时状态、从不写 .env；非 owner 一律拒绝（heartbeatCommand 内判定，不碰心跳状态）
+  // 心跳开关只改运行时状态、从不写 .env。只在私聊生效（BRIDGE-HB-1B）：群聊里（包括 owner 本人发的）
+  // 不回复、不读不改心跳状态，也不落到 Claude；私聊里非 owner 一律拒绝（heartbeatCommand 内判定，不碰心跳状态）
   if (text === '/heartbeat' || text.startsWith('/heartbeat ')) {
-    await reply(message.message_id, heartbeatCommand(text, { isOwner, heartbeat }));
+    const out = privateHeartbeatCommand(message.chat_type, text, { isOwner, heartbeat });
+    if (out === null) {
+      console.log('[heartbeat] 群聊里的 /heartbeat 不处理（只在 owner 私聊生效）');
+      return;
+    }
+    await reply(message.message_id, out);
     return;
   }
   if (text === '/status') {
