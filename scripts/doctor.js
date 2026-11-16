@@ -48,7 +48,7 @@ line(env.ok, '.env', env.ok ? (env.autofilled ? `已自动补写 OWNER_OPEN_ID=$
 
 // 5) workspace
 const ws = ensureOwnerWorkspace(path.join(ROOT, 'workspace'));
-line(ws.ok, 'owner 工作区', ws.ok ? 'memory/journal、skills、schedules、outbox、incoming 就绪' : ws.problem);
+line(ws.ok, 'owner 工作区', ws.ok ? 'memory/journal、skills、schedules、outbox、incoming、tasks 就绪' : ws.problem);
 
 // 6) 飞书 scope
 if (noNetwork) {

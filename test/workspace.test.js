@@ -16,7 +16,7 @@ describe('owner 工作区初始化', () => {
   test('空目录上建出三层记忆所需的全部目录', () => {
     const dir = tmp();
     ensureOwnerWorkspace(dir);
-    for (const d of ['memory/journal', 'skills', 'schedules', 'outbox', 'incoming']) {
+    for (const d of ['memory/journal', 'skills', 'schedules', 'outbox', 'incoming', 'tasks']) {
       assert.ok(fs.statSync(path.join(dir, d)).isDirectory(), `${d}/ 必须存在`);
     }
   });

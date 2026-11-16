@@ -143,14 +143,17 @@ export function startScheduler({ schedulesDir, stateFile, onFire }) {
           continue;
         }
 
-        // 先占位防重复触发，跑完再落「已完成」；中途崩溃时留下 running 痕迹便于排查
-        markFired(job._file, due.toISOString(), { when: job.when, status: 'running' });
-        const lateNote = lateMs > 5 * 60_000 ? `（迟到补跑 ${Math.round(lateMs / 60000)} 分钟）` : '';
-        console.log(`[sched] 触发「${job.name ?? job._file}」(${due.toLocaleString('zh-CN')})${lateNote}`);
+        // 并发已满：什么都不写，原样留给下一拍。并发检查必须在占位之前——旧实现先写 running
+        // 再检查，被挡下的这次触发在下一拍会因 due <= last 被当成「已经跑过」，永久丢失，
+        // 状态还一直停在 running（BRIDGE-HB-1 第 9 项）。
         if (inflight.size >= MAX_CONCURRENT) {
           console.log(`[sched] 并发已满（${MAX_CONCURRENT}），「${job.name ?? job._file}」下一轮再试`);
           continue;
         }
+        // 先占位防重复触发，跑完再落「已完成」；中途崩溃时留下 running 痕迹便于排查
+        markFired(job._file, due.toISOString(), { when: job.when, status: 'running' });
+        const lateNote = lateMs > 5 * 60_000 ? `（迟到补跑 ${Math.round(lateMs / 60000)} 分钟）` : '';
+        console.log(`[sched] 触发「${job.name ?? job._file}」(${due.toLocaleString('zh-CN')})${lateNote}`);
         inflight.add(job._file);
         const runOne = (async () => {
           try {

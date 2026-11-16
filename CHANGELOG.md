@@ -2,6 +2,27 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **桥接自带心跳（默认关闭，BRIDGE-HB-1）**：交办台账 `workspace/tasks/<slug>.json`（一事一个 JSON，
+  open/waiting/done/dropped）。每拍先由脚本读台账，有到期项才调一次模型（`sched:heartbeat`，不续会话、
+  无中间进度、自带互斥锁），提示词只含到期条目、title/notes 进不可信围栏；答复不是 `HEARTBEAT_OK` 才以应用身份
+  私聊 owner。每日调用上限（按本地日期，重启不清零）、免打扰时段（期间只记状态，结束后合并成一条）、
+  同正文 24 小时去重。桥接自己的状态放 `data/heartbeat-state.json`（原子写；损坏时备份并当天停调）。
+  新增 `.env` 项 `HEARTBEAT_ENABLED`（精确 `true` 才启动）/ `_INTERVAL_MIN` / `_MAX_RUNS_PER_DAY` /
+  `_MODEL` / `_EFFORT` / `_QUIET_HOURS` / `_WATCH`（本版只实现 `none`）。
+- **心跳工具档**：`--setting-sources ''` + `--strict-mcp-config`，内置工具白名单 Read/Grep/Glob/Edit/Write，
+  写入只预批 `tasks/` 与 `memory/journal/`；无 Bash、lark-cli、联网、飞书 MCP，显式拒绝改 `schedules/`。
+- **`/heartbeat on|off|status`**（仅 owner）：只改运行时开关、不写 `.env`；配置未启用时 `on` 拒绝并说明。
+- owner 默认工具集新增 `Edit(./tasks/**)`；工作区启动时建 `tasks/`。
+
+### 修复
+
+- **调度器并发已满时触发永久丢失**：旧实现先把任务标成 `running` 再检查并发，被挡下的这次触发在下一拍
+  因 `due <= last` 被当成「已经跑过」跳过，状态还一直停在 `running`。现在先查并发、被挡的不留占位，下一拍照常触发。
+
 ## [2.3.0] - 2026-09-14
 
 ### 新增
