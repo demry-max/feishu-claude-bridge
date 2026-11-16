@@ -223,3 +223,40 @@ describe('addOneDay / appendJournal', () => {
     assert.equal(fs.readFileSync(target, 'utf8'), 'keep\n');
   });
 });
+
+// BRIDGE-EV-1 R1（MEDIUM-1）：「推迟一天」以「原值加一天与现在加一天取较晚者」为基准
+describe('R1：推迟一天以现在为基准', async () => {
+  const { parseTime, dueTasks } = await import('../src/heartbeat.js');
+  const R1_NOW = new Date(2026, 10, 16, 10, 0); // 2026-11-16 10:00 本地
+  const snooze = (env, slug) => act(env, slug, 'snooze1d', { now: R1_NOW, parseTime });
+  const dueAt = (env, slug, d) => dueTasks([validateTask(JSON.parse(fs.readFileSync(path.join(env.tasksDir, `${slug}.json`), 'utf8')), slug).task], d);
+
+  test('snooze1d：已逾期多日的 next_check_at / escalate_after 从现在起推一天，推迟后当下不再到期', () => {
+    const env = mkEnv();
+    writeTask(env, 'late', { title: '逾期多日', status: 'open', next_check_at: '2026-11-10T09:00', escalate_after: '2026-11-12T18:00' });
+    assert.equal(dueAt(env, 'late', R1_NOW).length, 1, '对照：推迟前当下到期');
+    assert.deepEqual(snooze(env, 'late'), { ok: true, changed: ['next_check_at', 'escalate_after', 'updated_at'] });
+    const after = JSON.parse(fs.readFileSync(path.join(env.tasksDir, 'late.json'), 'utf8'));
+    assert.equal(after.next_check_at, '2026-11-17T10:00');
+    assert.equal(after.escalate_after, '2026-11-17T10:00');
+    assert.equal(after.updated_at, '2026-11-16T10:00');
+    assert.deepEqual(dueAt(env, 'late', R1_NOW), [], '推迟后当下不到期');
+    assert.deepEqual(dueAt(env, 'late', new Date(R1_NOW.getTime() + 23 * 3600_000)), [], 'now+23h 不到期');
+    assert.equal(dueAt(env, 'late', new Date(R1_NOW.getTime() + 24 * 3600_000)).length, 1, 'now+24h 到期');
+
+    // 只有 next_check_at 逾期、escalate_after 在未来：前者从现在起推一天，后者仍按原值加一天
+    writeTask(env, 'mixed', { title: '一个逾期一个未来', status: 'waiting', next_check_at: '2026-11-10T09:00', escalate_after: '2026-11-20T18:00' });
+    assert.deepEqual(snooze(env, 'mixed'), { ok: true, changed: ['next_check_at', 'escalate_after', 'updated_at'] });
+    const mixed = JSON.parse(fs.readFileSync(path.join(env.tasksDir, 'mixed.json'), 'utf8'));
+    assert.equal(mixed.next_check_at, '2026-11-17T10:00');
+    assert.equal(mixed.escalate_after, '2026-11-21T18:00');
+    assert.deepEqual(dueAt(env, 'mixed', R1_NOW), []);
+    assert.deepEqual(dueAt(env, 'mixed', new Date(R1_NOW.getTime() + 23 * 3600_000)), []);
+    assert.equal(dueAt(env, 'mixed', new Date(R1_NOW.getTime() + 24 * 3600_000)).length, 1);
+
+    // 不传 parseTime：维持只按日期加一天（现行为）
+    writeTask(env, 'nopt', { title: '不传解析函数', status: 'open', next_check_at: '2026-11-10T09:00' });
+    assert.deepEqual(act(env, 'nopt', 'snooze1d', { now: R1_NOW }), { ok: true, changed: ['next_check_at', 'updated_at'] });
+    assert.equal(JSON.parse(fs.readFileSync(path.join(env.tasksDir, 'nopt.json'), 'utf8')).next_check_at, '2026-11-11T09:00');
+  });
+});

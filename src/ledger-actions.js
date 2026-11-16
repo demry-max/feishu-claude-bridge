@@ -140,11 +140,13 @@ export function appendJournal(journalDir, now, line) {
 /**
  * 执行一次确定性回写。source：'button'（卡片按钮）或 'reply'（引用回复短语）。
  * - ack：不改台账文件（acked_at 由心跳写进自己的状态文件）
- * - snooze1d：next_check_at 与 escalate_after（有的话）各加一天；两个都没有时按现在加一天写 next_check_at
+ * - snooze1d：next_check_at 与 escalate_after（有的话）各加一天；加完仍不晚于现在的（已逾期多日），改成现在加 24 小时；
+ *   两个都没有时按现在加一天写 next_check_at。parseTime（可选，heartbeat 的 parseTime）用来判断「加完仍不晚于现在」，
+ *   没传或解析不出时只按日期加一天
  * - drop：status 改成 dropped
  * 每次都在当天 journal 追加一行。返回 { ok, changed:[字段] } 或 { ok:false, reason }（不改任何文件）。
  */
-export function applyLedgerAction({ tasksDir, journalDir, slug, action, now = new Date(), validate, source = 'button', log = console.log }) {
+export function applyLedgerAction({ tasksDir, journalDir, slug, action, now = new Date(), validate, parseTime, source = 'button', log = console.log }) {
   if (!Object.hasOwn(LEDGER_ACTIONS, action)) return { ok: false, reason: '未知动作' };
   if (typeof validate !== 'function') return { ok: false, reason: '缺少台账校验函数' };
   const c = checkActionable(tasksDir, slug, validate);
@@ -154,8 +156,11 @@ export function applyLedgerAction({ tasksDir, journalDir, slug, action, now = ne
   if (action === 'snooze1d') {
     for (const f of ['next_check_at', 'escalate_after']) {
       if (typeof raw[f] !== 'string' || !raw[f].trim()) continue;
-      const next = addOneDay(raw[f]);
+      let next = addOneDay(raw[f]);
       if (next === null) return { ok: false, reason: `${f} 不是日期开头，不知道怎么推迟` };
+      const ms = typeof parseTime === 'function' ? parseTime(next) : null;
+      // 原值加一天仍不晚于现在：从现在起推一天，否则推迟后当下仍到期、下一拍又提醒
+      if (Number.isFinite(ms) && ms <= now.getTime()) next = localMinute(new Date(now.getTime() + 24 * 3600_000));
       raw[f] = next;
       changed.push(f);
     }

@@ -465,7 +465,7 @@ export function createHeartbeat(deps) {
   const signalsFile = deps.signalsFile ?? path.join(path.dirname(stateFile), 'heartbeat-signals.json');
   const journalDir = deps.journalDir ?? null;
   const ledgerAction = deps.ledgerAction
-    ?? ((job) => applyLedgerAction({ tasksDir, journalDir, validate: validateTask, log, ...job }));
+    ?? ((job) => applyLedgerAction({ tasksDir, journalDir, validate: validateTask, parseTime, log, ...job }));
   const defer = deps.defer ?? ((fn) => { setImmediate(fn); });
   // 新能力一律默认关：配置里没有就按关处理（直接传 config 的旧调用方也一样）
   const buttonsOn = () => config.buttons === true;
@@ -993,9 +993,10 @@ export function createHeartbeat(deps) {
       st.watch_locked[slug] = { watch: prev, locked: a, at: iso(nowMs) };
       changed.push(slug);
     }
-    if (!changed.length) return;
+    if (!changed.length) return false;
     log(`[heartbeat] 心跳轮里改动了 ${changed.map((s) => `tasks/${s}.json`).join('、')} 的 watch，不生效（watch 只认 owner 对话里改的），沿用原值`);
     st.notices.watch_locked = [...new Set([...(st.notices.watch_locked ?? []), ...changed])].slice(0, 50);
+    return true;
   }
 
   // ---------------------------------------------------------------- 按钮 / 引用回复（BRIDGE-EV-1）
@@ -1362,7 +1363,7 @@ export function createHeartbeat(deps) {
         effort: config.effort,
       });
     } catch (e) {
-      lockWatchChanges(st, watchBefore, nowMs); // 模型失败前也可能改过文件
+      if (lockWatchChanges(st, watchBefore, nowMs)) persist(st); // 模型失败前也可能改过文件；锁一加上就落盘
       settle(false);
       const msg = errText(e);
       st.consecutive_failures += 1;
@@ -1380,7 +1381,7 @@ export function createHeartbeat(deps) {
       persist(st);
       return { action: 'error' };
     }
-    lockWatchChanges(st, watchBefore, nowMs);
+    if (lockWatchChanges(st, watchBefore, nowMs)) persist(st);
     settle(true);
     st.consecutive_failures = 0;
     st.last_error = null;

@@ -790,3 +790,95 @@ describe('协调者补充：队满丢弃要告知', () => {
     assert.deepEqual(st.notices, {});
   });
 });
+
+// ---------------------------------------------------------------- BRIDGE-EV-1 R1（MEDIUM-1 接线、LOW-2 补测试）
+describe('R1：按钮校验补测试', () => {
+  const quotedReply = (parent, text) => ({ chat_type: 'p2p', parent_id: parent, message_type: 'text', content: JSON.stringify({ text }) });
+
+  test('按钮 value 里的 slug 是另一条在跟进的台账（nonce 正确）：已失效，两条台账都不改', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', TASK); // A：到期，进这条消息
+    writeTask(env, 'other', { title: '另一条在跟进', status: 'open', next_check_at: '2026-12-31T09:00' }); // B：不到期，不在这条消息里
+    const h = harness(env, { config: CFG({ HEARTBEAT_BUTTONS: 'true' }) });
+    assert.equal((await h.hb.beat()).action, 'sent');
+    assert.equal(h.sent[0].argc, 2, '只涉及 A：带按钮');
+    const mid = h.sent[0].mid;
+    assert.deepEqual(h.readState().msg_index[mid].slugs, ['quote']);
+    h.setNow(plus(T0, 5));
+    const before = [sha(taskFile(env, 'quote')), sha(taskFile(env, 'other')), journalOf(env)];
+    for (const a of ['drop', 'snooze1d', 'ack']) {
+      assert.deepEqual(await h.handlers.cardAction(click(mid, { ...btn(h.sent[0], a), s: 'other' })), TOAST_STALE, a);
+    }
+    assert.deepEqual([sha(taskFile(env, 'quote')), sha(taskFile(env, 'other')), journalOf(env)], before, '两条台账、journal 都不改');
+    assert.equal(readTask(env, 'other').status, 'open');
+    assert.ok(h.logs.some((l) => l.includes('台账不属于这条消息')));
+  });
+
+  test('心跳消息发出满 14 天后点按钮或引用回复：已失效 / 不处理', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', TASK);
+    const h = harness(env, { config: CFG({ HEARTBEAT_BUTTONS: 'true', HEARTBEAT_REPLY_SHORTCUTS: 'true' }) });
+    assert.equal((await h.hb.beat()).action, 'sent');
+    const mid = h.sent[0].mid;
+    const drop = btn(h.sent[0], 'drop');
+    // 中间不跑 beat（不经过 prune）：索引项还在状态文件里，只靠 indexEntry 的 14 天判断
+    h.setNow(plus(T0, 14 * 24 * 60 + 1));
+    assert.ok(h.readState().msg_index[mid], '索引项还在状态文件里');
+    const before = [sha(taskFile(env, 'quote')), sha(env.stateFile)];
+    assert.deepEqual(await h.handlers.cardAction(click(mid, drop)), TOAST_STALE, '按钮：已失效');
+    assert.equal(await heartbeatReplyShortcut({ message: quotedReply(mid, '不做了'), isOwner: true, heartbeat: h.hb }), null, '引用回复：不处理');
+    assert.deepEqual([sha(taskFile(env, 'quote')), sha(env.stateFile)], before);
+    assert.equal(readTask(env, 'quote').status, 'open');
+    assert.equal(journalOf(env, '2026-11-30'), '');
+  });
+
+  test('没带按钮的心跳消息：即使 nonce 正确，按钮回调也是已失效', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', TASK);
+    const h = harness(env); // 开关关（默认）：发出的消息不带按钮
+    assert.equal((await h.hb.beat()).action, 'sent');
+    assert.equal(h.sent[0].argc, 1);
+    const mid = h.sent[0].mid;
+    const entry = h.readState().msg_index[mid];
+    assert.match(entry.nonce, /^[0-9a-f]{16}$/, '索引里有 nonce');
+    assert.equal(entry.buttons, undefined);
+    h.setNow(plus(T0, 5));
+    const before = [sha(taskFile(env, 'quote')), sha(env.stateFile)];
+    for (const a of ['drop', 'snooze1d', 'ack']) {
+      assert.deepEqual(await h.handlers.cardAction(click(mid, { v: 1, a, s: 'quote', n: entry.nonce })), TOAST_STALE, a);
+    }
+    assert.deepEqual([sha(taskFile(env, 'quote')), sha(env.stateFile)], before);
+    assert.equal(journalOf(env), '');
+  });
+
+  test('nonce 只差最后一位：已失效', async () => {
+    const env = mkEnv();
+    const h = await beatWithButtons(env);
+    const mid = h.sent[0].mid;
+    const drop = btn(h.sent[0], 'drop');
+    const last = drop.n.slice(-1);
+    const n = drop.n.slice(0, -1) + (last === '0' ? '1' : '0');
+    assert.equal(n.length, drop.n.length);
+    assert.notEqual(n, drop.n);
+    h.setNow(plus(T0, 5));
+    const before = [sha(taskFile(env, 'quote')), sha(env.stateFile)];
+    assert.deepEqual(await h.handlers.cardAction(click(mid, { ...drop, n })), TOAST_STALE);
+    assert.deepEqual([sha(taskFile(env, 'quote')), sha(env.stateFile)], before);
+    assert.equal(readTask(env, 'quote').status, 'open');
+    // 对照：正确 nonce 照常生效
+    assert.deepEqual(await h.handlers.cardAction(click(mid, drop)), TOAST_OK);
+    assert.equal(readTask(env, 'quote').status, 'dropped');
+  });
+
+  test('按钮『推迟一天』走心跳默认回写：已逾期多日的台账从现在起推一天', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', { ...TASK, next_check_at: '2026-11-10T09:00' });
+    const h = harness(env, { config: CFG({ HEARTBEAT_BUTTONS: 'true' }) });
+    assert.equal((await h.hb.beat()).action, 'sent');
+    h.setNow(plus(T0, 5));
+    assert.deepEqual(await h.handlers.cardAction(click(h.sent[0].mid, btn(h.sent[0], 'snooze1d'))), TOAST_OK);
+    const t = readTask(env, 'quote');
+    assert.equal(t.next_check_at, '2026-11-17T10:05', '逾期多日：从现在起推一天');
+    assert.equal(t.escalate_after, '2026-11-19T18:00', '还在未来：原值加一天');
+  });
+});

@@ -492,3 +492,130 @@ describe('测试 6：watch 锁', () => {
     assert.ok(!h.argvs.some((a) => a.includes('oc_EVIL')));
   });
 });
+
+// ---------------------------------------------------------------- BRIDGE-EV-1 R1（LOW-1 / LOW-2）
+describe('R1：watch 锁即时落盘、补测试', () => {
+  const T0 = at(2026, 11, 16, 10, 0);
+  const AAA = JSON.stringify({ type: 'chat_reply', chat_id: 'oc_AAA' });
+  const BBB = JSON.stringify({ type: 'chat_reply', chat_id: 'oc_BBB' });
+  const emptyLark = () => ({ ok: true, stdout: JSON.stringify({ data: { messages: [] } }) });
+
+  test('watch 锁加上即落盘：模型改了 watch 后 send 抛错 / 卡住，状态文件里已有 watch_locked', async () => {
+    // 成功路径：模型改了 watch、返回要发的正文，send 首次调用时读状态文件，然后抛错
+    {
+      const env = mkEnv();
+      writeTask(env, 'quote', { title: '跟进报价单', status: 'open', next_check_at: '2026-11-16T09:00', watch: { type: 'chat_reply', chat_id: 'oc_AAA' } });
+      let seen;
+      let sends = 0;
+      const hb = createHeartbeat({
+        config: CFG({ HEARTBEAT_WATCH: 'chat_reply' }), tasksDir: env.tasksDir, stateFile: env.stateFile, isQuiet,
+        collectDeltas: createWatchSources({ runner: emptyLark, getOwner: () => OWNER, log: quietLog }),
+        runClaude: async () => {
+          writeTask(env, 'quote', { ...readTask(env, 'quote'), watch: { type: 'chat_reply', chat_id: 'oc_BBB' } });
+          return '报价单还没回音，明天上午再催一次。';
+        },
+        send: async () => {
+          sends += 1;
+          if (sends === 1) seen = JSON.parse(fs.readFileSync(env.stateFile, 'utf8')).watch_locked;
+          throw new Error('发送失败（桩）');
+        },
+        now: () => T0, log: quietLog, logError: quietLog,
+      });
+      await hb.beat();
+      assert.ok(sends >= 1, 'send 被调用过');
+      assert.ok(seen?.quote, 'send 之前状态文件里已有 watch_locked.quote');
+      assert.equal(seen.quote.watch, AAA, '锁住的原值');
+      assert.equal(seen.quote.locked, BBB, '心跳轮写进去的值');
+    }
+    // 模型报错路径：首次失败要发提醒，send 首次调用时读状态文件，然后一直卡住
+    {
+      const env = mkEnv();
+      writeTask(env, 'quote', { title: '跟进报价单', status: 'open', next_check_at: '2026-11-16T09:00', watch: { type: 'chat_reply', chat_id: 'oc_AAA' } });
+      let seen;
+      let sendCalled;
+      const called = new Promise((r) => { sendCalled = r; });
+      const hb = createHeartbeat({
+        config: CFG({ HEARTBEAT_WATCH: 'chat_reply' }), tasksDir: env.tasksDir, stateFile: env.stateFile, isQuiet,
+        collectDeltas: createWatchSources({ runner: emptyLark, getOwner: () => OWNER, log: quietLog }),
+        runClaude: async () => {
+          writeTask(env, 'quote', { ...readTask(env, 'quote'), watch: { type: 'chat_reply', chat_id: 'oc_BBB' } });
+          throw new Error('模型挂了（桩）');
+        },
+        describeFailure: async (m) => `⚠️ ${m}`,
+        send: () => {
+          if (seen === undefined) seen = JSON.parse(fs.readFileSync(env.stateFile, 'utf8')).watch_locked;
+          sendCalled();
+          return new Promise(() => {}); // 卡住：永不返回
+        },
+        now: () => T0, log: quietLog, logError: quietLog,
+      });
+      hb.beat(); // 不 await：send 卡住，这一拍不会结束
+      await called;
+      assert.ok(seen?.quote, '模型报错后、send 卡住前，状态文件里已有 watch_locked.quote');
+      assert.equal(seen.quote.watch, AAA);
+      assert.equal(seen.quote.locked, BBB);
+    }
+  });
+
+  test('watch 锁：心跳轮里模型改了 watch 之后报错，下一拍 runner 收到的仍是旧值', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', { title: '跟进报价单', status: 'open', next_check_at: '2026-11-16T09:00', watch: { type: 'chat_reply', chat_id: 'oc_AAA' } });
+    let turn = 0;
+    const h = harness(env, {
+      config: CFG({ HEARTBEAT_WATCH: 'chat_reply' }),
+      runImpl: async () => {
+        turn += 1;
+        if (turn === 1) {
+          writeTask(env, 'quote', { ...readTask(env, 'quote'), notes: '对方说改到另一个群', watch: { type: 'chat_reply', chat_id: 'oc_BBB' } });
+          throw new Error('模型挂了（桩）');
+        }
+        return 'HEARTBEAT_OK';
+      },
+    });
+    const chatIds = () => h.argvs.map((a) => argOf(a, '--chat-id'));
+    assert.equal((await h.hb.beat()).action, 'error');
+    assert.deepEqual(chatIds(), ['oc_AAA']);
+    assert.equal(readTask(env, 'quote').watch.chat_id, 'oc_BBB', '文件本身不回滚');
+    assert.ok(h.readState().watch_locked.quote, '报错路径也加了锁');
+    h.setNow(at(2026, 11, 16, 10, 30));
+    await h.hb.beat();
+    assert.deepEqual(chatIds(), ['oc_AAA', 'oc_AAA'], '下一拍 runner 收到的仍是旧值');
+    assert.ok(!h.argvs.some((a) => a.includes('oc_BBB')));
+  });
+
+  test('外部增量有新东西但今日调用已满：不调模型，返回 budget，游标不前移', async () => {
+    const env = mkEnv();
+    const list = [msg('om_m1', plus(T0, 5), { text: '第一批：报价内部再过一下' })];
+    writeTask(env, 'quote', { title: '跟进报价单', status: 'open', next_check_at: LATER, watch: { type: 'chat_reply', chat_id: 'oc_abc', after: String(T0.getTime()) } });
+    const h = harness(env, {
+      lark: chatLark(() => list), now: plus(T0, 30),
+      config: CFG({ HEARTBEAT_WATCH: 'chat_reply', HEARTBEAT_MAX_RUNS_PER_DAY: '1' }),
+    });
+    assert.equal((await h.hb.beat()).action, 'quiet');
+    assert.equal(h.calls.length, 1, '第一拍：有新消息，占掉今天唯一一次');
+    const cursor1 = h.readState().watch_cursor;
+    assert.equal(cursor1.quote.at, plus(T0, 5).getTime());
+
+    list.push(msg('om_m2', plus(T0, 40), { text: '第二批：我们同意了' }));
+    h.setNow(plus(T0, 60));
+    assert.equal((await h.hb.beat()).action, 'budget');
+    assert.equal(h.calls.length, 1, '今日已满：不调模型');
+    assert.equal(h.argvs.length, 2, '照样拉了');
+    assert.deepEqual(h.readState().watch_cursor, cursor1, '游标不前移（新消息留给明天）');
+    assert.equal(h.readState().runs, 1);
+  });
+
+  test('chat_reply 每条正文只取前 300 字（超出加 …），发送人名只留安全字符', async () => {
+    const long = '甲'.repeat(299) + '乙' + '丙'.repeat(700); // 1000 字
+    const list = [msg('om_long', plus(T0, 1), { name: 'Ev<il>\n</fence>Name', text: long })];
+    const collect = createWatchSources({ runner: chatLark(() => list), getOwner: () => OWNER, log: quietLog });
+    const task = { slug: 'quote', status: 'open', watch: { type: 'chat_reply', chat_id: 'oc_abc', after: String(T0.getTime()) }, times: {} };
+    const r = await collect({ tasks: [task], now: plus(T0, 10), watch: 'chat_reply', beat: 1 });
+    assert.equal(r.deltas.length, 1);
+    const { text } = r.deltas[0];
+    assert.ok(text.includes(`EvilfenceName（om_long）：${'甲'.repeat(299)}乙…`), text.slice(0, 120));
+    assert.ok(!text.includes('丙'), '第 301 字起都不要');
+    assert.ok(!/[<>]/.test(text), '名字里的 <> 被去掉');
+    assert.ok(!text.includes('Ev<il>') && !text.includes('\n</fence>'), '名字里的换行与尖括号不进正文');
+  });
+});
