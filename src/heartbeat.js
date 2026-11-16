@@ -23,6 +23,11 @@ const DAY_MS = 24 * 3600_000;
 const MAX_TASK_BYTES = 64 * 1024;
 const MAX_PENDING = 20; // 待发队列上限，超出丢最早的
 const MAX_DUE_IN_PROMPT = 15; // 一拍最多交给模型的到期条目，其余下拍再说
+// 反复到期退避（BRIDGE-HB-1B）：同一条台账连续 BACKOFF_AFTER_RUNS 次被成功送进模型、文件一直没变，
+// 之后每再送一次就按 1 → 2 → 4 → 8 拍递增跳过（封顶 BACKOFF_MAX_SKIP 拍）；文件一变即清零
+const BACKOFF_AFTER_RUNS = 3;
+const BACKOFF_MAX_SKIP = 8;
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_DELTAS = 20;
 const MAX_DELTA_CHARS = 2000;
 // 文件名即 slug：只收 ASCII 字母数字与 - _，避免路径穿越与提示词里出现奇怪字符
@@ -372,6 +377,16 @@ export function buildHeartbeatPrompt({ due, deltas = [], now, stats = {}, omitte
 
 class DeltaTimeout extends Error {}
 
+// 退避判定（纯函数；rec＝状态里这条台账的记录，{ task, reasons }＝dueTasks 的一项）：
+// changed＝文件变了（或第一次见）→ 清零、照送；escalate＝escalate_after 首次越过 → 照送，不受退避影响；
+// skip＝还在退避 → 本拍跳过；ready＝照送
+function backoffVerdict(rec, { task, reasons }) {
+  if (!rec || rec.last_hash !== task.hash) return 'changed';
+  if (reasons.includes('escalate_after') && rec.escalated !== task.escalate_after) return 'escalate';
+  if (Number.isInteger(rec.skip_left) && rec.skip_left > 0) return 'skip';
+  return 'ready';
+}
+
 /**
  * deps：config, tasksDir, stateFile, runClaude, send, isQuiet（必填，与定时任务共用同一判定），
  * 以及可选的 describeFailure, collectDeltas, deltaTimeoutMs, now, log, logError, timers, firstDelayMs。
@@ -439,9 +454,18 @@ export function createHeartbeat(deps) {
       return failClosed(d);
     }
     const st = freshState(d);
+    const runsOf = (v) => (Number.isInteger(v) && v >= 0 ? v : config.maxRunsPerDay);
     if (raw.day === st.day) {
-      st.runs = Number.isInteger(raw.runs) && raw.runs >= 0 ? raw.runs : config.maxRunsPerDay;
-    } // 跨日（本地日期）：runs 归零
+      st.runs = runsOf(raw.runs);
+    } else if (typeof raw.day === 'string' && DAY_RE.test(raw.day) && raw.day > st.day) {
+      // 本机时钟回拨（BRIDGE-HB-1B）：记录的日期比本地今天还晚，沿用原日期与计数。
+      // 只有本地日期真正越过记录日期才翻日清零——否则时钟往回拨一下，每日上限就整份重新放出来
+      if (repair) { // status 只读，不记
+        log(`[heartbeat] 本机时钟回拨：状态里记录的日期 ${raw.day} 晚于本地今天 ${st.day}，沿用原计数 ${runsOf(raw.runs)}/${config.maxRunsPerDay}，不清零`);
+      }
+      st.day = raw.day;
+      st.runs = runsOf(raw.runs);
+    } // 本地日期晚于记录日期（真正跨日）：runs 归零
     for (const k of ['last_beat_at', 'last_run_at', 'last_fingerprint', 'last_error', 'last_notified_at']) {
       if (typeof raw[k] === 'string') st[k] = raw[k];
     }
@@ -508,8 +532,45 @@ export function createHeartbeat(deps) {
     }
   }
 
-  // 同样的正文 24 小时内只发一次；免打扰时段或发送失败进待发队列
-  async function deliver(st, body, slugs, nowMs) {
+  // 本拍到期项按退避分流：还在退避里的这拍跳过（剩余拍数减一）、不进提示词；其余照常送模型
+  function applyBackoff(st, due) {
+    const ready = [];
+    const skipped = [];
+    for (const it of due) {
+      const rec = st.tasks[it.task.slug];
+      const verdict = backoffVerdict(rec, it);
+      if (verdict === 'changed' && rec) { // 文件变了：退避清零
+        delete rec.stale_runs;
+        delete rec.skip_left;
+      }
+      if (verdict === 'skip') {
+        rec.skip_left = Math.min(rec.skip_left, BACKOFF_MAX_SKIP) - 1;
+        skipped.push(it);
+      } else {
+        ready.push(it);
+      }
+    }
+    return { ready, skipped };
+  }
+
+  // 模型成功处理完：本拍送进去的条目「文件没变的连续次数」+1，到阈值后按 1 → 2 → 4 → 8 设跳过拍数。
+  // 调模型失败不算（模型没看成，不是看了不改）
+  function armBackoff(st, shown) {
+    for (const { task, reasons } of shown) {
+      const rec = st.tasks[task.slug];
+      if (!rec) continue;
+      const runs = (Number.isInteger(rec.stale_runs) && rec.stale_runs > 0 ? rec.stale_runs : 0) + 1;
+      rec.stale_runs = runs;
+      rec.skip_left = runs >= BACKOFF_AFTER_RUNS
+        ? Math.min(BACKOFF_MAX_SKIP, 2 ** Math.min(runs - BACKOFF_AFTER_RUNS, 10))
+        : 0;
+      if (reasons.includes('escalate_after')) rec.escalated = task.escalate_after; // 这次越过已送达，之后不再豁免
+    }
+  }
+
+  // 同样的正文 24 小时内只发一次；免打扰时段、待发队列还没发完、本拍已发满或发送失败都进待发队列。
+  // quota：本拍还能发几条（补发的包与新消息合计，见 MAX_SENDS_PER_BEAT）
+  async function deliver(st, body, slugs, nowMs, quota) {
     const text = String(body).trim();
     const hash = sha256(text).slice(0, 32);
     const sentAt = st.sent[hash];
@@ -527,6 +588,18 @@ export function createHeartbeat(deps) {
       log(`[heartbeat] 免打扰时段（${config.quietHours.label}），消息进待发队列（共 ${st.pending.length} 条），时段结束后合并发送`);
       return 'queued';
     }
+    // 不插队（BRIDGE-HB-1B）：队列里还有没补发完的（含本拍补发失败），新消息排到队尾，下一拍按顺序一起发
+    if (st.pending.length) {
+      const before = st.pending.length;
+      enqueue(st, item);
+      log(`[heartbeat] 待发队列还有 ${before} 条没发完，新消息排到队尾（共 ${st.pending.length} 条），下一拍按顺序补发`);
+      return 'queued';
+    }
+    if (quota.left <= 0) {
+      enqueue(st, item);
+      log(`[heartbeat] 本拍已发满 ${MAX_SENDS_PER_BEAT} 条，新消息进待发队列，下一拍再发`);
+      return 'queued';
+    }
     try {
       await send(`💓 **心跳**\n\n${text}`);
     } catch (e) {
@@ -534,6 +607,7 @@ export function createHeartbeat(deps) {
       logError(`[heartbeat] 私聊 owner 失败，进待发队列，下一拍补发：${redact(errText(e)).slice(0, 200)}`);
       return 'queued';
     }
+    quota.left -= 1;
     markSent(st, [item], nowMs);
     log('[heartbeat] 已私聊 owner');
     return 'sent';
@@ -542,7 +616,7 @@ export function createHeartbeat(deps) {
   // 合并补发的体量控制：sendMarkdown 截在 20,000 字，每包（含标题行）压在 18,000 以内留余量
   const PACK_CHARS = 18_000;
   const PACK_HEADER_RESERVE = 120; // 标题行实际不到 60 字，装包时按这个预留
-  const MAX_PACKS_PER_BEAT = 3; // 一拍最多发几包，剩下的下一拍再发，防止刷屏
+  const MAX_SENDS_PER_BEAT = 3; // 一拍合计最多发几条（补发的包 + 本拍新消息），剩下的下一拍再发，防止刷屏
   const PACK_SEP = '\n\n';
   const TRUNC_NOTE = '（已截断，全文请看 tasks/ 或当天 journal）';
 
@@ -572,15 +646,16 @@ export function createHeartbeat(deps) {
   }
 
   // 免打扰结束后（或发送失败后的下一拍）把待发队列分包补发：一包一条消息，按顺序发；
-  // 只有真正发出的那一包才记为已发、移出队列；某包失败就停，剩下的下一拍再发（同一拍不重试）
-  async function flushPending(st, nowMs) {
+  // 只有真正发出的那一包才记为已发、移出队列；某包失败就停，剩下的下一拍再发（同一拍不重试）。
+  // 每发出一包占本拍一条额度（quota），与本拍新消息合计不超过 MAX_SENDS_PER_BEAT
+  async function flushPending(st, nowMs, quota) {
     let left = st.pending.filter((p) => !(nowMs - (st.sent[p.hash] ?? -Infinity) < DAY_MS));
     st.pending = left;
     if (!left.length) return;
     const total = left.length;
     const packs = packPending(left, nowMs);
     let sentItems = 0;
-    for (const [k, pack] of packs.slice(0, MAX_PACKS_PER_BEAT).entries()) {
+    for (const [k, pack] of packs.slice(0, Math.max(0, quota.left)).entries()) {
       const title = packs.length === 1
         ? `💓 **心跳 · 待发汇总（${total} 条）**`
         : `💓 **心跳 · 待发汇总（第 ${k + 1}/${packs.length} 包，本包 ${pack.items.length} 条，共 ${total} 条）**`;
@@ -590,12 +665,13 @@ export function createHeartbeat(deps) {
         logError(`[heartbeat] 补发待发队列第 ${k + 1}/${packs.length} 包失败，剩余 ${left.length} 条下一拍再试：${redact(errText(e)).slice(0, 200)}`);
         return;
       }
+      quota.left -= 1;
       markSent(st, pack.items, nowMs);
       left = left.slice(pack.items.length);
       st.pending = left;
       sentItems += pack.items.length;
     }
-    log(`[heartbeat] 已合并补发 ${sentItems} 条待发消息${left.length ? `，剩余 ${left.length} 条下一拍再发（一拍最多 ${MAX_PACKS_PER_BEAT} 包）` : ''}`);
+    log(`[heartbeat] 已合并补发 ${sentItems} 条待发消息${left.length ? `，剩余 ${left.length} 条下一拍再发（一拍合计最多发 ${MAX_SENDS_PER_BEAT} 条）` : ''}`);
   }
 
   async function fetchDeltas(tasks, d) {
@@ -624,7 +700,8 @@ export function createHeartbeat(deps) {
     const nowMs = d.getTime();
     const st = loadState(d);
     st.last_beat_at = iso(nowMs);
-    if (!inQuietHours(d, config.quietHours) && st.pending.length) await flushPending(st, nowMs);
+    const quota = { left: MAX_SENDS_PER_BEAT }; // 本拍合计发送额度：先补发，剩下的才给新消息
+    if (!inQuietHours(d, config.quietHours) && st.pending.length) await flushPending(st, nowMs, quota);
 
     const { tasks, invalid } = loadTasks(tasksDir, { log });
     prune(st, new Set([...tasks.map((t) => t.slug), ...invalid.map((i) => i.file.replace(/\.json$/i, ''))]), nowMs);
@@ -638,13 +715,20 @@ export function createHeartbeat(deps) {
       persist(st);
       return { action: 'no-due' };
     }
+    const { ready, skipped } = applyBackoff(st, due);
+    const skippedNames = skipped.slice(0, 5).map((x) => x.task.slug).join('、') + (skipped.length > 5 ? ` 等 ${skipped.length} 条` : '');
+    if (!ready.length && !freshDeltas) {
+      log(`[heartbeat] 到期 ${due.length} 条都在退避中（连续多拍送进模型、台账一直没变：${skippedNames}），本拍不调模型、不占每日次数`);
+      persist(st);
+      return { action: 'backoff' };
+    }
     if (st.runs >= config.maxRunsPerDay) {
       log(`[heartbeat] 今日已调用 ${st.runs}/${config.maxRunsPerDay} 次，到达每日上限，本拍不调模型（${due.length} 条到期，明天继续）`);
       persist(st);
       return { action: 'budget' };
     }
 
-    const shown = due.slice(0, MAX_DUE_IN_PROMPT);
+    const shown = ready.slice(0, MAX_DUE_IN_PROMPT);
     const stats = {};
     st.runs += 1;
     st.last_run_at = iso(nowMs);
@@ -665,8 +749,9 @@ export function createHeartbeat(deps) {
       return { action: 'state-error' };
     }
 
-    const prompt = buildHeartbeatPrompt({ due: shown, omitted: due.length - shown.length, deltas, now: d, stats });
-    log(`[heartbeat] ${shown.length} 条到期${deltas.length ? `、${deltas.length} 条外部增量` : ''}，调模型（今日第 ${st.runs}/${config.maxRunsPerDay} 次）`);
+    const prompt = buildHeartbeatPrompt({ due: shown, omitted: ready.length - shown.length, deltas, now: d, stats });
+    log(`[heartbeat] ${shown.length} 条到期${deltas.length ? `、${deltas.length} 条外部增量` : ''}，调模型（今日第 ${st.runs}/${config.maxRunsPerDay} 次）`
+      + (skipped.length ? `；另有 ${skipped.length} 条在退避中本拍跳过（${skippedNames}）` : ''));
     let answer;
     try {
       // 不续会话、不发中间进度（onProgress=null）；工具档由 claude.js 的 heartbeat 分支收紧
@@ -687,13 +772,14 @@ export function createHeartbeat(deps) {
         } catch {
           detail = `⚠️ Claude 调用失败：${msg}`;
         }
-        await deliver(st, `心跳调用模型失败（连续失败只提醒这一次；下一拍自动重试）\n\n${detail}`, [], nowMs);
+        await deliver(st, `心跳调用模型失败（连续失败只提醒这一次；下一拍自动重试）\n\n${detail}`, [], nowMs, quota);
       }
       persist(st);
       return { action: 'error' };
     }
     st.consecutive_failures = 0;
     st.last_error = null;
+    armBackoff(st, shown);
     if (deltas.length) st.last_fingerprint = fp;
     const body = String(answer ?? '').trim();
     if (isQuiet(body)) {
@@ -701,7 +787,7 @@ export function createHeartbeat(deps) {
       persist(st);
       return { action: 'quiet' };
     }
-    const action = await deliver(st, body, shown.map((x) => x.task.slug), nowMs);
+    const action = await deliver(st, body, shown.map((x) => x.task.slug), nowMs, quota);
     persist(st);
     return { action };
   }
@@ -772,16 +858,20 @@ export function createHeartbeat(deps) {
     let runtime;
     if (!config.enabled) runtime = '—（配置未启用，心跳不运行）';
     else runtime = active ? '运行中' : '已暂停（/heartbeat on 恢复；重启后回到配置值）';
+    const today = localDay(d);
+    const rollback = st.day !== today ? `；本机时钟回拨到 ${today}，沿用 ${st.day} 的计数` : '';
+    const dueNow = dueTasks(scan.tasks, d);
+    const backingOff = dueNow.filter((it) => backoffVerdict(st.tasks[it.task.slug], it) === 'skip').length;
     return [
       '💓 **心跳状态**',
       `- 配置开关 HEARTBEAT_ENABLED：${config.enabled ? 'true（已启用）' : '未启用（不是 true）'}`,
       `- 运行时开关：${runtime}`,
-      `- 今日调用：${st.runs}/${config.maxRunsPerDay}（按本地日期 ${localDay(d)} 计，重启不清零）`,
+      `- 今日调用：${st.runs}/${config.maxRunsPerDay}（按本地日期 ${st.day} 计，重启不清零${rollback}）`,
       `- 每 ${config.intervalMin} 分钟一拍 · 免打扰 ${config.quietHours ? config.quietHours.label : '关闭'} · `
         + `模型 ${config.model}/${config.effort} · 外部增量 ${config.watch}`,
       `- 台账：open ${counts.open} · waiting ${counts.waiting} · done ${counts.done} · dropped ${counts.dropped}`
         + ` · 无效 ${scan.invalid.length}${names ? `（${names}${more}）` : ''}`,
-      `- 当前到期 ${dueTasks(scan.tasks, d).length} 条 · 待发 ${st.pending.length} 条`,
+      `- 当前到期 ${dueNow.length} 条${backingOff ? `（退避中 ${backingOff} 条）` : ''} · 待发 ${st.pending.length} 条`,
       `- 上一拍 ${at(st.last_beat_at)} · 上次调模型 ${at(st.last_run_at)} · 连续失败 ${st.consecutive_failures} 次`,
     ].join('\n');
   }
@@ -801,6 +891,15 @@ export function startHeartbeat(deps) {
   const hb = createHeartbeat(deps);
   hb.start();
   return hb;
+}
+
+/**
+ * 消息入口用这个（BRIDGE-HB-1B）：/heartbeat 只在私聊（chat_type === 'p2p'）里生效。
+ * 群聊里（包括 owner 本人发的）返回 null＝不回复、不读不改心跳状态；chat_type 缺失或不认识一律按群聊处理。
+ */
+export function privateHeartbeatCommand(chatType, text, opts) {
+  if (chatType !== 'p2p') return null;
+  return heartbeatCommand(text, opts);
 }
 
 /** /heartbeat on|off|status（仅 owner；只改运行时开关，从不写 .env）。返回要回复的文字。 */

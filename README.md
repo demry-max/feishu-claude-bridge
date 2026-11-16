@@ -18,7 +18,7 @@
 - 🧠 **会话记忆**：每个飞书会话映射一个 Claude session（`--resume` 续聊），跨天跨周有效；`/new` 重开，`/status` 查看
 - 🗂️ **Agent 工作区**：workspace 内置 CLAUDE.md 人格 + `memory/` 三层长期记忆（画像 USER.md / 事实文件+索引 / journal 流水；纠正、决定、偏好主动落盘，不用等「记住」）+ `skills/` 技能沉淀（说「存成技能」自动生成 SKILL.md 并在后续会话自动加载）
 - ⏰ **定时任务（机器人自己排期）**：对它说「每天八点提醒我…」它就写一份任务定义到 `workspace/schedules/`，桥接到点执行并主动推送结果；支持 cron 表达式与一次性时间。**机器人始终没有 Bash/命令执行权限**——它只能写受限目录里的任务定义，执行由桥接负责
-- 💓 **桥接自带心跳（默认关闭）**：交办给它的事记在 `workspace/tasks/<slug>.json` 台账里；每拍先由脚本读台账，有到期项才调一次模型（收紧的固定工具档：无 Bash、无联网、无飞书工具，只能写 `tasks/` 与 `memory/journal/`），有事才私聊 owner、无事完全静默；每日调用上限、免打扰时段、24 小时去重。`HEARTBEAT_ENABLED=true` 开启，`/heartbeat on|off|status` 运行时开关
+- 💓 **桥接自带心跳（默认关闭）**：交办给它的事记在 `workspace/tasks/<slug>.json` 台账里；每拍先由脚本读台账，有到期项才调一次模型（收紧的固定工具档：无 Bash、无联网、无飞书工具，只能写 `tasks/` 与 `memory/journal/`），有事才私聊 owner、无事完全静默；每日调用上限、免打扰时段、24 小时去重。`HEARTBEAT_ENABLED=true` 开启，`/heartbeat on|off|status` 运行时开关（仅 owner 私聊）
 - ⏱️ **活动式超时与任务控制**：有输出就不计时（长任务不被误杀）；`/cancel` 随时取消、`/redirect` 中断改道
 - 🛡️ **出站脱敏**：回复送出前抹掉密钥、令牌、JWT 与内网 IP
 - 🔊 **语音回复**：`/voice` 开启后回答附带语音消息
@@ -90,21 +90,28 @@ workspace/
 2. 没有到期项（`status` 为 open/waiting，且 `next_check_at` 已到或 `escalate_after` 已过）→ 记一行日志，**不调模型**；
 3. 有到期项 → 调一次模型（`HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT`，不续会话、无中间进度），提示词只含到期条目，
    title/notes 进不可信围栏；模型改写台账推进进度；上一拍没跑完时本拍直接跳过；
+   **反复到期退避**：同一条台账连续 3 次被成功送进模型、文件内容一直没变（哈希相同），之后每再送一次
+   就按 1 → 2 → 4 → 8 拍递增跳过（封顶 8 拍）；文件一变即清零，`escalate_after` 首次越过的那一拍照送不跳。
+   退避中的条目不进提示词、不占每日次数（到期项全在退避里就整拍不调模型）；退避状态也在 `data/heartbeat-state.json`，重启不丢；
 4. 答复是 `HEARTBEAT_OK` → 完全静默；否则以应用身份私聊 owner。同样的正文 24 小时内只发一次；
-   免打扰时段内只记状态不发消息，时段结束后合并成一条发出。
+   免打扰时段内只记状态不发消息，时段结束后合并成一条发出。待发队列没发完时新消息排到队尾、不插队；
+   一拍合计最多发 3 条（补发的包 + 新消息），剩下的下一拍按原顺序接着发。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `HEARTBEAT_ENABLED` | `false` | 精确等于 `true` 才启动 |
 | `HEARTBEAT_INTERVAL_MIN` | `30` | 每拍间隔（分钟） |
-| `HEARTBEAT_MAX_RUNS_PER_DAY` | `12` | 每日最多调模型次数；按本地日期计，重启不清零 |
+| `HEARTBEAT_MAX_RUNS_PER_DAY` | `12` | 每日最多调模型次数；按本地日期计，重启不清零；本地日期越过记录日期才翻日，时钟回拨不清零 |
 | `HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT` | `claude-sonnet-5` / `low` | 心跳用的模型与思考档 |
 | `HEARTBEAT_QUIET_HOURS` | `22-08` | 免打扰时段（本地时间，可跨午夜；`none` 关闭） |
 | `HEARTBEAT_WATCH` | `none` | 外部增量（群聊回复/审批/日历）；本版只实现 `none`，其他值记日志后按 `none` 处理 |
 
-桥接自己的计数、去重、待发队列放 `data/heartbeat-state.json`（原子写，与台账分开，模型改不到）。
-`/heartbeat status` 查看开关、今日用量与台账分布；`/heartbeat off|on` 只改运行时开关（不写 `.env`，重启后回到配置值），
-`HEARTBEAT_ENABLED` 不是 `true` 时 `on` 会拒绝。台账协议与心跳轮次的提示词约定见
+桥接自己的计数、去重、待发队列、退避状态放 `data/heartbeat-state.json`（原子写，与台账分开，模型改不到）。
+本机时钟回拨（本地日期比状态里记的早）时沿用原计数、每拍记一行「时钟回拨」日志，等本地日期真正越过记录日期才翻日；
+若是时钟曾被误调快后又改回，额度会一直按那个「未来日期」累计，需要时手工把状态文件里的 `day` 改回今天。
+`/heartbeat status` 查看开关、今日用量、台账分布与退避中的条数；`/heartbeat off|on` 只改运行时开关（不写 `.env`，重启后回到配置值），
+`HEARTBEAT_ENABLED` 不是 `true` 时 `on` 会拒绝。`/heartbeat` 只在 owner 私聊里生效：群聊里（包括 owner 本人发的）
+不回复、不读不改心跳状态。台账协议与心跳轮次的提示词约定见
 [`docs/heartbeat-prompt-proposal.md`](docs/heartbeat-prompt-proposal.md)（建议稿，过审后并入 `workspace/CLAUDE.md`）。
 
 ## 快速开始 Quick Start
