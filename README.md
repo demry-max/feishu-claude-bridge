@@ -25,7 +25,7 @@
 - 🩺 **定时任务自诊断**：任务失败自动分析原因并给出建议动作
 - 🧷 **压缩前固化记忆**：上下文接近上限时自动提醒机器人把该留的写进 `memory/`，避免自动压缩后细节流失
 - 🔀 **模型随时切换**：`/model fable high` 一句话切换模型与思考档，立即生效无需重启；也可设定时自动切换（如早八点切回便宜档）
-- 🚦 **聊天/规划与执行分工两个模型**：`CLAUDE_MODEL` 负责平常对话与规划（如 fable 5.1），`CLAUDE_EXEC_MODEL` 负责执行（如 sonnet 5）——说「执行」「去做」或发 `/do <任务>` 时下一轮自动切到执行模型，会话上下文保留（执行模型看得见刚谈妥的计划）；定时任务默认走执行模型。`/model exec sonnet` 随时改，留空即关闭分工
+- 🚦 **聊天/规划与执行分工两个模型**：`CLAUDE_MODEL` 负责平常对话与规划（如 fable 5.1），`CLAUDE_EXEC_MODEL` 负责执行（如 sonnet 5.5）——说「执行」「去做」或发 `/do <任务>` 时下一轮自动切到执行模型，会话上下文保留（执行模型看得见刚谈妥的计划）；定时任务默认走执行模型。`/model exec sonnet` 随时改，留空即关闭分工
 - 🩺 **安装体检**：`npm run doctor` 检查 Node / npm / claude 登录 / `.env` / 工作区 / 飞书 scope，能自动修的直接修；启动日志也会自检 scope，告诉你哪些飞书工具因权限未开而不可用
 - 📄 **飞书文档 / 多维表格读写**：内置 MCP 工具（读文档、追加段落、多维表格查表/读记录/增改记录）；用**机器人应用自己的租户权限**，能碰什么由飞书后台 scope 精确控制，仅 owner 可用
 - 🖼️ **回传图片与文件**：机器人写进 `workspace/outbox/` 的文件自动上传发送（图片可直接预览）
@@ -87,7 +87,7 @@ workspace/
 只记 owner 交办给它的事，不接管日历。心跳每 `HEARTBEAT_INTERVAL_MIN` 分钟一拍：
 
 1. 脚本先读台账：坏文件、非法字段、软链、macOS `._` 影子文件跳过并记日志，不崩；
-2. 没有到期项（`status` 为 open/waiting，且 `next_check_at` 已到或 `escalate_after` 已过）→ 记一行日志，**不调模型**；
+2. 没有到期项（`status` 为 open/waiting，且 `next_check_at` 已到或 `escalate_after` 已过）、外部增量也没有新东西 → 记一行日志，**不调模型**；
 3. 有到期项 → 调一次模型（`HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT`，不续会话、无中间进度），提示词只含到期条目，
    title/notes 进不可信围栏；模型改写台账推进进度；上一拍没跑完时本拍直接跳过；
    **反复到期退避**：同一条台账连续 3 次被成功送进模型、文件内容一直没变（哈希相同），之后每再送一次
@@ -96,23 +96,67 @@ workspace/
 4. 答复是 `HEARTBEAT_OK` → 完全静默；否则以应用身份私聊 owner。同样的正文 24 小时内只发一次；
    免打扰时段内只记状态不发消息，时段结束后合并成一条发出。待发队列没发完时新消息排到队尾、不插队；
    一拍合计最多发 3 条（补发的包 + 新消息），剩下的下一拍按原顺序接着发。
+   待发队列里同一条（包）连续 5 拍发送失败就移出队列、不再重试（journal 记一行，不记正文）；队列满 20 条时丢最旧一条。
+   两种丢弃都在下一次成功发出的心跳消息末尾附一行计数说明，不调模型。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `HEARTBEAT_ENABLED` | `false` | 精确等于 `true` 才启动 |
 | `HEARTBEAT_INTERVAL_MIN` | `30` | 每拍间隔（分钟） |
-| `HEARTBEAT_MAX_RUNS_PER_DAY` | `12` | 每日最多调模型次数；按本地日期计，重启不清零；本地日期越过记录日期才翻日，时钟回拨不清零 |
-| `HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT` | `claude-sonnet-5` / `low` | 心跳用的模型与思考档 |
+| `HEARTBEAT_MAX_RUNS_PER_DAY` | `12` | 每日最多调模型次数；按本地日期计，重启不清零；时钟回拨不清零（见下） |
+| `HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT` | `claude-sonnet-5-5` / `low` | 心跳用的模型与思考档 |
 | `HEARTBEAT_QUIET_HOURS` | `22-08` | 免打扰时段（本地时间，可跨午夜；`none` 关闭） |
-| `HEARTBEAT_WATCH` | `none` | 外部增量（群聊回复/审批/日历）；本版只实现 `none`，其他值记日志后按 `none` 处理 |
+| `HEARTBEAT_WATCH` | `none` | 外部增量源：逗号分隔的 `chat_reply,approval` 子集（见下）；`calendar` 未实现，与其他不认识的值一样记日志后忽略 |
+| `HEARTBEAT_WATCH_MAX` | `10` | 每拍最多拉几条台账的外部增量（1–50） |
+| `HEARTBEAT_BUTTONS` | `false` | 精确 `true` 时，只涉及一条台账的心跳消息带三个按钮 |
+| `HEARTBEAT_REPLY_SHORTCUTS` | `false` | 精确 `true` 时，引用回复心跳消息的三个固定短语由桥接直接处理 |
+| `HEARTBEAT_UNREAD_PAUSE` | `0` | 最近 N 条心跳消息都超过 24 小时未读就暂停发送；`0` 关闭（0–50） |
+| `LARK_CLI_BIN` | `lark-cli` | 外部增量用的 lark-cli 可执行文件（不在 PATH 里时填绝对路径） |
 
-桥接自己的计数、去重、待发队列、退避状态放 `data/heartbeat-state.json`（原子写，与台账分开，模型改不到）。
-本机时钟回拨（本地日期比状态里记的早）时沿用原计数、每拍记一行「时钟回拨」日志，等本地日期真正越过记录日期才翻日；
-若是时钟曾被误调快后又改回，额度会一直按那个「未来日期」累计，需要时手工把状态文件里的 `day` 改回今天。
-`/heartbeat status` 查看开关、今日用量、台账分布与退避中的条数；`/heartbeat off|on` 只改运行时开关（不写 `.env`，重启后回到配置值），
+桥接自己的计数、去重、待发队列、退避状态、心跳消息索引放 `data/heartbeat-state.json`（原子写，与台账分开，模型改不到）。
+本机时钟回拨（本地日期比状态里记的早 1 天以内）时沿用原计数、每拍记一行「时钟回拨」日志，等本地日期真正越过记录日期才翻日；
+状态里记的日期比今天晚**超过 1 天**（时钟曾被误调快后又改回）时按今天计、保留原计数（不清零），记一行日志，不用再手工改状态文件。
+`/heartbeat status` 查看开关、今日用量、台账分布与退避中的条数，以及外部增量各源（开关、上次拉取、连续失败）、
+在盯 / 被锁的 watch 条数、按钮与引用回复开关、未读暂停状态、今日事件计数；`/heartbeat off|on` 只改运行时开关（不写 `.env`，重启后回到配置值），
 `HEARTBEAT_ENABLED` 不是 `true` 时 `on` 会拒绝。`/heartbeat` 只在 owner 私聊里生效：群聊里（包括 owner 本人发的）
 不回复、不读不改心跳状态。台账协议与心跳轮次的提示词约定见
-[`docs/heartbeat-prompt-proposal.md`](docs/heartbeat-prompt-proposal.md)（建议稿，过审后并入 `workspace/CLAUDE.md`）。
+[`docs/heartbeat-prompt-proposal.md`](docs/heartbeat-prompt-proposal.md)，`watch` 怎么填、外部原文怎么转述见
+[`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md)（都是建议稿，过审后并入 `workspace/CLAUDE.md`）。
+
+### 光总对心跳消息的操作（全部由桥接处理，不调模型）
+
+- **事件**：表情、已读、撤回三类机器人事件和卡片按钮回调（`card.action.trigger`）按确定规则处理，处理函数遇到坏载荷也不抛错。
+  只有 owner 本人对心跳消息的表情 / 已读才记信号（`data/heartbeat-signals.json`，下一拍并进状态里的 `read_at` / `reacted_at`）；
+  app 回显、别人的操作、非心跳消息、撤回只计数。
+- **按钮**（`HEARTBEAT_BUTTONS=true`）：只涉及一条台账的心跳消息末尾带［知道了］［推迟一天］［不做了］。
+  不论开关，回调都要校验：操作人是 owner、消息在心跳消息索引里（最多 200 条、保留 14 天）、按钮里的 nonce 与索引一致、
+  台账存在且仍在跟进、同一动作没处理过。全部通过才回「已记下」，否则回「已失效」、不改任何文件。
+  回调 3 秒内返回，回写异步排队；心跳这一拍正在跑时，等这一拍结束再写。
+  「知道了」只在心跳状态里记一笔（下次提示词里带上）、不改台账；「推迟一天」把 `next_check_at` / `escalate_after` 各推后一天；
+  「不做了」把 `status` 改成 `dropped`。改台账只动目标字段和 `updated_at`，不认识的字段原样保留，原子写；
+  每次都在当天 journal 记一行「（桥接）光总点了『…』：tasks/<slug>.json」。
+- **引用回复快捷**（`HEARTBEAT_REPLY_SHORTCUTS=true`）：owner 私聊里引用回复心跳消息，正文恰好是「知道了」「推迟一天」「不做了」
+  （允许带结尾标点），且那条消息只涉及一条台账 → 桥接按同样的规则回写并回一句确认，不进模型；
+  其余引用回复照常进 owner 对话，提示词末尾加一行「（你在回复关于 tasks/<slug>.json 的心跳消息）」。
+- **未读暂停**（`HEARTBEAT_UNREAD_PAUSE=N`）：最近 N 条心跳消息发出满 24 小时都没被读，就暂停发送（模型照常看台账，新消息只排队）。
+  owner 读了任一条心跳消息或执行 `/heartbeat on` 就恢复，攒下的按顺序补发，恢复后的第一条消息开头会说明暂停过。
+- 开放平台后台要手动订阅 `im.message.reaction.created_v1`、`im.message.message_read_v1`、`im.message.recalled_v1`，
+  并在回调配置里用长连接接收 `card.action.trigger`。没开时这些功能只是收不到事件，心跳的其余行为不变。
+
+### 外部增量（`HEARTBEAT_WATCH`）
+
+台账里写了 `watch` 的条目，每拍由桥接以 owner 身份（`lark-cli … --as user`）执行**固定的只读命令**拉增量，有新东西才可能调模型：
+
+- `chat_reply`（`"watch": { "type": "chat_reply", "chat_id": "oc_…", "after": "om_… 或时间戳" }`）：拉该会话 `after` 之后的新消息，
+  过滤 owner、机器人和系统消息；游标只进不退（台账把 `after` 改小也不会重复触发），同一批消息指纹不变就不调模型；
+- `approval`（`"watch": { "type": "approval", "instance_code": "…" }`）：拉审批实例的状态、当前节点和最近评论，没变化就不调模型；
+  首次拉到仍在审批中只建基线；同一条审批隔一拍才拉一次；
+- `calendar` 未实现，跳过；每拍最多拉 `HEARTBEAT_WATCH_MAX` 条。
+- 三条 argv 模板逐字冻结在 `src/watch-sources.js`（只读命令，变量都先校验），子进程不经 shell、15 秒超时、输出上限 1MB，
+  环境变量只给 HOME / PATH / LANG；拉取失败或超时这一拍降级为只看台账，不抛错。外部原文进提示词时包在不可信围栏里。
+- **watch 锁**：`watch` 决定桥接以 owner 身份去读哪个会话 / 审批，所以只认 owner 对话里改的。心跳轮里改动的 `watch` 不生效：
+  沿用原值、记日志，下一条心跳消息末尾说明。
+- 需要本机已安装并以 owner 身份登录 `lark-cli`；`HEARTBEAT_WATCH` 不配时一次 lark-cli 都不跑。
 
 ## 快速开始 Quick Start
 
@@ -155,13 +199,13 @@ npm start              # 日志出现 [ws] ws client ready 即成功
 
 ```
 CLAUDE_MODEL=fable           # 平常聊天、讨论、规划（默认车道）
-CLAUDE_EXEC_MODEL=sonnet     # 执行；留空 = 不分工，所有轮次都用 CLAUDE_MODEL
+CLAUDE_EXEC_MODEL=sonnet     # 执行（别名 sonnet = claude-sonnet-5-5）；留空 = 不分工，所有轮次都用 CLAUDE_MODEL
 CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EFFORT
 ```
 
 - 触发执行车道：消息以 `/do`、`/exec`、`/run` 开头（前缀会被剥掉），或句首是「执行」「开始执行」「去做」「动手」「go」「do it」等触发词（`EXEC_TRIGGERS` 可整体覆盖）。裸 `/do` = 「按上面已确认的计划执行」。
 - 判定是**确定性的**（前缀/句首词边界），不靠模型猜：「执行力很重要」「google 一下」都不会误切。
-- 执行轮通过 `--resume` 复用同一会话：sonnet 看得见 fable 刚谈妥的计划。桥接会在系统提示词里告诉模型本轮车道与分工。
+- 执行轮通过 `--resume` 复用同一会话：sonnet 5.5 看得见 fable 刚谈妥的计划。桥接会在系统提示词里告诉模型本轮车道与分工。
 - 定时任务默认走执行车道（任务定义里写 `model` 可覆盖）；失败自诊断仍用 `DIAG_MODEL`。
 - `/model` 查看两个模型；`/model exec sonnet` 改执行模型、`/model exec off` 关闭分工；`set-model` 定时动作支持 `exec_model` / `exec_effort` 字段。
 

@@ -184,7 +184,7 @@ describe('回归：普通 owner 与定时任务参数除新增 Edit(./tasks/**) 
   const CASES = {
     ownerChat: [{}, (m) => m.buildClaudeArgs('oc_x', true, [], { lane: 'chat', resumeId: 'sess-1' })],
     ownerExecLark: [
-      { LARK_CLI: 'true', CLAUDE_EXEC_MODEL: 'sonnet' },
+      { LARK_CLI: 'true', CLAUDE_EXEC_MODEL: 'claude-sonnet-5' },
       (m) => m.buildClaudeArgs('oc_x', true, ['Read(./incoming/**)'], { lane: 'exec', resumeId: 'sess-1' }),
     ],
     schedJob: [{}, (m) => m.buildClaudeArgs('sched:daily.json', true, [], { model: 'haiku', effort: 'low' })],

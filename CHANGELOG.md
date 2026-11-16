@@ -6,6 +6,18 @@
 
 ### 新增
 
+- **心跳第二步：机器人事件 + 按钮 + 外部增量（新能力默认全关，BRIDGE-EV-1）**：表情 / 已读 / 撤回事件与卡片按钮回调
+  （`card.action.trigger`）接成「光总对心跳消息的操作」信号，全部由桥接按确定规则处理、不调模型；`sendMarkdown` 返回
+  `message_id`（降级纯文本也返回），心跳消息记索引（最多 200 条、保留 14 天）。`HEARTBEAT_BUTTONS=true` 时只涉及一条台账的
+  心跳消息带［知道了］［推迟一天］［不做了］：回调校验 owner、索引、nonce、台账后才异步回写（原子写、未知字段保留、journal 记一行），
+  否则回「已失效」、不改任何文件；`HEARTBEAT_REPLY_SHORTCUTS=true` 时引用回复的同名短语确定性处理，其余引用回复带台账提示行进对话。
+  `HEARTBEAT_WATCH` 实现 `chat_reply` / `approval`：以 owner 身份执行冻结的只读 lark-cli 命令（不经 shell、15 秒超时、输出 1MB 封顶、
+  环境变量只给 HOME/PATH/LANG），游标只进不退、指纹不变不调模型、审批隔拍拉、失败降级为只看台账，外部原文进不可信围栏；
+  心跳轮里改的 `watch` 不生效（watch 锁）。`HEARTBEAT_UNREAD_PAUSE=N`：最近 N 条心跳消息超过 24 小时未读就暂停发送，
+  已读或 `/heartbeat on` 恢复。状态日期比今天晚超过 1 天时按今天计、保留计数；待发队列同一条连续 5 拍发送失败即移出、
+  队满丢最旧一条，两者都在下一条成功发出的消息末尾说明；`/heartbeat status` 增加外部增量、watch、按钮、暂停与今日事件计数。
+  新增 `.env` 项 `HEARTBEAT_WATCH_MAX` / `_BUTTONS` / `_REPLY_SHORTCUTS` / `_UNREAD_PAUSE`、`LARK_CLI_BIN`。
+  `sonnet` 别名与 `HEARTBEAT_MODEL` 默认值统一为 `claude-sonnet-5-5`（`haiku` 别名、`DIAG_MODEL` 不变）。
 - **桥接自带心跳（默认关闭，BRIDGE-HB-1）**：交办台账 `workspace/tasks/<slug>.json`（一事一个 JSON，
   open/waiting/done/dropped）。每拍先由脚本读台账，有到期项才调一次模型（`sched:heartbeat`，不续会话、
   无中间进度、自带互斥锁），提示词只含到期条目、title/notes 进不可信围栏；答复不是 `HEARTBEAT_OK` 才以应用身份
