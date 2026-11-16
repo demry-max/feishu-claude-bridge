@@ -107,7 +107,7 @@ function safeParse(json) {
  * 这类高权工具。围栏不是万能的，但把「数据」和「指令」显式分开能挡掉绝大多数顺手注入。
  * 围栏用随机结束标记，防止内容里自带闭合标记来逃逸。
  */
-function fenceUntrusted(label, body) {
+export function fenceUntrusted(label, body) {
   // CSPRNG：Math.random 可预测，且 nonce 会随回显泄漏给攻击者
   const nonce = crypto.randomBytes(8).toString('hex');
   // 清掉正文里一切仿造的围栏标记（不只是本次 nonce），否则可以伪造闭合整段逃逸

@@ -33,7 +33,8 @@ export const MEMORY_MD_SEED = `# 记忆索引（事实层）
 
 `;
 
-const DIRS = ['memory/journal', 'skills', 'schedules', 'outbox', 'incoming'];
+// tasks/：任务台账（一事一个 JSON，心跳按 next_check_at / escalate_after 到期推进，BRIDGE-HB-1）
+const DIRS = ['memory/journal', 'skills', 'schedules', 'outbox', 'incoming', 'tasks'];
 
 /**
  * 建出三层记忆所需的目录与种子文件。返回 { ok, problem }，不抛——

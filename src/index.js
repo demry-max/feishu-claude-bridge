@@ -6,6 +6,7 @@ import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeys
 import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
+import { startHeartbeat, heartbeatConfig, heartbeatCommand } from './heartbeat.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
@@ -123,6 +124,7 @@ const HELP_TEXT = [
   '- `/model exec <模型|off>` 设置执行模型，如 `/model exec sonnet`（仅 owner）',
   '- `/do <任务>` 用执行模型跑这一轮；说「执行」「去做」也一样，会话上下文保留',
   '- `/tasks` 查看定时任务：上次/下次触发时间（仅 owner）',
+  '- `/heartbeat on|off|status` 心跳开关与状态（仅 owner；只改运行时开关，不写 .env）',
   '',
   '**能做什么**',
   '- 直接对话；群里 @我 即可',
@@ -326,6 +328,11 @@ async function handleMessage(data) {
       return;
     }
     await reply(message.message_id, describeTasks());
+    return;
+  }
+  // 心跳开关只改运行时状态、从不写 .env；非 owner 一律拒绝（heartbeatCommand 内判定，不碰心跳状态）
+  if (text === '/heartbeat' || text.startsWith('/heartbeat ')) {
+    await reply(message.message_id, heartbeatCommand(text, { isOwner, heartbeat }));
     return;
   }
   if (text === '/status') {
@@ -535,9 +542,27 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 });
 
 // ---- 定时任务：到点跑 Claude，把结果主动发到指定会话 ----
+// 无事不报的哨兵：答案为空或整条就是 HEARTBEAT_OK 时静默。定时任务与桥接心跳共用这一个判定。
+// 必须整条只是心跳词：前缀匹配会把「HEARTBEAT_OK 但磁盘快满了」这类带正文的告警整条吞掉
+function isQuietAnswer(answer) {
+  const body = String(answer ?? '').trim();
+  return !body || /^HEARTBEAT_OK[.。!！]?$/i.test(body);
+}
+
 async function sendToChat(chatId, text) {
+  return sendMarkdown('chat_id', chatId, text);
+}
+
+// 以应用身份私聊 owner（与启动通知同一条路：receive_id_type=open_id），桥接心跳用
+async function sendToOwner(text) {
+  const owner = OWNER_OPEN_ID || loadOwner();
+  if (!owner) throw new Error('还没有 owner open_id（owner 首次私聊机器人后自动绑定）');
+  return sendMarkdown('open_id', owner, text);
+}
+
+async function sendMarkdown(receiveIdType, receiveId, text) {
   const body = (data) =>
-    client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } });
+    client.im.v1.message.create({ params: { receive_id_type: receiveIdType }, data: { receive_id: receiveId, ...data } });
   const chunk = redact(text).slice(0, 20000);
   try {
     await body({
@@ -548,7 +573,7 @@ async function sendToChat(chatId, text) {
       }),
     });
   } catch (e) {
-    console.error('[sched] 卡片发送失败，降级纯文本:', e?.message ?? e);
+    console.error(`[send] 卡片发送失败（${receiveIdType}），降级纯文本:`, e?.message ?? e);
     await body({ msg_type: 'text', content: JSON.stringify({ text: chunk }) });
   }
 }
@@ -683,12 +708,10 @@ startScheduler({
         { model: job.model, effort: job.effort } // 任务可自带档位，未指定则用全局配置
       );
       const late = job._late ? `（迟到补跑 ${Math.round(job._late / 60000)} 分钟）` : '';
-      // 无事不报：答案以 HEARTBEAT_OK 开头（或为空）时静默跳过，
-      // 让「每天检查一遍，有问题才叫我」这类心跳型任务成为可能
-      // 必须整条just是心跳词：前缀匹配会把「HEARTBEAT_OK 但磁盘快满了」这类
-      // 带正文的告警整条吞掉
+      // 无事不报：答案整条就是 HEARTBEAT_OK（或为空）时静默跳过，
+      // 让「每天检查一遍，有问题才叫我」这类心跳型任务成为可能（判定见 isQuietAnswer）
       const body = (answer ?? '').trim();
-      const quiet = !body || /^HEARTBEAT_OK[.。!！]?$/i.test(body);
+      const quiet = isQuietAnswer(body);
       if (quiet) {
         console.log(`[sched] 「${job.name ?? job._file}」无需汇报，静默跳过`);
       } else {
@@ -743,6 +766,25 @@ setInterval(() => {
   cleanIncoming(WORKSPACE_DIR);
   cleanIncoming(GUEST_WORKSPACE_DIR);
 }, 24 * 3600 * 1000).unref();
+
+// ---- 桥接自带心跳（BRIDGE-HB-1）：默认关闭，HEARTBEAT_ENABLED 精确等于 true 才启动 ----
+// 每拍先由脚本读 workspace/tasks/ 台账，有到期项才调一次模型（收紧的心跳工具档），
+// 只有答复不是 HEARTBEAT_OK 时才私聊 owner。自带互斥锁，不占定时任务的并发名额。
+// 失败提醒复用私聊的失败话术（含登录故障修复步骤），只把「重发这条消息」换成心跳语境
+async function describeHeartbeatFailure(msg) {
+  return (await claudeFailureReply(msg))
+    .replace(/(修好|恢复)后重发这条消息。$/, '$1后不用重发，心跳下一拍会自动重试。')
+    .replace(/过半分钟再发一次。$/, '心跳下一拍会自动重试。');
+}
+const heartbeat = startHeartbeat({
+  config: heartbeatConfig(process.env),
+  tasksDir: path.join(WORKSPACE_DIR, 'tasks'),
+  stateFile: path.join(DATA_DIR, 'heartbeat-state.json'),
+  runClaude,
+  send: sendToOwner,
+  isQuiet: isQuietAnswer,
+  describeFailure: describeHeartbeatFailure,
+});
 
 console.log('启动飞书长连接…');
 wsClient.start({ eventDispatcher });

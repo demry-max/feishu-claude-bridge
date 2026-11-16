@@ -84,13 +84,14 @@ ensureGuestWorkspace();
   const r = ensureOwnerWorkspace(WORKSPACE_DIR);
   if (!r.ok) console.error('[owner-workspace]', r.problem);
 }
-// owner 默认工具集。写权限必须包含工作区里的四个目录，否则 CLAUDE.md 承诺的三层记忆、
-// 技能沉淀、自建定时任务、文件回传在开箱状态下全部写不进去（2026-09-13 安装反馈 P0）。
+// owner 默认工具集。写权限必须包含工作区里的五个目录，否则 CLAUDE.md 承诺的三层记忆、
+// 技能沉淀、自建定时任务、文件回传、交办台账（tasks/，心跳读它）在开箱状态下全部写不进去
+// （2026-09-13 安装反馈 P0；tasks/ 为 BRIDGE-HB-1 新增）。
 // 文件权限规则只认 Edit(path)——它覆盖 Write/NotebookEdit 等所有编辑工具；
 // Write(path) 写法不会被文件权限检查匹配，等于没配。
 // 显式配置 ALLOWED_TOOLS 时完全以配置为准，不做合并（用户收窄了就不该再暗中扩回来）。
 export const DEFAULT_OWNER_TOOLS =
-  'Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**)';
+  'Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**),Edit(./tasks/**)';
 const ALLOWED_TOOLS = process.env.ALLOWED_TOOLS ?? DEFAULT_OWNER_TOOLS;
 // 可选：飞书官方 lark-cli（22 个业务域 200+ 命令，用户 OAuth 身份，凭据在系统钥匙串）。
 // 覆盖面比手写的 10 个 MCP 工具大得多（审批/日历/任务/OKR…），且用户维度的查询
@@ -453,6 +454,53 @@ function runtimeSystemPrompt(chatId, model, effort, isOwner, lane = 'chat') {
   ].join('\n');
 }
 
+// ---- 心跳工具档（BRIDGE-HB-1，toolProfile: 'heartbeat'）----
+// 心跳是桥接自己定时唤起的无人值守轮次：没人盯着，输入里有台账自由文本（可能带注入），
+// 所以工具面比 owner 普通会话窄得多，且固定写死、不受 env 放宽影响
+// （ALLOWED_TOOLS / LARK_CLI / FEISHU_TOOLS / extraTools 一律不进来）：
+//   --setting-sources ''  不加载任何 settings：用户级 permissions.allow（本机含 Bash(lark-cli *)）对 -p 同样生效
+//   --strict-mcp-config   不加载用户级 MCP；飞书 MCP 也不挂（只读最小集取空集：读工具会带回未围栏的第三方内容）
+//   --tools               内置工具白名单：Read/Grep/Glob + Edit/Write；没有 Bash、WebFetch、WebSearch、Task、Skill……
+//   --allowedTools        Read 预批限工作区；写只预批 tasks/ 与 memory/journal/；
+//                         不给裸 Grep/Glob——裸规则等于预批任意路径的检索（工作区内的检索本就免询问）
+//   --disallowedTools     黑名单兜底：高危工具 + 工作区里其他可写位置（拒绝优先于任何允许）
+const HEARTBEAT_TOOLS = ['Read', 'Grep', 'Glob', 'Edit', 'Write'];
+const HEARTBEAT_ALLOWED = ['Read(./**)', 'Edit(./tasks/**)', 'Edit(./memory/journal/**)'];
+const HEARTBEAT_DENY = [...new Set([
+  ...GUEST_HARD_DENY.filter((x) => !HEARTBEAT_TOOLS.includes(x)),
+  'WebFetch', 'WebSearch', 'mcp__feishu',
+  'Edit(./schedules/**)', 'Edit(./skills/**)', 'Edit(./outbox/**)', 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)',
+])];
+
+function heartbeatSystemPrompt(model, effort) {
+  return [
+    '# 当前运行配置（由桥接注入，权威来源）',
+    `- 模型：${model || '（未指定，走 claude CLI 默认）'}`,
+    `- 思考深度 effort：${effort || '（未指定，走 CLI 默认）'}`,
+    '- 本轮是**心跳**：桥接定时唤起，只处理提示里列出的到期台账条目，不是用户发来的消息。',
+    '- 可用工具：Read/Grep/Glob（仅工作区内）；写入只限 `./tasks/` 与 `./memory/journal/`。',
+    '  没有 Bash、联网、飞书工具，也不能改定时任务；本轮不回传文件。',
+    '- 对外动作一律只起草，写进回复交 owner 确认。没有值得报告的事时只回复 `HEARTBEAT_OK`。',
+  ].join('\n');
+}
+
+function buildHeartbeatArgs(opts = {}) {
+  const model = normalizeModel(opts.model) ?? CLAUDE_MODEL;
+  const effort = normalizeEffort(opts.effort) ?? CLAUDE_EFFORT;
+  // 永不 --resume：每拍都是全新上下文，台账就是全部记忆
+  const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+  args.push('--allowedTools', HEARTBEAT_ALLOWED.join(','));
+  args.push('--setting-sources', '');
+  args.push('--strict-mcp-config');
+  args.push('--tools', HEARTBEAT_TOOLS.join(','));
+  args.push('--disallowedTools', HEARTBEAT_DENY.join(','));
+  args.push('--settings', JSON.stringify({ autoMemoryEnabled: false }));
+  if (model) args.push('--model', model);
+  if (effort) args.push('--effort', effort);
+  args.push('--append-system-prompt', heartbeatSystemPrompt(model, effort));
+  return { args, cwd: WORKSPACE_DIR, model, effort, lane: 'chat', cleanup: () => {} };
+}
+
 /**
  * 运行 claude 无头模式。onProgress 提供时走 stream-json 实时解析：
  * - 中间消息 = assistant 事件的 text 块；最终答案 = result 事件的 result 字段。
@@ -466,6 +514,8 @@ function runtimeSystemPrompt(chatId, model, effort, isOwner, lane = 'chat') {
  * 而不是对源码文本做正则匹配（那种测试在隔离被整体改回去时依然全绿）。
  */
 export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts = {}) {
+  // 心跳档只对 owner 生效（心跳本就只以 owner 身份跑）；非 owner 带这个档时当没带
+  if (isOwner && opts.toolProfile === 'heartbeat') return buildHeartbeatArgs(opts);
   const cwd = workspaceFor(isOwner);
   // 车道：调用方显式给 lane；没给时定时任务默认执行车道（它们是「跑一个任务」，不是聊天），
   // 自诊断（sched-diag）由调用方显式指定 DIAG_MODEL，本就不走车道。
