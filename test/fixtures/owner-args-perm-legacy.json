@@ -1,0 +1,368 @@
+{
+  "_note": "基线 8a75262 上生成（BRIDGE-PERM-1 实现前）；见 test/owner-profiles.test.js 的 snap()",
+  "cases": {
+    "ownerChat": {
+      "env": {},
+      "call": [
+        "oc_x",
+        true,
+        [],
+        {
+          "lane": "chat",
+          "resumeId": "sess-1"
+        }
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--resume",
+        "sess-1",
+        "--allowedTools",
+        "Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**),Edit(./tasks/**),mcp__feishu",
+        "--model",
+        "claude-test-chat",
+        "--effort",
+        "high",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-chat\n- 思考深度 effort：high\n- 当前会话 chat_id：oc_x\n- 本轮文件回传目录：`./outbox/oc_x-20zbh/`（要发给用户的图片/文件写到**这个目录**，\n  本轮结束后桥接会自动上传并清空；写到别处或 outbox 根目录都不会被发送）\n\n被问到「你用什么模型/什么思考档位」时**以上面为准**，不要凭自身记忆推测——\n无头模式下你无法从自身推断真实模型，猜测必然出错。\n创建定时任务时，`chat_id` 直接用上面这个值，不要编造。",
+        "--mcp-config",
+        "<mcp-config>"
+      ],
+      "cwd": "<workspace>",
+      "model": "claude-test-chat",
+      "effort": "high",
+      "lane": "chat",
+      "mcp": {
+        "servers": [
+          "feishu"
+        ],
+        "type": "stdio",
+        "command": "<node>",
+        "args": [
+          "<repo>/src/mcp-feishu.js"
+        ],
+        "envKeys": [
+          "FEISHU_APP_ID",
+          "FEISHU_APP_SECRET",
+          "FEISHU_DOMAIN"
+        ]
+      }
+    },
+    "ownerChatNoFeishu": {
+      "env": {
+        "FEISHU_TOOLS": "false"
+      },
+      "call": [
+        "oc_x",
+        true,
+        [],
+        {
+          "lane": "chat",
+          "resumeId": "sess-1"
+        }
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--resume",
+        "sess-1",
+        "--allowedTools",
+        "Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**),Edit(./tasks/**)",
+        "--model",
+        "claude-test-chat",
+        "--effort",
+        "high",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-chat\n- 思考深度 effort：high\n- 当前会话 chat_id：oc_x\n- 本轮文件回传目录：`./outbox/oc_x-20zbh/`（要发给用户的图片/文件写到**这个目录**，\n  本轮结束后桥接会自动上传并清空；写到别处或 outbox 根目录都不会被发送）\n\n被问到「你用什么模型/什么思考档位」时**以上面为准**，不要凭自身记忆推测——\n无头模式下你无法从自身推断真实模型，猜测必然出错。\n创建定时任务时，`chat_id` 直接用上面这个值，不要编造。"
+      ],
+      "cwd": "<workspace>",
+      "model": "claude-test-chat",
+      "effort": "high",
+      "lane": "chat",
+      "mcp": null
+    },
+    "ownerExecLark": {
+      "env": {
+        "LARK_CLI": "true",
+        "CLAUDE_EXEC_MODEL": "claude-test-exec"
+      },
+      "call": [
+        "oc_x",
+        true,
+        [
+          "Read(./incoming/**)"
+        ],
+        {
+          "lane": "exec",
+          "resumeId": "sess-1"
+        }
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--resume",
+        "sess-1",
+        "--allowedTools",
+        "Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**),Edit(./tasks/**),Bash(lark-cli:*),Read(./incoming/**),mcp__feishu",
+        "--model",
+        "claude-test-exec",
+        "--effort",
+        "high",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-exec\n- 思考深度 effort：high\n- 本轮车道：**执行**（模型 claude-test-exec）。用户已经决定要做，直接执行、少讨论、产出结果；\n  只有缺关键信息时才追问。聊天与规划由另一模型负责，不要在本轮重开规划。\n- 当前会话 chat_id：oc_x\n- 本轮文件回传目录：`./outbox/oc_x-20zbh/`（要发给用户的图片/文件写到**这个目录**，\n  本轮结束后桥接会自动上传并清空；写到别处或 outbox 根目录都不会被发送）\n\n被问到「你用什么模型/什么思考档位」时**以上面为准**，不要凭自身记忆推测——\n无头模式下你无法从自身推断真实模型，猜测必然出错。\n创建定时任务时，`chat_id` 直接用上面这个值，不要编造。",
+        "--mcp-config",
+        "<mcp-config>"
+      ],
+      "cwd": "<workspace>",
+      "model": "claude-test-exec",
+      "effort": "high",
+      "lane": "exec",
+      "mcp": {
+        "servers": [
+          "feishu"
+        ],
+        "type": "stdio",
+        "command": "<node>",
+        "args": [
+          "<repo>/src/mcp-feishu.js"
+        ],
+        "envKeys": [
+          "FEISHU_APP_ID",
+          "FEISHU_APP_SECRET",
+          "FEISHU_DOMAIN"
+        ]
+      }
+    },
+    "schedJob": {
+      "env": {
+        "LARK_CLI": "true",
+        "CLAUDE_EXEC_MODEL": "claude-test-exec"
+      },
+      "call": [
+        "sched:daily.json",
+        true,
+        [],
+        {
+          "model": "claude-test-sched",
+          "effort": "low",
+          "toolProfile": "sched"
+        }
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--allowedTools",
+        "Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**),Edit(./tasks/**),Bash(lark-cli:*),mcp__feishu",
+        "--model",
+        "claude-test-sched",
+        "--effort",
+        "low",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-sched\n- 思考深度 effort：low\n- 本轮车道：**执行**（模型 claude-test-exec）。用户已经决定要做，直接执行、少讨论、产出结果；\n  只有缺关键信息时才追问。聊天与规划由另一模型负责，不要在本轮重开规划。\n- 当前会话 chat_id：（本次为定时任务，无对应会话）\n- 本轮文件回传目录：`./outbox/sched_daily.json-1ktwzk/`（要发给用户的图片/文件写到**这个目录**，\n  本轮结束后桥接会自动上传并清空；写到别处或 outbox 根目录都不会被发送）\n\n被问到「你用什么模型/什么思考档位」时**以上面为准**，不要凭自身记忆推测——\n无头模式下你无法从自身推断真实模型，猜测必然出错。\n本次是定时任务，没有可用的 chat_id；不要创建需要 chat_id 的新任务。",
+        "--mcp-config",
+        "<mcp-config>"
+      ],
+      "cwd": "<workspace>",
+      "model": "claude-test-sched",
+      "effort": "low",
+      "lane": "exec",
+      "mcp": {
+        "servers": [
+          "feishu"
+        ],
+        "type": "stdio",
+        "command": "<node>",
+        "args": [
+          "<repo>/src/mcp-feishu.js"
+        ],
+        "envKeys": [
+          "FEISHU_APP_ID",
+          "FEISHU_APP_SECRET",
+          "FEISHU_DOMAIN"
+        ]
+      }
+    },
+    "schedDiag": {
+      "env": {
+        "LARK_CLI": "true",
+        "CLAUDE_EXEC_MODEL": "claude-test-exec"
+      },
+      "call": [
+        "sched-diag:daily.json",
+        true,
+        [],
+        {
+          "model": "claude-test-diag",
+          "effort": "low"
+        }
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--allowedTools",
+        "Read,Grep,Glob,WebSearch,WebFetch,Edit(./memory/**),Edit(./skills/**),Edit(./schedules/**),Edit(./outbox/**),Edit(./tasks/**),Bash(lark-cli:*),mcp__feishu",
+        "--model",
+        "claude-test-diag",
+        "--effort",
+        "low",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-diag\n- 思考深度 effort：low\n- 本轮车道：聊天/规划（模型 claude-test-chat）。执行由 claude-test-exec 负责：\n  用户说「执行」或发 `/do <任务>` 时下一轮会自动切到执行模型，会话上下文保留。\n  计划谈妥后可以提醒用户「说“执行”即开始」。\n- 当前会话 chat_id：（本次为定时任务，无对应会话）\n- 本轮文件回传目录：`./outbox/sched-diag_daily.json-1k1lddi/`（要发给用户的图片/文件写到**这个目录**，\n  本轮结束后桥接会自动上传并清空；写到别处或 outbox 根目录都不会被发送）\n\n被问到「你用什么模型/什么思考档位」时**以上面为准**，不要凭自身记忆推测——\n无头模式下你无法从自身推断真实模型，猜测必然出错。\n本次是定时任务，没有可用的 chat_id；不要创建需要 chat_id 的新任务。",
+        "--mcp-config",
+        "<mcp-config>"
+      ],
+      "cwd": "<workspace>",
+      "model": "claude-test-diag",
+      "effort": "low",
+      "lane": "chat",
+      "mcp": {
+        "servers": [
+          "feishu"
+        ],
+        "type": "stdio",
+        "command": "<node>",
+        "args": [
+          "<repo>/src/mcp-feishu.js"
+        ],
+        "envKeys": [
+          "FEISHU_APP_ID",
+          "FEISHU_APP_SECRET",
+          "FEISHU_DOMAIN"
+        ]
+      }
+    },
+    "heartbeat": {
+      "env": {
+        "LARK_CLI": "true",
+        "CLAUDE_EXEC_MODEL": "claude-test-exec"
+      },
+      "call": [
+        "sched:heartbeat",
+        true,
+        [],
+        {
+          "toolProfile": "heartbeat",
+          "model": "claude-test-hb",
+          "effort": "low"
+        }
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--allowedTools",
+        "Read(./**),Edit(./tasks/**),Edit(./memory/journal/**)",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--tools",
+        "Read,Grep,Glob,Edit,Write",
+        "--disallowedTools",
+        "Bash,BashOutput,KillShell,NotebookEdit,Task,Agent,Skill,SendMessage,Artifact,CronCreate,CronDelete,CronList,Workflow,ListAgents,RemoteTrigger,PushNotification,ScheduleWakeup,TaskCreate,TaskUpdate,DesignSync,EnterWorktree,ExitWorktree,Monitor,WebFetch,WebSearch,mcp__feishu,Edit(./schedules/**),Edit(./skills/**),Edit(./outbox/**),Edit(./CLAUDE.md),Edit(./.claude/**)",
+        "--settings",
+        "{\"autoMemoryEnabled\":false}",
+        "--model",
+        "claude-test-hb",
+        "--effort",
+        "low",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-hb\n- 思考深度 effort：low\n- 本轮是**心跳**：桥接定时唤起，只处理提示里列出的到期台账条目，不是用户发来的消息。\n- 可用工具：Read/Grep/Glob（仅工作区内）；写入只限 `./tasks/` 与 `./memory/journal/`。\n  没有 Bash、联网、飞书工具，也不能改定时任务；本轮不回传文件。\n- 对外动作一律只起草，写进回复交 owner 确认。没有值得报告的事时只回复 `HEARTBEAT_OK`。"
+      ],
+      "cwd": "<workspace>",
+      "model": "claude-test-hb",
+      "effort": "low",
+      "lane": "chat",
+      "mcp": null
+    },
+    "guest": {
+      "env": {
+        "LARK_CLI": "true"
+      },
+      "call": [
+        "guest:oc_g:ou_y",
+        false,
+        [],
+        {}
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--allowedTools",
+        "WebSearch",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--tools",
+        "WebSearch",
+        "--disallowedTools",
+        "Bash,BashOutput,KillShell,Edit,Write,NotebookEdit,Task,Agent,Skill,SendMessage,Artifact,CronCreate,CronDelete,CronList,Workflow,ListAgents,RemoteTrigger,PushNotification,ScheduleWakeup,TaskCreate,TaskUpdate,DesignSync,EnterWorktree,ExitWorktree,Monitor",
+        "--settings",
+        "{\"autoMemoryEnabled\":false}",
+        "--model",
+        "claude-test-chat",
+        "--effort",
+        "high",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-chat\n- 思考深度 effort：high\n\n被问到「你用什么模型/什么思考档位」时**以上面为准**，不要凭自身记忆推测。"
+      ],
+      "cwd": "<guest-workspace>",
+      "model": "claude-test-chat",
+      "effort": "high",
+      "lane": "chat",
+      "mcp": null
+    },
+    "guestFile": {
+      "env": {
+        "LARK_CLI": "true"
+      },
+      "call": [
+        "guest:oc_g:ou_y",
+        false,
+        [
+          "Read(./incoming/**)"
+        ],
+        {}
+      ],
+      "args": [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--allowedTools",
+        "WebSearch,Read(./incoming/**)",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--tools",
+        "WebSearch,Read",
+        "--disallowedTools",
+        "Bash,BashOutput,KillShell,Edit,Write,NotebookEdit,Task,Agent,Skill,SendMessage,Artifact,CronCreate,CronDelete,CronList,Workflow,ListAgents,RemoteTrigger,PushNotification,ScheduleWakeup,TaskCreate,TaskUpdate,DesignSync,EnterWorktree,ExitWorktree,Monitor",
+        "--settings",
+        "{\"autoMemoryEnabled\":false}",
+        "--model",
+        "claude-test-chat",
+        "--effort",
+        "high",
+        "--append-system-prompt",
+        "# 当前运行配置（由桥接注入，权威来源）\n- 模型：claude-test-chat\n- 思考深度 effort：high\n\n被问到「你用什么模型/什么思考档位」时**以上面为准**，不要凭自身记忆推测。"
+      ],
+      "cwd": "<guest-workspace>",
+      "model": "claude-test-chat",
+      "effort": "high",
+      "lane": "chat",
+      "mcp": null
+    }
+  }
+}

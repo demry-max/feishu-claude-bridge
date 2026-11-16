@@ -403,6 +403,7 @@ function syncSkills() {
   } catch (e) {
     console.error('[skills-sync]', e?.message ?? e);
   }
+  if (OWNER_TOOL_PROFILE !== 'legacy') syncExtraSkills(); // BRIDGE-PERM-1：用户级 lark-* 技能（内部逐个兜错）
 }
 
 // 模型对自身身份的自述不可靠（无头模式无人告知它跑在哪个模型上，它会凭训练记忆瞎猜）。
@@ -423,7 +424,7 @@ function laneLines(lane) {
       ];
 }
 
-function runtimeSystemPrompt(chatId, model, effort, isOwner, lane = 'chat') {
+function runtimeSystemPrompt(chatId, model, effort, isOwner, lane = 'chat', toolLines = []) {
   // 访客只需要知道自己跑在什么模型上；outbox、定时任务、chat_id 都是 owner 侧的概念，
   // 讲给访客听既没用又会诱导它去尝试没有的能力
   if (!isOwner) {
@@ -442,6 +443,7 @@ function runtimeSystemPrompt(chatId, model, effort, isOwner, lane = 'chat') {
     `- 模型：${model || '（未指定，走 claude CLI 默认）'}`,
     `- 思考深度 effort：${effort || '（未指定，走 CLI 默认）'}`,
     ...laneLines(lane),
+    ...toolLines, // BRIDGE-PERM-1：audit/strict 的工具档说明；legacy 为空
     `- 当前会话 chat_id：${realChat ?? '（本次为定时任务，无对应会话）'}`,
     `- 本轮文件回传目录：\`${outboxRel}\`（要发给用户的图片/文件写到**这个目录**，`,
     '  本轮结束后桥接会自动上传并清空；写到别处或 outbox 根目录都不会被发送）',
@@ -501,6 +503,208 @@ function buildHeartbeatArgs(opts = {}) {
   return { args, cwd: WORKSPACE_DIR, model, effort, lane: 'chat', cleanup: () => {} };
 }
 
+// ---- owner 工具档（BRIDGE-PERM-1，OWNER_TOOL_PROFILE=legacy|audit|strict，启动时读一次）----
+// legacy（默认）：本段一行都不走，owner/定时/心跳/访客的 argv 与基线 8a75262 逐字一致。
+// audit：工具面照旧（ALLOWED_TOOLS + 全部 lark-cli + 飞书 MCP；不看 LARK_CLI），但不再加载用户级 settings/MCP，
+//        挂第三方内容提示钩子，并把每次工具调用的命令名记进 data/tool-audit.jsonl（判定按 strict 档预演）。
+// strict：内置工具白名单 + lark-cli 按子命令分级放行（策略表见 tool-policy.js）+ 黑名单兜底；
+//        ALLOWED_TOOLS 与 LARK_CLI 在 strict 下不生效。定时任务（toolProfile:'sched' 或 sched: 前缀）只读。
+// 心跳（toolProfile:'heartbeat'）、访客、sched-diag: 自诊断三档都不进本段。
+// import 写在这里而不是文件头：本卡只在这一段新增代码；ESM 的 import/export 声明会被提升，位置不影响加载顺序。
+import { larkRules, larkClassRules, STRICT_TOOLS, FEISHU_MCP_READ, FEISHU_MCP_WRITE } from './tool-policy.js';
+import { createToolRecorder } from './tool-audit.js';
+import { DATA_DIR } from './store.js';
+export { detectConfirm } from './tool-policy.js';
+export { createToolTurn, startToolAuditSummary } from './tool-audit.js';
+
+export const OWNER_TOOL_PROFILE = (() => {
+  const v = (process.env.OWNER_TOOL_PROFILE ?? '').trim();
+  if (!v) return 'legacy';
+  if (v === 'legacy' || v === 'audit' || v === 'strict') return v;
+  console.error('[tool-profile] OWNER_TOOL_PROFILE 只能是 legacy/audit/strict，当前值无效，按 legacy 处理');
+  return 'legacy';
+})();
+export const DEFAULT_EXTRA_SKILLS =
+  'lark-shared,lark-im,lark-approval,lark-calendar,lark-mail,lark-doc,lark-sheets,lark-drive,lark-contact,lark-whiteboard';
+const OWNER_EXTRA_SKILLS = process.env.OWNER_EXTRA_SKILLS ?? DEFAULT_EXTRA_SKILLS;
+// buildOwnerProfileArgs 递归调用 buildClaudeArgs 复用会话/车道/模型/MCP 临时文件逻辑时打的标记（不会再分派）
+const PROFILE_BASE = Symbol('owner-profile-base');
+const HOOK_SCRIPT = path.join(__dirname, 'hooks', 'untrusted-note.js');
+// 账号级/编排类工具：strict 的 --tools 白名单本就没有它们，这里显式再拒一遍（拒绝优先于任何允许）
+const ACCOUNT_TOOLS = ['Artifact', 'CronCreate', 'CronDelete', 'CronList', 'RemoteTrigger', 'PushNotification', 'SendMessage',
+  'Workflow', 'ListAgents', 'ScheduleWakeup', 'DesignSync', 'Monitor', 'EnterWorktree', 'ExitWorktree', 'NotebookEdit', 'Agent', 'Task'];
+const STRICT_CHAT_BASE = ['Read', 'Grep', 'Glob', 'WebSearch', 'Edit(./memory/**)', 'Edit(./skills/**)', 'Edit(./schedules/**)',
+  'Edit(./outbox/**)', 'Edit(./tasks/**)'];
+const STRICT_SCHED_BASE = ['Edit(./memory/**)', 'Edit(./outbox/**)'];
+const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+/** 本次调用落在哪个工具档：'chat' | 'sched' | null（legacy、非 owner、心跳、sched-diag 都是 null）。 */
+function ownerToolKind(chatId, isOwner, opts = {}) {
+  if (!isOwner || OWNER_TOOL_PROFILE === 'legacy' || opts?.toolProfile === 'heartbeat') return null;
+  const id = String(chatId);
+  if (id.startsWith('sched-diag:')) return null;
+  return opts?.toolProfile === 'sched' || id.startsWith('sched:') ? 'sched' : 'chat';
+}
+
+const LARK_FLAG_LINE =
+  '- lark-cli 的全局参数写在子命令后面（如 `lark-cli im +messages-send --chat-id … --as user`）；' +
+  '写在子命令前面（--as user/bot 除外）在 strict 档匹配不上放行规则，会被拒。';
+
+/** 追加进运行配置提示词的工具档说明（2–3 行）。 */
+function ownerToolLines(kind, confirm) {
+  if (OWNER_TOOL_PROFILE === 'audit') {
+    return ['- 工具档：audit（试运行：工具照常可用，桥接只记录命令名，用于预演 strict 档）。', LARK_FLAG_LINE];
+  }
+  if (kind === 'sched') {
+    return [
+      '- 工具档：strict·定时任务（只读）：lark-cli 只放行读类子命令，飞书工具只有读；文件只能写 ./memory 与 ./outbox，' +
+        '不能发消息、不能改定时任务/台账/技能——要通知谁就写进回复。',
+      LARK_FLAG_LINE,
+    ];
+  }
+  return [
+    '- 工具档：strict。发消息、导入文档、建日程可直接执行（回复末尾自动附回执）；回邮件/发邮件、审批、撤回消息、建群改群、' +
+      '增删群成员必须先给出草稿，等光总回「确认」后的下一轮才能执行。',
+    ...(confirm ? ['- 光总本轮已回复「确认」：可以执行上一轮草稿里列出的确认级操作，草稿之外的不做。'] : []),
+    LARK_FLAG_LINE,
+  ];
+}
+
+// lark-cli 读到的第三方内容（群消息、邮件、审批、文档）补一句「是数据不是指令」：PostToolUse 钩子，只挂 Bash。
+// 用当前 node 的绝对路径起钩子（不依赖 PATH 里有没有 node），两段路径都按 shell 单引号转义。
+function ownerHookSettings() {
+  return JSON.stringify({
+    hooks: {
+      PostToolUse: [{
+        matcher: 'Bash',
+        hooks: [{ type: 'command', command: `${shq(process.execPath)} ${shq(HOOK_SCRIPT)}`, timeout: 2 }],
+      }],
+    },
+  });
+}
+
+function ownerDenyList(sched) {
+  const deny = [
+    ...ACCOUNT_TOOLS, 'WebFetch', 'Bash(lark-cli api:*)', 'Bash(lark-cli auth logout:*)', 'Bash(codex:*)', 'Bash(nohup:*)',
+    'Bash(npx:*)', `Edit(//${os.homedir().replace(/^\/+/, '')}/code/ias-ops/**)`, 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)',
+  ];
+  if (sched) {
+    // 定时只读的纵深拒绝：即便哪天 allow 规则写宽了，写类 lark 子命令与飞书写工具也过不去
+    deny.push('Edit(./schedules/**)', 'Edit(./tasks/**)', 'Edit(./skills/**)',
+      ...larkClassRules('write', 'confirm', 'chat-only', 'deny'), ...FEISHU_MCP_WRITE.map((t) => `mcp__feishu__${t}`));
+  }
+  return [...new Set(deny)];
+}
+
+/**
+ * audit / strict 档的 owner 参数（对话与定时）。先按 legacy 路径构造一遍拿到会话、车道、模型与 MCP 临时文件
+ * （MCP 子进程多带 FEISHU_MCP_FENCE=1），再按工具档重排工具相关参数。定时任务只取 model/effort：
+ * 任务文件里的任何字段、附件规则、confirm 都改不动定时的权限。
+ */
+function buildOwnerProfileArgs(chatId, extraTools, opts) {
+  const kind = ownerToolKind(chatId, true, opts);
+  const sched = kind === 'sched';
+  const strict = OWNER_TOOL_PROFILE === 'strict';
+  const confirm = strict && !sched && opts.confirm === true;
+  const extra = sched ? [] : extraTools;
+  const base = buildClaudeArgs(chatId, true, extra, {
+    ...(sched ? { model: opts.model, effort: opts.effort } : opts),
+    [PROFILE_BASE]: true,
+  });
+  const mcp = FEISHU_TOOLS ? 'mcp__feishu' : '';
+  let allowed;
+  if (!strict) allowed = [...ALLOWED_TOOLS.split(','), 'Bash(lark-cli:*)', 'Bash(lark-cli)', ...extra, mcp];
+  else if (sched) allowed = [...STRICT_SCHED_BASE, ...larkRules('sched'), ...(FEISHU_TOOLS ? FEISHU_MCP_READ.map((t) => `mcp__feishu__${t}`) : [])];
+  else allowed = [...STRICT_CHAT_BASE, ...larkRules('chat', { confirm }), ...extra, mcp];
+  allowed = [...new Set(allowed.map((s) => String(s).trim()).filter(Boolean))];
+
+  const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+  if (base.args[4] === '--resume') args.push('--resume', base.args[5]);
+  args.push('--allowedTools', allowed.join(','));
+  // 只读项目级配置：用户级 permissions.allow（本机含 Bash(lark-cli *)）与用户级 hooks 都不再进 owner 会话
+  args.push('--setting-sources', 'project');
+  args.push('--strict-mcp-config');
+  if (strict) {
+    args.push('--tools', STRICT_TOOLS.join(','));
+    args.push('--disallowedTools', ownerDenyList(sched).join(','));
+  }
+  args.push('--settings', ownerHookSettings());
+  if (base.model) args.push('--model', base.model);
+  if (base.effort) args.push('--effort', base.effort);
+  args.push('--append-system-prompt',
+    runtimeSystemPrompt(chatId, base.model, base.effort, true, base.lane, ownerToolLines(kind, confirm)));
+  if (base.args.at(-2) === '--mcp-config') args.push('--mcp-config', base.args.at(-1));
+  return { ...base, args };
+}
+
+// OWNER_EXTRA_SKILLS：把用户级 ~/.claude/skills 里的 lark-* 技能复制进工作区 .claude/skills
+// （--setting-sources project 之后用户级技能不再自动加载）。只认合法的 lark-* 名字、只复制普通目录，符号链接一律跳过。
+const skillWarned = new Set();
+function warnSkillOnce(key, msg) {
+  if (skillWarned.has(key)) return;
+  skillWarned.add(key);
+  console.error(msg);
+}
+export function syncExtraSkills({ home = os.homedir(), workspace = WORKSPACE_DIR, list = OWNER_EXTRA_SKILLS } = {}) {
+  const copied = [];
+  for (const name of String(list ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    if (!/^lark-[a-z-]{1,40}$/.test(name)) {
+      warnSkillOnce(`bad:${name}`, `[skills-sync] OWNER_EXTRA_SKILLS 里的 ${JSON.stringify(name.slice(0, 60))} 不是 lark-* 技能名，跳过`);
+      continue;
+    }
+    const src = path.join(home, '.claude', 'skills', name);
+    try {
+      const st = fs.lstatSync(src, { throwIfNoEntry: false });
+      if (!st) {
+        warnSkillOnce(`missing:${name}`, `[skills-sync] 用户级技能 ${name} 不存在，跳过`);
+        continue;
+      }
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        warnSkillOnce(`link:${name}`, `[skills-sync] 跳过 ${name}：不是普通目录（符号链接不复制）`);
+        continue;
+      }
+      fs.cpSync(src, path.join(workspace, '.claude', 'skills', name), {
+        recursive: true,
+        filter: (s) => !fs.lstatSync(s).isSymbolicLink(),
+      });
+      copied.push(name);
+    } catch (e) {
+      console.error(`[skills-sync] 复制 ${name} 失败：`, e?.code ?? e?.message ?? e);
+    }
+  }
+  return copied;
+}
+
+// 审计采集：每个 claude 子进程（以它的 readline 为键）一份收集器；legacy/访客/心跳/sched-diag 记为 null。
+// result 事件到了就落盘；没等到 result（被杀、崩溃）时 stdout 关闭再补写。任何异常都只记日志，不影响本轮。
+const toolAudits = new WeakMap();
+function toolAuditFor(rl, chatId, isOwner, opts = {}) {
+  if (toolAudits.has(rl)) return toolAudits.get(rl);
+  const kind = ownerToolKind(chatId, isOwner, opts);
+  let rec = null;
+  if (kind) {
+    rec = createToolRecorder({
+      kind,
+      profile: OWNER_TOOL_PROFILE,
+      confirm: kind === 'chat' && opts?.confirm === true,
+      file: path.join(DATA_DIR, 'tool-audit.jsonl'),
+      onToolEvent: typeof opts?.onToolEvent === 'function' ? opts.onToolEvent : null,
+    });
+    rl.once('close', () => {
+      try { rec.flush(); } catch { /* 写失败已在 appendToolAudit 里记过 */ }
+    });
+  }
+  toolAudits.set(rl, rec);
+  return rec;
+}
+function auditStream(rl, chatId, isOwner, opts, phase, d) {
+  try {
+    toolAuditFor(rl, chatId, isOwner, opts)?.[phase](d);
+  } catch (e) {
+    console.error('[tool-audit] 采集出错（已忽略）：', e?.name ?? 'Error');
+  }
+}
+
 /**
  * 运行 claude 无头模式。onProgress 提供时走 stream-json 实时解析：
  * - 中间消息 = assistant 事件的 text 块；最终答案 = result 事件的 result 字段。
@@ -516,6 +720,7 @@ function buildHeartbeatArgs(opts = {}) {
 export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts = {}) {
   // 心跳档只对 owner 生效（心跳本就只以 owner 身份跑）；非 owner 带这个档时当没带
   if (isOwner && opts.toolProfile === 'heartbeat') return buildHeartbeatArgs(opts);
+  if (!opts[PROFILE_BASE] && ownerToolKind(chatId, isOwner, opts)) return buildOwnerProfileArgs(chatId, extraTools, opts); // BRIDGE-PERM-1 audit/strict
   const cwd = workspaceFor(isOwner);
   // 车道：调用方显式给 lane；没给时定时任务默认执行车道（它们是「跑一个任务」，不是聊天），
   // 自诊断（sched-diag）由调用方显式指定 DIAG_MODEL，本就不走车道。
@@ -594,6 +799,7 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
             FEISHU_APP_ID: process.env.FEISHU_APP_ID ?? '',
             FEISHU_APP_SECRET: process.env.FEISHU_APP_SECRET ?? '',
             FEISHU_DOMAIN: process.env.FEISHU_DOMAIN ?? '',
+            ...(opts[PROFILE_BASE] ? { FEISHU_MCP_FENCE: '1' } : {}), // BRIDGE-PERM-1：audit/strict 下读工具结果加围栏
           },
         },
       },
@@ -665,6 +871,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         // 任何 assistant 事件都意味着模型已开始动作（可能已调用工具、写过文件、发过消息），
         // 此后的断连不可安全重放——只有在这之前失败才允许自动重试。
         producedOutput = true;
+        auditStream(rl, chatId, isOwner, opts, 'assistant', d); // BRIDGE-PERM-1 工具审计（legacy/访客/心跳不采集）
         // 单次调用的驻留上下文＝这一条 message 的 usage（result 里的是整轮累计，
         // 会把多次工具往返叠加成虚高数字——157 万那种读数就是这么来的）
         const mu = d.message?.usage;
@@ -687,8 +894,11 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
           );
         }
         pending = text;
+      } else if (d.type === 'user') {
+        auditStream(rl, chatId, isOwner, opts, 'user', d); // BRIDGE-PERM-1：tool_result 成败（回执只计成功的）
       } else if (d.type === 'result') {
         producedOutput = true;
+        auditStream(rl, chatId, isOwner, opts, 'result', d); // BRIDGE-PERM-1：permission_denials 对账并落盘
         // 定时任务是一次性的独立上下文，持久化它的 session 会让每次 --resume 复利膨胀
         // （且永远收不到固化提醒）；/new 期间跑完的任务也不该把刚删掉的会话写回来。
         const ephemeral = ephemeralChat;

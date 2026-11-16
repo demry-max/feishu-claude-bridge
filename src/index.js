@@ -11,6 +11,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
+import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummary } from './claude.js';
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -474,6 +475,10 @@ async function handleMessage(data) {
   // 这样 `/redirect 执行` 也能走执行车道。
   const route = routeTurn(prompt);
   prompt = route.prompt;
+  // BRIDGE-PERM-1：strict 档 owner 私聊句首「确认」放行上一轮草稿里的确认级操作（只管这一轮）；
+  // audit/strict 收集本轮工具事件给回复附回执。legacy 与访客原样透传。
+  const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm: detectConfirm(prompt, message.chat_type, isOwner), runClaude, redact });
+  prompt = toolTurn.prompt;
 
   // 群聊带上发言人姓名，机器人才知道是谁在说话。
   // 注意用 prompt 而不是 text——否则 /redirect 刚设好的新要求会被这里覆盖掉
@@ -515,9 +520,10 @@ async function handleMessage(data) {
     await react(message.message_id, 'OnIt');
     const progress = createProgressChannel(client, message.message_id);
     try {
+      const runClaude = toolTurn.runClaude; // BRIDGE-PERM-1：audit/strict 收集工具事件、strict 私聊确认；legacy 下就是原函数
       const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });
       await progress.finish();
-      await reply(message.message_id, answer || '（Claude 返回了空回复）');
+      await reply(message.message_id, toolTurn.withReceipt(answer || '（Claude 返回了空回复）'));
       // 机器人写进本轮专属 outbox 的图片/文件随本轮一起回传
       await flushOutbox(client, outboxDirFor(sessionKey, isOwner), (data) =>
         client.im.v1.message.reply({ path: { message_id: message.message_id }, data })
@@ -711,7 +717,7 @@ startScheduler({
         true,
         [],
         (p) => sendToChat(chatId, `⏳ ${p}`),
-        { model: job.model, effort: job.effort } // 任务可自带档位，未指定则用全局配置
+        { model: job.model, effort: job.effort, toolProfile: 'sched' } // 任务可自带档位，未指定则用全局配置；工具档固定为定时（BRIDGE-PERM-1）
       );
       const late = job._late ? `（迟到补跑 ${Math.round(job._late / 60000)} 分钟）` : '';
       // 无事不报：答案整条就是 HEARTBEAT_OK（或为空）时静默跳过，
@@ -854,3 +860,13 @@ async function scopeSelfCheck() {
 // 启动通知放在全部自检之后：此前 announceStartup() 在 config 块之前调用，
 // cliProblem 在发通知那一刻永远是 null，「启动自检发现问题」那段文案从未真正发出过
 scopeSelfCheck().finally(() => announceStartup());
+
+// BRIDGE-PERM-1：audit/strict 档每天 TOOL_AUDIT_SUMMARY_AT（默认 21:30）私信 owner 一份工具审计日报——
+// 只列被拒/需确认的命令名与次数；legacy 档不启用。进度存 data/tool-audit-state.json，发送失败不推进、下次补上。
+startToolAuditSummary({
+  profile: OWNER_TOOL_PROFILE,
+  at: process.env.TOOL_AUDIT_SUMMARY_AT,
+  auditFile: path.join(DATA_DIR, 'tool-audit.jsonl'),
+  stateFile: path.join(DATA_DIR, 'tool-audit-state.json'),
+  send: sendToOwner,
+});

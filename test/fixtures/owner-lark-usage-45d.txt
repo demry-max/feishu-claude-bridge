@@ -1,0 +1,46 @@
+# 近45天 owner 会话工具调用（只有命令名，无参数内容）
+## lark-cli 子命令
+314 im +chat-messages-list
+102 approval tasks
+97 im +messages-send
+23 calendar +agenda
+20 im +messages-resources-download
+18 contact +search-user
+18 user im
+17 drive +import
+15 sheets +workbook-info
+14 approval instances
+13 docs +fetch
+13 mail +message
+12 sheets +csv-get
+9 mail +triage
+7 im 2>
+5 im chats
+4 sheets 2>
+4 im +chat-list
+4 mail +reply-all
+4 whiteboard +export
+3 approval 2>
+3 im chat.members
+3 drive +download
+3 auth login
+3 calendar +create
+2 schema docx.v1.document.raw_content
+2 schema docx.v1.document_block.list
+2 drive
+2 docs
+2 sheets
+2 drive +inspect
+2 sheets +cells-get
+2 mail
+2 im messages
+2 mail +thread
+2 mail +reply
+2 2>
+2 im +help
+2 auth qrcode
+1 drive 2>
+1 mail 2>
+1 whiteboard
+1 sheets +info
+1 im +messages-resource-download

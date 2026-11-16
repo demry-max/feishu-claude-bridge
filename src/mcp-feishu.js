@@ -75,7 +75,8 @@ server.tool(
         path: { document_id: token },
         params: { lang: 0 },
       });
-      return ok({ document_id: token, content: res?.data?.content ?? res?.content ?? '' });
+      // BRIDGE-PERM-1：owner 工具档 audit/strict 下桥接设 FEISHU_MCP_FENCE=1，第三方正文包进随机围栏
+      return (process.env.FEISHU_MCP_FENCE === '1' ? (await import('./tool-audit.js')).fencedMcpResult('飞书云文档 doc_read', ok) : ok)({ document_id: token, content: res?.data?.content ?? res?.content ?? '' });
     } catch (e) {
       return fail(e);
     }
@@ -174,7 +175,8 @@ server.tool(
         params: { page_size: Math.min(page_size ?? 50, 500), page_token },
       });
       const d = res?.data ?? res;
-      return ok({
+      // BRIDGE-PERM-1：FEISHU_MCP_FENCE=1 时记录内容包进随机围栏
+      return (process.env.FEISHU_MCP_FENCE === '1' ? (await import('./tool-audit.js')).fencedMcpResult('飞书多维表格 bitable_records', ok) : ok)({
         total: d?.total,
         has_more: d?.has_more,
         page_token: d?.page_token,
@@ -245,7 +247,8 @@ server.tool(
         url: `/open-apis/sheets/v2/spreadsheets/${token}/values/${encodeURIComponent(target)}`,
       });
       const vr = res?.data?.valueRange ?? res?.valueRange ?? {};
-      return ok({ range: vr.range, values: vr.values ?? [] });
+      // BRIDGE-PERM-1：FEISHU_MCP_FENCE=1 时单元格内容包进随机围栏
+      return (process.env.FEISHU_MCP_FENCE === '1' ? (await import('./tool-audit.js')).fencedMcpResult('飞书电子表格 sheet_read', ok) : ok)({ range: vr.range, values: vr.values ?? [] });
     } catch (e) {
       return fail(e);
     }
