@@ -539,26 +539,63 @@ export function createHeartbeat(deps) {
     return 'sent';
   }
 
-  // 免打扰结束后（或发送失败后的下一拍）把待发队列合并成一条发出
+  // 合并补发的体量控制：sendMarkdown 截在 20,000 字，每包（含标题行）压在 18,000 以内留余量
+  const PACK_CHARS = 18_000;
+  const PACK_HEADER_RESERVE = 120; // 标题行实际不到 60 字，装包时按这个预留
+  const MAX_PACKS_PER_BEAT = 3; // 一拍最多发几包，剩下的下一拍再发，防止刷屏
+  const PACK_SEP = '\n\n';
+  const TRUNC_NOTE = '（已截断，全文请看 tasks/ 或当天 journal）';
+
+  // 按顺序装包，一条不拆到两包；单条本身超长就截到上限并在末尾标注
+  function packPending(items, nowMs) {
+    const budget = PACK_CHARS - PACK_HEADER_RESERVE;
+    const packs = [];
+    let cur = null;
+    items.forEach((p, i) => {
+      const head = `**${i + 1}.** （${fmtShort(msOf(p.at) ?? nowMs)}）\n`;
+      let entry = head + p.body;
+      if (PACK_SEP.length + entry.length > budget) {
+        let cut = p.body.slice(0, Math.max(0, budget - PACK_SEP.length - head.length - TRUNC_NOTE.length - 1));
+        if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1); // 不留半个代理对
+        entry = `${head}${cut}\n${TRUNC_NOTE}`;
+      }
+      const cost = PACK_SEP.length + entry.length;
+      if (!cur || cur.size + cost > budget) {
+        cur = { items: [], entries: [], size: 0 };
+        packs.push(cur);
+      }
+      cur.items.push(p);
+      cur.entries.push(entry);
+      cur.size += cost;
+    });
+    return packs;
+  }
+
+  // 免打扰结束后（或发送失败后的下一拍）把待发队列分包补发：一包一条消息，按顺序发；
+  // 只有真正发出的那一包才记为已发、移出队列；某包失败就停，剩下的下一拍再发（同一拍不重试）
   async function flushPending(st, nowMs) {
-    const items = st.pending.filter((p) => !(nowMs - (st.sent[p.hash] ?? -Infinity) < DAY_MS));
-    if (!items.length) {
-      st.pending = [];
-      return;
+    let left = st.pending.filter((p) => !(nowMs - (st.sent[p.hash] ?? -Infinity) < DAY_MS));
+    st.pending = left;
+    if (!left.length) return;
+    const total = left.length;
+    const packs = packPending(left, nowMs);
+    let sentItems = 0;
+    for (const [k, pack] of packs.slice(0, MAX_PACKS_PER_BEAT).entries()) {
+      const title = packs.length === 1
+        ? `💓 **心跳 · 待发汇总（${total} 条）**`
+        : `💓 **心跳 · 待发汇总（第 ${k + 1}/${packs.length} 包，本包 ${pack.items.length} 条，共 ${total} 条）**`;
+      try {
+        await send([title, ...pack.entries].join(PACK_SEP));
+      } catch (e) {
+        logError(`[heartbeat] 补发待发队列第 ${k + 1}/${packs.length} 包失败，剩余 ${left.length} 条下一拍再试：${redact(errText(e)).slice(0, 200)}`);
+        return;
+      }
+      markSent(st, pack.items, nowMs);
+      left = left.slice(pack.items.length);
+      st.pending = left;
+      sentItems += pack.items.length;
     }
-    const text = [
-      `💓 **心跳 · 待发汇总（${items.length} 条）**`,
-      ...items.map((p, i) => `**${i + 1}.** （${fmtShort(msOf(p.at) ?? nowMs)}）\n${p.body}`),
-    ].join('\n\n');
-    try {
-      await send(text);
-    } catch (e) {
-      logError(`[heartbeat] 补发待发队列失败，下一拍再试：${redact(errText(e)).slice(0, 200)}`);
-      return;
-    }
-    markSent(st, items, nowMs);
-    st.pending = [];
-    log(`[heartbeat] 已合并补发 ${items.length} 条待发消息`);
+    log(`[heartbeat] 已合并补发 ${sentItems} 条待发消息${left.length ? `，剩余 ${left.length} 条下一拍再发（一拍最多 ${MAX_PACKS_PER_BEAT} 包）` : ''}`);
   }
 
   async function fetchDeltas(tasks, d) {

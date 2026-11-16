@@ -228,6 +228,53 @@ describe('测试 4：每日上限', () => {
     assert.equal(h2.calls.length, 1, '本地日期翻日后清零');
     assert.equal(h2.readState().runs, 1);
   });
+
+  // R1 / MEDIUM-1：计数先落盘再调模型；落盘失败就不调
+  test('计数落盘失败就不调模型：状态目录只读时每拍 state-error，runClaude 0 次', async (t) => {
+    if (process.getuid?.() === 0) {
+      t.skip('root 无视目录写权限，chmod 0o500 造不出写失败');
+      return;
+    }
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask());
+    const dataDir = path.dirname(env.stateFile);
+    fs.mkdirSync(dataDir, { recursive: true });
+    // 合法的当天状态：读得出来、额度没用，唯一的障碍是写不进去
+    fs.writeFileSync(env.stateFile, JSON.stringify({ version: 1, day: '2026-11-16', runs: 0, tasks: {}, sent: {}, pending: [] }));
+    fs.chmodSync(dataDir, 0o500);
+    try {
+      const h = harness(env);
+      for (const mi of [0, 30, 59]) {
+        h.setNow(at(2026, 11, 16, 10, mi));
+        assert.equal((await h.hb.beat()).action, 'state-error', `10:${mi} 这一拍应是 state-error`);
+      }
+      assert.equal(h.calls.length, 0, '计数落不了盘就一次都不调模型');
+      assert.ok(h.logs.some((l) => l.includes('无法落盘')));
+    } finally {
+      fs.chmodSync(dataDir, 0o700);
+    }
+  });
+
+  test('调用模型的那一刻，本次计数已经在盘上（runs=1、day 为当天）', async () => {
+    const env = mkEnv();
+    writeTask(env, 'quote', dueTask());
+    let onDisk = null;
+    const h = harness(env, {
+      runImpl: async () => {
+        try {
+          onDisk = JSON.parse(fs.readFileSync(env.stateFile, 'utf8'));
+        } catch (e) {
+          onDisk = { readError: e.code ?? String(e) };
+        }
+        return 'HEARTBEAT_OK';
+      },
+    });
+    assert.equal((await h.hb.beat()).action, 'quiet');
+    assert.equal(h.calls.length, 1);
+    assert.ok(onDisk && !onDisk.readError, `调模型时状态文件应已存在：${JSON.stringify(onDisk)}`);
+    assert.equal(onDisk.runs, 1, '调模型之前计数就已落盘');
+    assert.equal(onDisk.day, '2026-11-16');
+  });
 });
 
 describe('测试 5：HEARTBEAT_OK 静默与 24 小时去重', () => {
@@ -565,5 +612,106 @@ describe('失败与投递兜底', () => {
     assert.equal(delivered.length, 1);
     assert.ok(delivered[0].includes('报价单今天到期'));
     assert.equal(h.readState().pending.length, 0);
+  });
+});
+
+// R1 / MEDIUM-2：合并补发按条分包，每包 ≤ 18,000 字；只把真正发出的记为已发
+describe('合并补发分包', () => {
+  const PACK_LIMIT = 18_000;
+  const TRUNC_NOTE = '（已截断，全文请看 tasks/ 或当天 journal）';
+  const mark = (i) => `MARK-${String(i).padStart(2, '0')}`;
+  // 每条正文首尾各带唯一标记，尾标记在就说明这条没被截掉
+  const bodyOf = (i, len) => {
+    const head = `${mark(i)}-START `;
+    const tail = ` ${mark(i)}-END`;
+    return head + 'x'.repeat(len - head.length - tail.length) + tail;
+  };
+  // 直接预置待发队列（当天、额度未用），台账为空：每拍只做补发，不调模型
+  function seedPending(env, bodies) {
+    fs.mkdirSync(path.dirname(env.stateFile), { recursive: true });
+    const pending = bodies.map((body, i) => ({ at: '2026-11-16T01:00:00.000Z', hash: `seed-${i}`, body, slugs: [] }));
+    fs.writeFileSync(env.stateFile, JSON.stringify({ version: 1, day: '2026-11-16', runs: 0, tasks: {}, sent: {}, pending }));
+  }
+  const hasAll = (text, i) => text.includes(`${mark(i)}-START`) && text.includes(`${mark(i)}-END`);
+
+  test('20 条 × 5,000 字：每包 ≤ 18,000，一拍最多 3 包，几拍内全部发完且不重复，pending 清空', async () => {
+    const env = mkEnv();
+    const N = 20;
+    seedPending(env, Array.from({ length: N }, (_, i) => bodyOf(i, 5000)));
+    const h = harness(env, { now: at(2026, 11, 16, 9, 0) });
+    const perBeat = [];
+    for (let b = 0; b < 10 && (b === 0 || h.readState().pending.length); b++) {
+      h.setNow(at(2026, 11, 16, 9, 30 * b));
+      const before = h.sent.length;
+      assert.equal((await h.hb.beat()).action, 'no-due');
+      perBeat.push(h.sent.length - before);
+    }
+    assert.equal(h.calls.length, 0);
+    assert.ok(h.sent.length > 1, '超过一包的量必须分包');
+    for (const [k, t] of h.sent.entries()) assert.ok(t.length <= PACK_LIMIT, `第 ${k + 1} 次发送 ${t.length} 字，超过 ${PACK_LIMIT}`);
+    assert.ok(perBeat.every((n) => n <= 3), `一拍最多 3 包：${perBeat}`);
+    assert.ok(h.sent[0].includes('第 1/'), '多包时标题带「第 k/n 包」');
+    for (let i = 0; i < N; i++) {
+      const hits = h.sent.filter((t) => t.includes(`${mark(i)}-START`)).length;
+      assert.equal(hits, 1, `${mark(i)} 应恰好发出一次（实际 ${hits}）`);
+      assert.ok(h.sent.some((t) => hasAll(t, i)), `${mark(i)} 首尾标记都应完整发出`);
+    }
+    const st = h.readState();
+    assert.equal(st.pending.length, 0);
+    assert.equal(Object.keys(st.sent).length, N, '20 条都记为已发');
+  });
+
+  test('第 2 包发送失败：第 1 包已记为已发并移出 pending，其余留队列；下一拍补发且不重发第 1 包', async () => {
+    const env = mkEnv();
+    const N = 9;
+    seedPending(env, Array.from({ length: N }, (_, i) => bodyOf(i, 5000)));
+    let n = 0;
+    const delivered = [];
+    const h = harness(env, {
+      now: at(2026, 11, 16, 9, 0),
+      sendImpl: async (t) => {
+        n += 1;
+        if (n === 2) throw new Error('飞书 500');
+        delivered.push(t);
+      },
+    });
+    await h.hb.beat();
+    assert.equal(n, 2, '第 2 包失败就停，不在同一拍重试或继续发第 3 包');
+    assert.equal(delivered.length, 1);
+    const first = [...Array(N).keys()].filter((i) => delivered[0].includes(`${mark(i)}-START`));
+    assert.ok(first.length >= 1 && first.length < N, `第 1 包只装了一部分：${first}`);
+    let st = h.readState();
+    for (const i of first) assert.ok(st.sent[`seed-${i}`] !== undefined, `${mark(i)} 已记为已发`);
+    assert.deepEqual(st.pending.map((p) => p.hash), [...Array(N).keys()].filter((i) => !first.includes(i)).map((i) => `seed-${i}`),
+      '只有第 1 包移出 pending，其余按原顺序留下');
+    for (const p of st.pending) assert.equal(st.sent[p.hash], undefined, '没发出去的不得记为已发');
+
+    for (let b = 1; b < 6 && h.readState().pending.length; b++) {
+      h.setNow(at(2026, 11, 16, 9, 30 * b));
+      await h.hb.beat();
+    }
+    st = h.readState();
+    assert.equal(st.pending.length, 0, '下一拍起把剩下的补发完');
+    const later = delivered.slice(1).join('\n');
+    for (const i of first) assert.ok(!later.includes(`${mark(i)}-START`), `${mark(i)} 不得重复发送`);
+    for (let i = 0; i < N; i++) if (!first.includes(i)) assert.ok(hasAll(later, i), `${mark(i)} 应在后续补发里`);
+    for (const t of delivered) assert.ok(t.length <= PACK_LIMIT);
+  });
+
+  test('单条 30,000 字：截到上限内并带截断标注，记为已发；只有一包时标题不变', async () => {
+    const env = mkEnv();
+    seedPending(env, [bodyOf(0, 30_000)]);
+    const h = harness(env, { now: at(2026, 11, 16, 9, 0) });
+    await h.hb.beat();
+    assert.equal(h.sent.length, 1);
+    const t = h.sent[0];
+    assert.ok(t.length <= PACK_LIMIT, `发出 ${t.length} 字，超过 ${PACK_LIMIT}`);
+    assert.ok(t.includes(TRUNC_NOTE), '带截断标注');
+    assert.ok(t.trimEnd().endsWith(TRUNC_NOTE), '标注在末尾');
+    assert.ok(t.includes(`${mark(0)}-START`) && !t.includes(`${mark(0)}-END`), '保留开头、截掉尾部');
+    assert.ok(t.startsWith('💓 **心跳 · 待发汇总（1 条）**'), '只有一包时标题仍是「待发汇总（N 条）」');
+    const st = h.readState();
+    assert.equal(st.pending.length, 0);
+    assert.ok(st.sent['seed-0'] !== undefined);
   });
 });
