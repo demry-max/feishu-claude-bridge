@@ -520,7 +520,8 @@ async function handleMessage(data) {
     await react(message.message_id, 'OnIt');
     const progress = createProgressChannel(client, message.message_id);
     try {
-      const answer = await toolTurn.runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });
+      const runClaude = toolTurn.runClaude; // BRIDGE-PERM-1：audit/strict 收集工具事件、strict 私聊确认；legacy 下就是原函数
+      const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });
       await progress.finish();
       await reply(message.message_id, toolTurn.withReceipt(answer || '（Claude 返回了空回复）'));
       // 机器人写进本轮专属 outbox 的图片/文件随本轮一起回传

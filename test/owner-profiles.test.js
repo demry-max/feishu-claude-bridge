@@ -524,7 +524,13 @@ test('接线：index.js 确认判定在 routeTurn 之后、调用保持守卫字
   const iConfirm = src.indexOf('detectConfirm(prompt, message.chat_type, isOwner)');
   const iGroup = src.indexOf("if (message.chat_type !== 'p2p') {\n    const name = await resolveSenderName");
   assert.ok(iRoute > 0 && iConfirm > iRoute && iGroup > iConfirm, '确认判定夹在 routeTurn 与群名前缀之间');
-  assert.match(src, /toolTurn\.runClaude\(sessionKey, prompt, isOwner, extraTools, progress\.update, \{ lane: route\.lane \}\)/);
+  const ALIAS = 'const runClaude = toolTurn.runClaude;';
+  const iAlias = src.indexOf(ALIAS);
+  assert.ok(iAlias > 0 && src.indexOf(ALIAS, iAlias + 1) === -1, '别名行恰好出现一次');
+  const lines = src.split('\n');
+  const li = lines.findIndex((l) => l.includes(ALIAS));
+  assert.equal(lines[li + 1].trim(), 'const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });', '别名行的下一行就是调用行');
+  assert.ok(iAlias > iConfirm, '别名在确认判定之后');
   assert.match(src, /await reply\(message\.message_id, toolTurn\.withReceipt\(answer \|\| '（Claude 返回了空回复）'\)\);/);
   const iSelf = src.lastIndexOf('scopeSelfCheck().finally(');
   const iTimer = src.lastIndexOf('startToolAuditSummary(');
