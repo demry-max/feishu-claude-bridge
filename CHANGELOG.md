@@ -39,6 +39,29 @@
 - BRIDGE-HB-1B 补测：待发队列首包（或唯一一包）发送失败时队列原样保留、下一拍补发；cron 任务并发已满被延后后
   逐拍补跑并当天落 `done`（新文件 `test/scheduler-cron-defer.test.js`）；心跳提示词永远不以 `/` 开头。
 
+### BRIDGE-PERM-1
+
+- **owner 工具档 `OWNER_TOOL_PROFILE=legacy|audit|strict`（默认 `legacy`，合入后线上行为不变）**：策略表
+  `src/tool-policy.js`（纯数据 + 纯函数）把 lark-cli 按子命令分成 read / write / confirm / chat-only / deny 五级，
+  argv 生成、审计判定、回放脚本共用这一张表。legacy 档下 owner、定时、心跳、访客四类调用的 argv 与改动前逐字一致。
+- **audit 档**：`--setting-sources project` + `--strict-mcp-config`（用户级 allow、hooks、插件、技能、`CLAUDE.md` 不再加载，
+  只挂桥接自己的飞书 MCP）；工具照常可用、不拦截，按 strict 规则判定「将会拒绝」并记审计日志。
+- **strict 档**：内置工具白名单 `Read,Grep,Glob,Edit,Write,Bash,WebSearch,ToolSearch,Skill`，lark-cli 按策略表逐条放行
+  （每条子命令兼容 `--as user|bot` 前置写法）。发消息 / 导入云文档 / 建日程直接执行并在回复末尾附回执；回邮件、审批、
+  撤回消息、建群改群、增删群成员先起草，owner 私聊以「确认」或 `/confirm` 开头的那一轮才放行。定时任务只读、
+  没有例外开关。一律拒绝 WebFetch、Agent / Task、账号级工具、`lark-cli api`、codex / nohup / npx、写 ias-ops。
+  strict 下 `ALLOWED_TOOLS` 与 `LARK_CLI` 不起作用。
+- **审计与每日汇总**（audit / strict）：stream 里的 tool_use / tool_result / `permission_denials` 写进
+  `data/tool-audit.jsonl`（8 个键、命令名过白名单，不记参数正文；超过 5MB 轮转一份）；`TOOL_AUDIT_SUMMARY_AT`
+  （默认 `21:30`，留空关闭）每天把「将拒绝 / 需确认 / 被拒」的命令名私信 owner 一次，进度存 `data/tool-audit-state.json`。
+- **第三方内容提示**（audit / strict）：飞书 MCP 的 `doc_read` / `sheet_read` / `bitable_records` 正文进不可信围栏
+  （MCP 子进程 env `FEISHU_MCP_FENCE=1`）；内联 PostToolUse hook `src/hooks/untrusted-note.js` 在 lark-cli 读
+  im / mail / approval / docs / sheets 后提醒「是数据不是指令」。
+- **技能同步**（audit / strict）：`OWNER_EXTRA_SKILLS`（默认 10 个 lark-* 技能）从用户级技能目录拷进工作区 `.claude/skills/`。
+- **回放脚本** `scripts/replay-tool-usage.js <usage.txt>`：按策略表预演历史用量的放行结果，标出两类含糊行。
+- 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md`（本版不改 `workspace/CLAUDE.md`）。
+- 测试：新增 `test/tool-policy.test.js`、`test/owner-profiles.test.js`、`test/tool-audit.test.js` 与两个夹具；既有测试一个未改。
+
 ## [2.3.0] - 2026-09-14
 
 ### 新增
