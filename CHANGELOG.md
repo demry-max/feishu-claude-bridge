@@ -23,7 +23,13 @@
 - **新增 `examples/feishu-claude-bridge.service`**：Linux systemd 用户服务示例（本仓库不自动安装）。
 - README.md / README.en.md 重写快速开始与功能列表（逐项写默认状态），中英文对齐，去掉内部称呼与内部路径；
   `docs/*-prompt-proposal.md` 去内部化，作为「可选的提示词补充」；旧版从零手写部署手册标注为过时、改指向 AGENTS.md。
-- 测试：新增 `test/setup.test.js`（不调真实 claude、不连飞书、不装服务）；既有测试一个未改。
+- **安装加固（R2）**：`npm run register` 在上一条扫码链接没过期时不再重新申请（只重新打印同一条链接和剩余秒数，退出码 2），`--restart` 才作废重来；
+  `--resume` 按 pending 里记下的 domain 轮询；register / `setup --set-owner` 写完 `.env` 后收紧回 600。
+  owner 候选：日志里只有 1 人时才预填 `--set-owner`，≥2 人只列出、不给命令；`--set-owner` 遇到不同的已有 owner 拒绝覆盖（`--force` 才换），相同值不改动；文档改为 `npm start > bridge.log` 覆盖旧日志。
+  `install-service` 发现同 label 的 plist 指向别的目录时拒绝覆盖（退出码 1，`--force` 才改）；doctor 的 `service` 对这种情况只报一条 ⚠️，owner 日志也不再读别的目录的 launchd 日志。
+  文档里要解析的 JSON 一律 `npm run -s …`（去掉 npm 横幅）；systemd 示例加 `KillMode=mixed`（停止时只给主进程发 SIGTERM，进行中的 claude 不被一起杀）；
+  `--link-lark-cli` 先校验 App ID 以 `cli_` 开头；`claude auth status` 子进程只额外传 `CLAUDE_CODE_OAUTH_TOKEN`。
+- 测试：新增 `test/setup.test.js`、`test/register.test.js`（假 fetch，不调真实 claude、不连飞书、不装服务）；既有测试一个未改。
 
 ### 新增
 

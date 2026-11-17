@@ -20,7 +20,7 @@
 - 🔒 **访客隔离**：非 owner 跑在独立工作区、切断用户级配置与 MCP、显式禁用本机工具——碰不到你的记忆，也借不到你的权限
 - 🔌 **零公网依赖**：长连接收事件，家用电脑即可部署
 - 📲 **扫码即建应用**：`npm run register` 走飞书官方应用注册接口，扫一次码自动创建应用、写入凭据、登记 owner；没有终端交互时（AI agent 代跑）自动分成「打印链接 → 人扫码 → `--resume` 取回」两段
-- 🩺 **安装自检与体检**：`npm run setup` 一条命令检查 Node / 依赖 / claude 登录 / `.env` / 必填项并给出下一步；`npm run doctor` 再查工作区、常驻服务、飞书 scope。两者都有 `--json` 和「全绿 / 只差人工 / 失败」三态退出码；启动日志也会自检 scope
+- 🩺 **安装自检与体检**：`npm run setup` 一条命令检查 Node / 依赖 / claude 登录 / `.env` / 必填项并给出下一步；`npm run doctor` 再查工作区、常驻服务、飞书 scope。两者都有 `--json`（程序解析时用 `npm run -s setup -- --json`，否则 stdout 开头带 npm 横幅）和「全绿 / 只差人工 / 失败」三态退出码；启动日志也会自检 scope
 - 🧠 **会话记忆**：每个飞书会话映射一个 Claude session（`--resume` 续聊），跨天跨周有效；`/new` 重开，`/status` 查看
 - 🗂️ **Agent 工作区**：workspace 内置 CLAUDE.md 人格 + `memory/` 三层长期记忆（画像 USER.md / 事实文件+索引 / journal 流水；纠正、决定、偏好主动落盘，不用等「记住」）+ `skills/` 技能沉淀（说「存成技能」自动生成 SKILL.md 并在后续会话自动加载）
 - ⏰ **定时任务（机器人自己排期）**：对它说「每天八点提醒我…」它就写一份任务定义到 `workspace/schedules/`，桥接到点执行并主动推送结果；支持 cron 表达式与一次性时间。**机器人始终没有 Bash/命令执行权限**——它只能写受限目录里的任务定义，执行由桥接负责
@@ -98,6 +98,7 @@ npm run setup          # 自检：没有 .env 就从 .env.example 生成，并�
   - 结束时会打印一段 scope JSON。到开发者后台打开这个刚生成的应用，「权限管理 → 批量导入」粘贴，然后「版本管理与发布」发布版本。只做一次。
   - 注册接口建出来的应用没有开通 scope：不做这步，文档 / 多维表格工具用不了，聊天不受影响。
   - 国际版 Lark 先在 `.env` 设 `FEISHU_DOMAIN=lark`。
+  - 没有终端时（AI agent 代跑）是两段式：`npm run register -- --no-wait` 打印链接，人扫完后 `npm run register -- --resume`。链接没过期时重复 `--no-wait` 只重新打印同一条链接、不会新建应用；确定作废重来加 `--restart`。
 - **和 lark-cli 的关系**：lark-cli 的 `lark-cli config init --new`（安装向导里的「配置应用」）走的是同一个注册接口，**每扫一次码就新建一个应用**。所以别两边各扫一次：先让桥接建好应用，再用 `npm run setup -- --link-lark-cli` 把同一个应用交给 lark-cli（Secret 经 stdin 传，不打印）。反过来不行：lark-cli 的 App Secret 存在系统钥匙串里，没有导出命令，setup 只读得到它的 App ID。详见 [AGENTS.md §3](AGENTS.md#3-飞书应用安装过程自动生成)。
 - **例外：沿用已有的应用**：把 App ID / App Secret 填进 `.env`，再到开发者后台检查这个应用（不是新建）：
   1. 已添加「机器人」能力；
@@ -105,7 +106,7 @@ npm run setup          # 自检：没有 .env 就从 .env.example 生成，并�
   3. 批量导入 scope（JSON 见 [AGENTS.md §3B](AGENTS.md#3b-沿用已有的应用例外不扫码)）；
   4. 已发布版本。
 
-  owner 的登记：先 `npm start >> bridge.log 2>&1`，自己私聊机器人一句；再跑 `npm run setup`，它会从日志里找出你的 open_id；最后 `npm run setup -- --set-owner ou_…`。
+  owner 的登记：先 `npm start > bridge.log 2>&1`（`>` 覆盖旧日志，只看本次启动之后），只有你自己私聊机器人一句；再跑 `npm run setup`，日志里只有一个人时它会给出 `npm run setup -- --set-owner ou_…`。有多人私聊过时它不给命令：请别人先别私聊，重启后重做。`.env` 已有别的 owner 时 `--set-owner` 拒绝覆盖，确认要换再加 `--force`。
 
 **验证与常驻**
 

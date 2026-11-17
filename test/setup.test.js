@@ -11,6 +11,7 @@ import {
   parseEnvText, checkNodeVersion, checkDeps, checkClaudeCli, checkClaudeAuth, maskEmail, ensureEnvFile,
   checkRequiredEnv, checkEnvSanity, checkShadowed, validOpenId, findOwnerCandidates, withExitTimeout,
   plistExitTimeout, plistEnvPath, checkService, exitCodeFor, toJson, scrubSecrets, renderLine,
+  ownerHint, plistWorkingDir, serviceLabelConflict, ownerLogFiles,
 } from '../scripts/lib/checks.js';
 import {
   parseRegisterArgs, chooseMode, guardExisting, savePending, loadPending, clearPending, pendingPath, classifyPoll,
@@ -186,7 +187,7 @@ test('exitCodeFor: 全绿 0 / 只差人 2 / 有失败 1；toJson 只带约定字
 // ---------- register 两段式纯逻辑 ----------
 
 test('register: 参数与模式（无 TTY 默认两段式）', () => {
-  assert.deepEqual(parseRegisterArgs(['--resume', '--timeout', '30']), { wait: false, noWait: false, resume: true, force: false, timeoutSec: 30 });
+  assert.deepEqual(parseRegisterArgs(['--resume', '--timeout', '30']), { wait: false, noWait: false, resume: true, force: false, restart: false, timeoutSec: 30 });
   assert.equal(parseRegisterArgs(['--timeout', 'x']).timeoutSec, null);
   assert.equal(parseRegisterArgs(['--timeout', '99999']).timeoutSec, 900);
   assert.equal(chooseMode(parseRegisterArgs([]), { isTTY: true }), 'wait');
@@ -377,4 +378,167 @@ test('install-service --dry-run: plist 带 ExitTimeOut = SHUTDOWN_GRACE_SEC + 10
   assert.equal(r.status, 0, r.stderr);
   const t = plistExitTimeout(r.stdout);
   assert.ok(t >= 10 && t <= 3610, `ExitTimeOut=${t}`);
+});
+
+// ---------- R2：owner 候选 / 服务目录 / .env 权限 / JSON 输出 ----------
+
+test('findOwnerCandidates: 先后两人私聊 → 后来的在前（顺序要真的反过来）', () => {
+  const log = [
+    '[owner] owner.json 缺失且未开放认领。当前请求者：ou_aaaaaa1',
+    '[owner] owner.json 缺失且未开放认领。当前请求者：ou_bbbbbb2',
+  ].join('\n');
+  assert.deepEqual(findOwnerCandidates(log), ['ou_bbbbbb2', 'ou_aaaaaa1']);
+});
+
+test('ownerHint: 0 个 → null；1 个 → 预填 --set-owner；≥2 个 → 全列出但不预填命令', () => {
+  assert.equal(ownerHint([]), null);
+  const one = ownerHint(['ou_only111']);
+  assert.match(one.message, /ou_only111/);
+  assert.match(one.fix, /--set-owner ou_only111/);
+  const two = ownerHint(['ou_bbbbbb2', 'ou_aaaaaa1']);
+  assert.match(two.message, /ou_bbbbbb2/);
+  assert.match(two.message, /ou_aaaaaa1/);
+  assert.doesNotMatch(two.fix, /--set-owner\s+ou_/);
+  assert.match(two.fix, /不要猜/);
+  assert.match(two.fix, /§5/);
+});
+
+test('checkRequiredEnv: owner 的 fix 用 > bridge.log（只看本次启动之后），不用 >>', () => {
+  const owner = checkRequiredEnv({}).find((i) => i.id === 'owner');
+  assert.match(owner.fix, /npm start > bridge\.log 2>&1/);
+  assert.doesNotMatch(owner.fix, />>/);
+});
+
+test('plistWorkingDir: 取 WorkingDirectory 并反转义；没有则 null', () => {
+  const xml = buildPlist({ label: 'com.t.fcb', node: '/n/bin/node', root: '/r/a&b', home: '/h' });
+  assert.equal(plistWorkingDir(xml), '/r/a&b');
+  assert.equal(plistWorkingDir('<plist><dict></dict></plist>'), null);
+  assert.equal(plistWorkingDir(null), null);
+});
+
+test('checkService(darwin): label 属于另一个目录 → 只报一条 service warn，跳过 PATH / ExitTimeOut', () => {
+  const xml = buildPlist({ label: 'com.t.fcb', node: '/n/bin/node', root: '/other/bridge', home: '/h' });
+  const calls = [];
+  const out = checkService({
+    platform: 'darwin', home: '/h', label: 'com.t.fcb', uid: 501, graceSec: 120, root: '/mine/bridge',
+    exists: (p) => p.endsWith('.plist'), readFile: () => xml,
+    run: (...a) => { calls.push(a); return { ok: true, stdout: 'pid = 7' }; },
+  });
+  assert.deepEqual(out.map((i) => [i.id, i.status]), [['service', 'warn']]);
+  assert.match(out[0].message, /另一个目录（\/other\/bridge）/);
+  assert.match(out[0].fix, /LAUNCHD_LABEL=com\.t\.fcb-2/);
+  assert.deepEqual(calls, [], '别的目录的服务不去查运行状态');
+  // 同目录照常检查
+  const same = checkService({
+    platform: 'darwin', home: '/h', label: 'com.t.fcb', uid: 501, graceSec: 120, root: '/other/bridge',
+    exists: (p) => p.endsWith('.plist'), readFile: () => xml, run: run({ ok: true, stdout: 'pid = 7' }),
+  });
+  assert.deepEqual(same.map((i) => i.id), ['service', 'service_claude_path', 'service_exit_timeout']);
+});
+
+test('serviceLabelConflict: 已有 plist 指向别的目录且没 --force → 拒绝并给出改 label 的办法', () => {
+  const other = buildPlist({ label: 'com.t.fcb', node: '/n', root: '/other/bridge', home: '/h' });
+  const mine = buildPlist({ label: 'com.t.fcb', node: '/n', root: '/mine/bridge', home: '/h' });
+  const msg = serviceLabelConflict({ existingXml: other, root: '/mine/bridge', label: 'com.t.fcb' });
+  assert.match(msg, /com\.t\.fcb/);
+  assert.match(msg, /\/other\/bridge/);
+  assert.match(msg, /LAUNCHD_LABEL=com\.t\.fcb-2/);
+  assert.match(msg, /--force/);
+  assert.equal(serviceLabelConflict({ existingXml: other, root: '/mine/bridge', label: 'com.t.fcb', force: true }), null);
+  assert.equal(serviceLabelConflict({ existingXml: mine, root: '/mine/bridge', label: 'com.t.fcb' }), null);
+  assert.equal(serviceLabelConflict({ existingXml: null, root: '/mine/bridge', label: 'com.t.fcb' }), null);
+  assert.equal(serviceLabelConflict({ existingXml: mine, root: '/mine/bridge/', label: 'com.t.fcb' }), null, '尾斜杠不算不同');
+});
+
+test('ownerLogFiles: 只有 plist 的 WorkingDirectory 是本目录时才读 launchd 日志', () => {
+  const base = { root: '/mine/bridge', home: '/h', label: 'com.t.fcb', platform: 'darwin' };
+  const launchdLog = '/h/Library/Logs/com.t.fcb.log';
+  const plistOf = (root) => buildPlist({ label: 'com.t.fcb', node: '/n', root, home: '/h' });
+  const mine = ownerLogFiles({ ...base, exists: () => true, readFile: () => plistOf('/mine/bridge'), extra: '/x/extra.log' });
+  assert.ok(mine.includes(launchdLog));
+  assert.ok(mine.includes('/mine/bridge/bridge.log'));
+  assert.ok(mine.includes('/x/extra.log'));
+  const other = ownerLogFiles({ ...base, exists: () => true, readFile: () => plistOf('/other/bridge') });
+  assert.ok(!other.includes(launchdLog));
+  assert.ok(other.includes('/mine/bridge/bridge.log'));
+  assert.ok(!ownerLogFiles({ ...base, exists: () => false }).includes(launchdLog));
+  assert.deepEqual(ownerLogFiles({ ...base, platform: 'linux' }), ['/mine/bridge/bridge.log']);
+});
+
+test('setup e2e: --json 的 stdout 以 { 开头（可直接 JSON.parse）', { skip: skipNoSh }, () => {
+  const root = makeRoot();
+  const home = tmp('gh1-home-');
+  const r = runScript('setup.js', ['--json', '--no-network', '--root', root], { claudeBin: makeStub(home), home });
+  assert.equal(r.stdout[0], '{', r.stdout.slice(0, 80));
+  const d = runScript('doctor.js', ['--json', '--no-network', '--root', root], { claudeBin: makeStub(home), home });
+  assert.equal(d.stdout[0], '{', d.stdout.slice(0, 80));
+});
+
+test('setup e2e: 日志里两人私聊过 → 列出两人、不预填 --set-owner', { skip: skipNoSh }, () => {
+  const root = makeRoot();
+  const home = tmp('gh1-home-');
+  fs.writeFileSync(path.join(root, 'bridge.log'),
+    '[owner] owner.json 缺失且未开放认领。当前请求者：ou_owner0001\n[owner] owner.json 缺失且未开放认领。当前请求者：ou_intruder2\n');
+  for (const script of ['setup.js', 'doctor.js']) {
+    const r = runScript(script, ['--json', '--no-network', '--root', root], { claudeBin: makeStub(home), home });
+    const owner = JSON.parse(r.stdout).items.find((i) => i.id === 'owner');
+    assert.match(owner.message, /ou_owner0001/, script);
+    assert.match(owner.message, /ou_intruder2/, script);
+    assert.doesNotMatch(owner.fix, /--set-owner\s+ou_/, script);
+  }
+});
+
+test('setup e2e: --set-owner 写入后 .env 是 600；已有不同 owner 要 --force；相同值不改；没跟值 fail', { skip: skipNoSh }, () => {
+  const root = makeRoot();
+  const home = tmp('gh1-home-');
+  const claudeBin = makeStub(home);
+  const envPath = path.join(root, '.env');
+  const go = (...a) => {
+    const r = runScript('setup.js', ['--json', '--no-network', '--root', root, ...a], { claudeBin, home });
+    return { r, set: JSON.parse(r.stdout).items.find((i) => i.id === 'set_owner') };
+  };
+  const mode = () => fs.statSync(envPath).mode & 0o777;
+
+  const first = go('--set-owner', 'ou_owner0001');
+  assert.equal(first.set.status, 'ok');
+  assert.match(fs.readFileSync(envPath, 'utf8'), /^OWNER_OPEN_ID=ou_owner0001$/m);
+  assert.equal(mode(), 0o600, '--set-owner 之后 .env 必须仍是 600');
+
+  const other = go('--set-owner', 'ou_intruder2');
+  assert.equal(other.set.status, 'fail');
+  assert.match(other.set.message, /已有 owner/);
+  assert.match(other.set.fix, /--force/);
+  assert.equal(other.r.status, 1);
+  assert.match(fs.readFileSync(envPath, 'utf8'), /^OWNER_OPEN_ID=ou_owner0001$/m, '没 --force 不覆盖');
+
+  const before = fs.statSync(envPath).mtimeMs;
+  const text = fs.readFileSync(envPath, 'utf8');
+  const same = go('--set-owner', 'ou_owner0001');
+  assert.equal(same.set.status, 'ok');
+  assert.equal(fs.readFileSync(envPath, 'utf8'), text);
+  assert.equal(fs.statSync(envPath).mtimeMs, before, '相同值不改动 .env');
+
+  fs.chmodSync(envPath, 0o644);
+  const forced = go('--set-owner', 'ou_intruder2', '--force');
+  assert.equal(forced.set.status, 'ok');
+  assert.match(fs.readFileSync(envPath, 'utf8'), /^OWNER_OPEN_ID=ou_intruder2$/m);
+  assert.equal(mode(), 0o600);
+
+  // 没跟值：在末尾，或后面紧跟的是另一个参数
+  for (const args of [['--no-network', '--set-owner'], ['--set-owner', '--no-network']]) {
+    const r = runScript('setup.js', ['--json', '--root', root, ...args], { claudeBin, home });
+    const s = JSON.parse(r.stdout).items.find((i) => i.id === 'set_owner');
+    assert.equal(s?.status, 'fail', `没跟值：${JSON.stringify(args)}`);
+    assert.equal(r.status, 1);
+  }
+  assert.match(fs.readFileSync(envPath, 'utf8'), /^OWNER_OPEN_ID=ou_intruder2$/m);
+});
+
+test('checkClaudeAuth: 子进程只多拿到 CLAUDE_CODE_OAUTH_TOKEN，.env 其它值（App Secret）不进环境（R2 L5）', () => {
+  let seen = null;
+  const spy = (cmd, args, opts) => { seen = opts.env; return { ok: true, stdout: '{"loggedIn":true}' }; };
+  checkClaudeAuth({ run: spy, env: { PATH: '/bin' }, envFile: { FEISHU_APP_SECRET: SECRET, CLAUDE_CODE_OAUTH_TOKEN: 'tok_123456' } });
+  assert.deepEqual(seen, { CLAUDE_CODE_OAUTH_TOKEN: 'tok_123456', PATH: '/bin' });
+  checkClaudeAuth({ run: spy, env: { PATH: '/bin' }, envFile: { FEISHU_APP_SECRET: SECRET } });
+  assert.deepEqual(seen, { PATH: '/bin' });
 });

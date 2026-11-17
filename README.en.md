@@ -20,7 +20,7 @@ Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-
 - 🔒 **Guest isolation**: non-owners run in a separate workspace with user-level config and MCP cut off and local tools explicitly denied — they cannot reach your memory or borrow your permissions
 - 🔌 **Zero public-network dependency**: events over a persistent WebSocket — deploy on a home computer
 - 📲 **App created by scanning a QR code**: `npm run register` uses Feishu's official app-registration flow — one scan creates the app, writes credentials to `.env`, and registers you as owner. Without an interactive terminal (an AI agent running it), it splits into two steps: print the link → a human scans → `--resume` collects the result
-- 🩺 **Setup check and health check**: `npm run setup` checks Node / dependencies / claude login / `.env` / required fields in one command and tells you the next step; `npm run doctor` also checks the workspace, the background service and Feishu scopes. Both support `--json` and a three-state exit code (all green / only human steps left / failed); the startup log also self-checks scopes
+- 🩺 **Setup check and health check**: `npm run setup` checks Node / dependencies / claude login / `.env` / required fields in one command and tells you the next step; `npm run doctor` also checks the workspace, the background service and Feishu scopes. Both support `--json` (when a program parses it, use `npm run -s setup -- --json`; without `-s` npm prints a banner first on stdout) and a three-state exit code (all green / only human steps left / failed); the startup log also self-checks scopes
 - 🧠 **Session memory**: each Feishu chat maps to one Claude session (`--resume`), valid across days; `/new` to reset, `/status` to inspect
 - 🗂️ **Agent workspace**: a CLAUDE.md persona plus three-layer long-term memory in `memory/` (profile USER.md / fact files + index / daily journal — corrections, decisions and preferences are saved proactively, no "remember this" needed) plus self-authored `skills/` (say "save this as a skill" and it writes a SKILL.md that later sessions load automatically)
 - ⏰ **Scheduled tasks (the bot schedules itself)**: say "remind me every weekday at 8" and it writes a job definition into `workspace/schedules/`; the bridge fires it on time and pushes the result proactively. Supports cron expressions and one-shot times. **The bot never gets Bash/shell access** — it only writes job definitions in a whitelisted directory; execution stays with the bridge
@@ -98,6 +98,7 @@ npm run setup          # self-check: creates .env from .env.example if missing a
   - At the end it prints a scope JSON. Open that newly generated app in the developer console, paste the JSON under Permissions → Batch import, then create and publish a version. Once only.
   - Apps created by the registration API start with no scopes: skip this and the doc/bitable tools don't work (chat still does).
   - For international Lark, set `FEISHU_DOMAIN=lark` in `.env` first.
+  - Without a terminal (an AI agent running it) it's two steps: `npm run register -- --no-wait` prints the link, and after the human scans, `npm run register -- --resume`. While the link hasn't expired, running `--no-wait` again only reprints the same link and creates no new app; add `--restart` only when you really want to discard it and start over.
 - **How this relates to lark-cli**: `lark-cli config init --new` (the "configure app" step of its install wizard) uses the same registration API, and **every scan creates a new app**. So don't scan on both sides: let the bridge create the app first, then run `npm run setup -- --link-lark-cli` to hand the same app to lark-cli (the secret goes over stdin and is never printed). The other direction doesn't work: lark-cli keeps the App Secret in the system keychain with no export command, so setup can only read its App ID. See [AGENTS.md §3](AGENTS.md#3-飞书应用安装过程自动生成).
 - **Exception — reuse an existing app**: put the App ID / App Secret in `.env`, then check that app (not a new one) in the developer console:
   1. the Bot capability is added;
@@ -105,7 +106,7 @@ npm run setup          # self-check: creates .env from .env.example if missing a
   3. scopes are batch-imported (JSON in [AGENTS.md §3B](AGENTS.md#3b-沿用已有的应用例外不扫码));
   4. a version is published.
 
-  To register the owner: run `npm start >> bridge.log 2>&1` and DM the bot once; then run `npm run setup`, which finds your open_id in the log; finally run `npm run setup -- --set-owner ou_…`.
+  To register the owner: run `npm start > bridge.log 2>&1` (`>` overwrites the old log, so only DMs after this start count) and have only yourself DM the bot once; then run `npm run setup` — if exactly one person appears in the log it prints `npm run setup -- --set-owner ou_…`. If several people DMed the bot it prints no command: ask the others to stop, restart and redo. If `.env` already has a different owner, `--set-owner` refuses to overwrite it; add `--force` only after confirming the owner should change.
 
 **Verify and run in the background**
 

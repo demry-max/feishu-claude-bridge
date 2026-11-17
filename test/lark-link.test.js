@@ -193,3 +193,11 @@ test('setup e2e: --link-lark-cli 把桥接凭据交给 lark-cli（Secret 只进 
   const after = JSON.parse(go().stdout);
   assert.equal(after.items.find((i) => i.id === 'lark_cli_app').status, 'ok');
 });
+
+test('linkLarkCli: App ID 不是 cli_ 开头 → fail，不调用 lark-cli（R2 L5）', () => {
+  const r = fakeRun({ appId: 'cli_larkapp' });
+  const bad = linkLarkCli({ FEISHU_APP_ID: '--app-id-injected', FEISHU_APP_SECRET: 'x'.repeat(12) }, { bin: 'lark-cli', run: r });
+  assert.equal(bad.status, 'fail');
+  assert.match(bad.message, /cli_/);
+  assert.equal(r.calls.length, 0);
+});

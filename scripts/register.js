@@ -7,6 +7,9 @@
 //   npm run register -- --resume [--timeout 秒]
 //                                       人扫完码后再跑：取回凭据写入 .env（还没授权则退出码 2，可再跑）
 //   npm run register -- --force         .env 已有凭据时仍然新建应用（默认拒绝，避免重复建应用）
+//   npm run register -- --no-wait --restart
+//                                       作废上一条还没过期的扫码链接、重新申请（默认重复 --no-wait 只重新打印旧链接：
+//                                       人可能已经扫了旧链接，新申请会让那个应用在飞书里成了取不回凭据的孤儿）
 // 没有 TTY（AI agent / CI 里运行）且没写 --wait 时，按 --no-wait 处理。
 // 退出码：0 成功；2 等人扫码 / 授权；1 失败。
 import fs from 'node:fs';
@@ -17,7 +20,7 @@ import { patchEnvFile } from '../src/env-file.js';
 import { ensureEnvFile, readEnvFile } from './lib/checks.js';
 import {
   parseRegisterArgs, chooseMode, guardExisting, savePending, loadPending, clearPending, classifyPoll,
-  consoleUrl, scopeImportJson,
+  consoleUrl, scopeImportJson, regUrl,
 } from './lib/register-core.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,14 +30,12 @@ const ENV_PATH = path.join(ROOT, '.env');
 const opts = parseRegisterArgs(process.argv.slice(2));
 const mode = chooseMode(opts, { isTTY: Boolean(process.stdout.isTTY) });
 const envValues = readEnvFile(ROOT).values;
-// FEISHU_DOMAIN=lark 时走国际版 Lark 注册端点（shell 环境优先，与 dotenv 的规则一致）
-const domain = (process.env.FEISHU_DOMAIN ?? envValues.FEISHU_DOMAIN) === 'lark' ? 'lark' : 'feishu';
-const REG_URL = domain === 'lark'
-  ? 'https://accounts.larksuite.com/oauth/v1/app/registration'
-  : 'https://accounts.feishu.cn/oauth/v1/app/registration';
+// FEISHU_DOMAIN=lark 时走国际版 Lark 注册端点（shell 环境优先，与 dotenv 的规则一致）。
+// --resume 改用 pending 里记下的 domain：两步之间改了 FEISHU_DOMAIN 也不会去轮询错的端点。
+let domain = (process.env.FEISHU_DOMAIN ?? envValues.FEISHU_DOMAIN) === 'lark' ? 'lark' : 'feishu';
 
 async function post(body) {
-  const res = await fetch(REG_URL, {
+  const res = await fetch(regUrl(domain), {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(body).toString(),
@@ -62,6 +63,8 @@ function onSuccess(p) {
     FEISHU_APP_SECRET: p.appSecret,
     ...(openId ? { OWNER_OPEN_ID: openId } : {}),
   });
+  // patchEnvFile 写临时文件再 rename，新文件按默认 umask（常见 644）：App Secret 不能让同机其他用户读到
+  try { fs.chmodSync(ENV_PATH, 0o600); } catch { /* Windows */ }
   if (openId) {
     const ownerPath = path.join(ROOT, 'data', 'owner.json');
     if (!fs.existsSync(ownerPath)) {
@@ -115,12 +118,28 @@ if (mode === 'resume') {
       : '没有待授权的注册：先运行 npm run register -- --no-wait 获取扫码链接。');
     process.exit(1);
   }
+  if (rec.domain === 'lark' || rec.domain === 'feishu') domain = rec.domain;
   const deadline = Math.min(rec.expires_at, Date.now() + (opts.timeoutSec ?? 120) * 1000);
   console.log(`等待授权结果（最多 ${Math.round((deadline - Date.now()) / 1000)} 秒）…`);
   await pollUntil(rec.device_code, rec.interval || 5, deadline);
   const left = Math.max(0, Math.round((rec.expires_at - Date.now()) / 1000));
   console.log(`还没有完成授权。人在飞书里扫码并点「同意 / 创建」后，再运行 npm run register -- --resume（链接还剩约 ${left} 秒有效）：\n${rec.url}`);
   process.exit(2);
+}
+
+// 上一条扫码链接还有效时不重新申请：人可能已经扫了它，重新 begin 会覆盖设备码，
+// 那个已建好的应用的凭据就再也取不回来（飞书里多一个孤儿应用）。只有 --restart 才作废重来。
+{
+  const { rec, error } = loadPending(ROOT); // 过期的（error=expired）不拦，直接重新申请
+  if (rec && !error && !opts.restart) {
+    const left = Math.max(0, Math.round((rec.expires_at - Date.now()) / 1000));
+    console.log('[需要人] 上一条扫码链接还有效（没有重新申请，避免多建一个应用）：');
+    console.log(rec.url);
+    console.log(`[Human needed] The previous link is still valid (about ${left} s left); no new registration was started.`);
+    console.log(`\n链接还剩约 ${left} 秒有效。人扫完后运行：npm run register -- --resume；确定作废重来加 --restart（npm run register -- --no-wait --restart）`);
+    process.exit(2);
+  }
+  if (opts.restart) clearPending(ROOT);
 }
 
 const init = await post({ action: 'init' });

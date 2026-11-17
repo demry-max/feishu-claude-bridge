@@ -2,7 +2,7 @@
 
 > ⚠️ **已过时，请勿照此执行。** 本文是项目早期「从零手写源码」的部署手册，里面的源码与现在仓库里的 `src/` 不一致；
 > 照它把源码「原样写入」会覆盖掉当前代码。**安装请看仓库根目录的 [`AGENTS.md`](../AGENTS.md)**（给 AI agent）或 [`README.md`](../README.md)（给人）。
-> 本文只保留作背景参考：附录 A（手工在开发者后台建应用）和附录 B（订阅令牌 `claude setup-token`）的思路仍然适用。
+> 本文只保留作背景参考：现在飞书应用由 `npm run register` 扫码自动生成，**不要再手工建应用**；附录 A（开发者后台配置）只适用于沿用已有应用（AGENTS.md §3B）时对照检查。附录 B（订阅令牌 `claude setup-token`）的思路仍然适用。
 >
 > **This document is obsolete — do not follow it.** Install with [`AGENTS.md`](../AGENTS.md) instead.
 

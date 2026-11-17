@@ -66,6 +66,11 @@ export function linkLarkCli(values = {}, { bin = 'lark-cli', run = defaultRun, e
     return item('link_lark_cli', 'fail', title, '.env 里还没有 FEISHU_APP_ID / FEISHU_APP_SECRET',
       '先让桥接有应用：npm run register -- --no-wait（扫码自动建应用，AGENTS.md §3A）');
   }
+  // App ID 会作为 argv 传给 lark-cli：先按格式校验，不让奇怪的值（如以 -- 开头）变成它的参数
+  if (!/^cli_[A-Za-z0-9]+$/.test(id)) {
+    return item('link_lark_cli', 'fail', title, '.env 里的 FEISHU_APP_ID 不像飞书 App ID（应以 cli_ 开头）',
+      '到开发者后台「凭证与基础信息」核对后改正 .env，再重跑');
+  }
   const cur = readLarkCliApp({ bin, run, env });
   if (!cur.installed) {
     return item('link_lark_cli', 'fail', title, `找不到 ${bin}`,

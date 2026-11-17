@@ -14,6 +14,7 @@ export function parseRegisterArgs(argv = []) {
     noWait: has('--no-wait'),
     resume: has('--resume'),
     force: has('--force'),
+    restart: has('--restart'),
     timeoutSec: Number.isFinite(timeout) && timeout > 0 ? Math.min(Math.floor(timeout), 900) : null,
   };
 }
@@ -80,6 +81,13 @@ export function classifyPoll(p) {
   if (p?.error === 'slow_down') return { kind: 'slow_down' };
   if (p?.error) return { kind: 'error', message: `${p.error} ${p.error_description ?? ''}`.trim() };
   return { kind: 'pending' };
+}
+
+/** 注册接口端点：lark = 国际版，其它一律飞书 */
+export function regUrl(domain) {
+  return domain === 'lark'
+    ? 'https://accounts.larksuite.com/oauth/v1/app/registration'
+    : 'https://accounts.feishu.cn/oauth/v1/app/registration';
 }
 
 export function consoleUrl(domain) {

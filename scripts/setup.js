@@ -6,7 +6,8 @@
 //   --json              机器可读：{ exit, counts, items:[{ id, status, title, message, fix }] }
 //                       status = ok | warn | fail | needs_human
 //   --no-network        透传给 doctor，跳过飞书 scope 探测
-//   --set-owner <ou_…>  把 OWNER_OPEN_ID 写进 .env（只接受 ou_ 开头的 open_id）
+//   --set-owner <ou_…>  把 OWNER_OPEN_ID 写进 .env（只接受 ou_ 开头的 open_id）；.env 已有不同的 owner 时
+//                       要再加 --force 才替换（值相同则不改动）
 //   --log <file>        额外指定一份桥接日志，用来找「owner 未登记时私聊过机器人的人」
 //   --link-lark-cli     让飞书官方 lark-cli 用 .env 里同一个应用（lark-cli config init --app-id … --app-secret-stdin，
 //                       Secret 只走 stdin）；lark-cli 已配置别的应用时要再加 --force 才替换
@@ -14,14 +15,17 @@
 //
 // 退出码：0 = 全绿（⚠️ 提醒不算）；2 = 只差需要人做的步骤（🙋）；1 = 有失败项（agent 应该能修）。
 // 不在任何输出里打印密钥值；不调模型、不连飞书（scope 探测由 doctor 做，可 --no-network 关掉）。
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { patchEnvFile } from '../src/env-file.js';
+import { defaultLabel } from '../src/launchd.js';
 import {
   item, checkNodeVersion, checkDeps, checkClaudeCli, checkClaudeAuth, ensureEnvFile, readEnvFile,
   checkRequiredEnv, checkEnvSanity, validOpenId, findOwnerCandidates, readTail, exitCodeFor,
-  renderLine, toJson, scrubSecrets, summarize,
+  renderLine, toJson, scrubSecrets, summarize, ownerHint, ownerLogFiles,
 } from './lib/checks.js';
 import { checkLarkCliApp, linkLarkCli } from './lib/lark-link.js';
 
@@ -54,17 +58,29 @@ const envItem = ensureEnvFile(ROOT);
 add(envItem);
 
 // 5b) --set-owner
-const setOwner = valueOf('--set-owner');
-if (setOwner !== undefined) {
-  if (!validOpenId(setOwner)) {
-    add(item('set_owner', 'fail', '写入 OWNER_OPEN_ID', '参数不是 open_id（应以 ou_ 开头）', '从 npm run setup 的 owner 提示或日志里复制完整 open_id'));
+if (flag('--set-owner')) {
+  const setOwner = valueOf('--set-owner');
+  const title = '写入 OWNER_OPEN_ID';
+  const current = (readEnvFile(ROOT).values.OWNER_OPEN_ID ?? '').trim();
+  if (setOwner === undefined || setOwner === '' || setOwner.startsWith('--')) {
+    add(item('set_owner', 'fail', title, '--set-owner 后面没跟 open_id', 'npm run setup -- --set-owner ou_…（从 npm run setup 的 owner 提示里复制）'));
+  } else if (!validOpenId(setOwner)) {
+    add(item('set_owner', 'fail', title, '参数不是 open_id（应以 ou_ 开头）', '从 npm run setup 的 owner 提示或日志里复制完整 open_id'));
   } else if (envItem.status !== 'ok') {
-    add(item('set_owner', 'fail', '写入 OWNER_OPEN_ID', '.env 不可用，未写入', '先解决 .env 那一项'));
+    add(item('set_owner', 'fail', title, '.env 不可用，未写入', '先解决 .env 那一项'));
+  } else if (current === setOwner) {
+    add(item('set_owner', 'ok', title, '.env 里已经是这个 open_id，未改动'));
+  } else if (current && !flag('--force')) {
+    add(item('set_owner', 'fail', title, `.env 里已有 owner（${current}），未覆盖`,
+      `已有 owner，替换加 --force：npm run setup -- --set-owner ${setOwner} --force（先请人确认要换 owner）`));
   } else {
-    const ok = patchEnvFile(path.join(ROOT, '.env'), { OWNER_OPEN_ID: setOwner });
+    const envPath = path.join(ROOT, '.env');
+    const ok = patchEnvFile(envPath, { OWNER_OPEN_ID: setOwner });
+    // patchEnvFile 写临时文件再 rename，新文件按默认 umask（常见 644）：写完收紧回 600
+    try { fs.chmodSync(envPath, 0o600); } catch { /* Windows */ }
     add(ok
-      ? item('set_owner', 'ok', '写入 OWNER_OPEN_ID', '已写入 .env（重启 bridge 后生效）')
-      : item('set_owner', 'fail', '写入 OWNER_OPEN_ID', '写入失败', '检查 .env 是否可写'));
+      ? item('set_owner', 'ok', title, `${current ? '已替换' : '已写入'} .env（重启 bridge 后生效）`)
+      : item('set_owner', 'fail', title, '写入失败', '检查 .env 是否可写'));
   }
 }
 
@@ -73,16 +89,12 @@ const values = readEnvFile(ROOT).values;
 const required = checkRequiredEnv(values);
 const owner = required.find((r) => r.id === 'owner');
 if (owner?.status === 'needs_human') {
-  const logs = [path.join(ROOT, 'bridge.log'), valueOf('--log')].filter(Boolean);
-  if (process.platform === 'darwin' && process.env.HOME) {
-    const user = String(process.env.USER || 'user').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'user';
-    const label = values.LAUNCHD_LABEL || process.env.LAUNCHD_LABEL || `com.${user}.feishu-claude-bridge`;
-    logs.push(path.join(process.env.HOME, 'Library', 'Logs', `${label}.log`));
-  }
-  const ids = [...new Set(logs.flatMap((f) => findOwnerCandidates(readTail(f))))];
-  if (ids.length) {
-    owner.message += `；日志里有 owner 未登记时私聊过机器人的人：${ids.join('、')}（最近的在前）`;
-    owner.fix = `请人确认哪个是 owner 后：npm run setup -- --set-owner ${ids[0]}`;
+  // label 与 install-service 同一套规则（shell 里显式设置的优先于 .env）
+  const logs = ownerLogFiles({ root: ROOT, home: process.env.HOME || os.homedir(), label: defaultLabel({ ...values, ...process.env }), extra: valueOf('--log') });
+  const hint = ownerHint(logs.flatMap((f) => findOwnerCandidates(readTail(f))));
+  if (hint) {
+    owner.message += hint.message;
+    owner.fix = hint.fix;
   }
 }
 add(required, checkEnvSanity(values));

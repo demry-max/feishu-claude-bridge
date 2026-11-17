@@ -26,6 +26,9 @@ RestartSec=60
 # 优雅退出：要大于 .env 的 SHUTDOWN_GRACE_SEC（默认 120）
 TimeoutStopSec=130
 KillSignal=SIGTERM
+# mixed：停止时只给主进程（桥接）发 SIGTERM，让它等进行中的对话收尾；超过 TimeoutStopSec 才 SIGKILL 整个 cgroup。
+# 默认的 control-group 会同时给所有子进程发 SIGTERM，进行中的 claude 会被一起杀掉，优雅退出等于没有。
+KillMode=mixed
 
 [Install]
 WantedBy=default.target

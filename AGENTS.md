@@ -30,7 +30,7 @@
 | `npm run setup` | 安装自检。Node、依赖、claude CLI 与登录、`.env`（不存在则从 `.env.example` 生成）、必填项，最后跑一遍 doctor 并合并结果 | `0` 全绿；`2` 只差 🙋 人工步骤；`1` 有 ❌ 失败项 |
 | `npm run doctor` | 运行体检。在 setup 的基础上，还查可选命令、工作区、常驻服务、飞书 scope（联网，可 `--no-network`） | 文本模式：`0` 通过 / `1` 有问题；`--json`：同 setup 的三态 |
 
-两者都支持 `--json`，输出：
+两者都支持 `--json`，输出如下。**要解析 JSON 时用 `npm run -s …`**（例如 `npm run -s setup -- --json`），或直接 `node scripts/setup.js --json`：不加 `-s` 时 npm 会先往 stdout 打两行 `> feishu-claude-bridge@… setup` 横幅，`JSON.parse` / `jq` 会失败。
 
 ```json
 { "exit": 2, "counts": { "ok": 9, "warn": 2, "fail": 0, "needs_human": 1 },
@@ -46,8 +46,10 @@
 | id | 对应步骤 |
 |---|---|
 | `node` / `npm` / `deps` | §2 |
-| `claude_cli` / `claude_model` / `claude_auth` | §2 |
+| `claude_cli` / `claude_model` / `claude_exec_model` / `claude_auth` | §2 |
 | `env_file` / `feishu_credentials` | §3 |
+| `doctor` | setup 里跑 doctor 这一步本身：`warn` 是依赖还没装、跳过了（§2.4）；`fail` 是 doctor 运行失败，`npm run doctor` 看完整输出 |
+| `workspace` | owner 工作区目录（doctor 自动建）；`fail` 时按 message 检查 `workspace/` 是否可写 |
 | `lark_cli_app` / `link_lark_cli` | §3C，可选 |
 | `feishu_scopes` | §4 |
 | `owner` / `set_owner` | §5 |
@@ -94,7 +96,7 @@
   > 请在这台电脑的终端里运行 `claude`，在里面输入 `/login`，按提示在浏览器里用你的 Claude 账号完成登录，完成后告诉我。
   >
   > Please run `claude` in a terminal on this machine, type `/login`, finish signing in with your Claude account in the browser, then let me know.
-- **验证**：`npm run setup -- --json --no-network`，看 `claude_auth` 是 `ok`。
+- **验证**：`npm run -s setup -- --json --no-network`，看 `claude_auth` 是 `ok`。
   - `needs_human`：还没登录。
   - `warn`：这个 CLI 版本没有 `auth status` 子命令，确认不了。请人在终端跑一次 `claude -p hi` 看能否回答。
 - 常驻服务不继承终端环境时，可用长期令牌：
@@ -126,7 +128,7 @@ npm ci
 
 **不要让人到飞书开发者后台手工「创建应用」。** 应用由扫码注册自动生成，人只需要扫码授权：
 
-- 桥接自带的 `npm run register` 调飞书的应用注册接口（`/oauth/v1/app/registration`，`archetype=PersonalAgent`，见 `scripts/register.js:32-34`、`:124-135`）。扫码同意后，接口直接返回 App ID、App Secret 和扫码人的 open_id，脚本写进 `.env`。
+- 桥接自带的 `npm run register` 调飞书的应用注册接口（`/oauth/v1/app/registration`，`archetype=PersonalAgent`，见 `scripts/lib/register-core.js:87-91` 的端点、`scripts/register.js:151-156` 的 `begin` 请求）。扫码同意后，接口直接返回 App ID、App Secret 和扫码人的 open_id，脚本写进 `.env`。
 - 飞书官方 lark-cli 的 `lark-cli config init --new` 走的是**同一个**注册接口，也是扫码自动建应用（lark-cli 1.0.97 二进制里含同一端点与 `PersonalAgent`）。它的安装向导 `npx @larksuite/cli install` 在有终端时会调这一步（`install-wizard.js:298-328`），没终端时跳过（`:374-379`）。
 - **每扫一次码就是一个新应用。** 两边各扫一次，就是两个应用。桥接只认 `.env` 里的 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`；lark-cli 用自己的配置：App ID 在 `lark-cli config show` 里，App Secret 在系统钥匙串里，lark-cli 没有导出 Secret 的命令。
 - 所以能自动化的方向是「桥接 → lark-cli」：先让桥接建好应用，再用 `npm run setup -- --link-lark-cli` 把同一个应用交给 lark-cli（§3C）。反过来，setup 只能读到 lark-cli 应用的 App ID，读不到 Secret。
@@ -136,7 +138,7 @@ npm ci
 | `[需要人]` | 为什么命令做不了 | 在哪 |
 |---|---|---|
 | 扫码授权建应用 | 要人用飞书 App 确认 | §3A 第 2 步 |
-| 权限批量导入 + 发布版本（只做一次） | 注册接口建出来的应用没有开通 scope（`scripts/register.js:76-81`），开通和发布只能在开发者后台点 | §3A 第 4 步 |
+| 权限批量导入 + 发布版本（只做一次） | 注册接口建出来的应用没有开通 scope（`scripts/register.js:79-84`），开通和发布只能在开发者后台点 | §3A 第 4 步 |
 | `claude` 登录 | 浏览器登录 Claude 账号 | §2.3 |
 | lark-cli 用户登录（只在要用 lark-cli 功能时） | 用户 OAuth，要人在浏览器同意 | §3C 第 3 步 |
 
@@ -153,6 +155,7 @@ npm ci
 1. **命令**：`npm run register -- --no-wait`
    - **成功**：退出码 `2`，输出一行 `[需要人]` 和一个 `https://…` 链接。设备码存在 `data/register-pending.json`，约 10 分钟内有效。
    - 国际版 Lark 先在 `.env` 加一行 `FEISHU_DOMAIN=lark`。
+   - **再跑一次不会新建**：上一条链接还没过期时，重复 `--no-wait` 不发任何请求，只重新打印同一条链接和剩余秒数（退出码仍是 `2`）。人可能已经扫了旧链接，重新申请会让那个应用成为取不回凭据的孤儿。确定旧链接作废、要重来时才加 `--restart`（`npm run register -- --no-wait --restart`）。
    - **失败**：
      - 退出码 `1` 且提示「.env 里已有 FEISHU_APP_ID / FEISHU_APP_SECRET」：已经有应用了，走 §3B 的验证，**不要加 `--force`**。`--force` 会在飞书里再建一个应用并覆盖凭据。
      - 网络错误见 §10。
@@ -172,7 +175,7 @@ npm ci
      > 请打开飞书开发者后台里刚扫码生成的应用（不用新建），「权限管理 → 批量导入」粘贴我给你的 JSON，然后「版本管理与发布」创建版本并发布，完成后告诉我。
      >
      > Open the app that was just created by the scan in the Feishu developer console (do not create a new one), paste the JSON I give you into Permissions → Batch import, then create and publish a version. Tell me when done.
-   - **验证**：`npm run doctor -- --json`，`feishu_scopes` 为 `ok`。
+   - **验证**：`npm run -s doctor -- --json`，`feishu_scopes` 为 `ok`。
    - 人明确不需要文档 / 表格工具时可以跳过这一步。
 - 有 TTY 的人自己在终端跑 `npm run register`（不带参数）时，是老的交互式二维码，原地等待。
 
@@ -196,7 +199,7 @@ npm ci
    - 国际版 Lark 另加一行 `FEISHU_DOMAIN=lark`。
    - **验证**：`npm run setup`，`feishu_credentials` ✅。
 2. **`[需要人]` 开发者后台确认**（不是新建应用，是检查这个已有应用的配置）
-   - 扫码生成的应用（§3A 或 lark-cli 建的）按 `scripts/register.js:76-81` 只差 ③④，和 §3A 第 4 步一样。①② 主要是给早年在后台手工建的应用查的；§6 收不到 `[msg]` 时再查①②（真机未逐项验证扫码应用的默认配置）。
+   - 扫码生成的应用（§3A 或 lark-cli 建的）按 `scripts/register.js:79-84` 只差 ③④，和 §3A 第 4 步一样。①② 主要是给早年在后台手工建的应用查的；§6 收不到 `[msg]` 时再查①②（真机未逐项验证扫码应用的默认配置）。
    - **转告人**：
      > 请在飞书开发者后台打开这个应用，确认四件事：
      > ①「应用能力」里已添加「机器人」；
@@ -217,7 +220,7 @@ npm ci
      {"scopes":{"tenant":["im:message","im:message.p2p_msg:readonly","im:message.group_at_msg:readonly","im:resource","im:message.reactions:write","speech_to_text:speech","contact:user.base:readonly","docx:document","docx:document:readonly","bitable:app","bitable:app:readonly","wiki:wiki:readonly","sheets:spreadsheet","sheets:spreadsheet:readonly"],"user":[]}}
      ```
 
-   - **验证**：`npm run doctor -- --json`，`feishu_scopes` 应为 `ok`。
+   - **验证**：`npm run -s doctor -- --json`，`feishu_scopes` 应为 `ok`。
      - `needs_human`：message 里列出还缺的 scope，提醒人补完后**重新发布版本**。
      - `fail`：凭据错，或网络不通（§10）。
    - 长连接与事件订阅脚本查不到，要在 §6 前台验证时确认。
@@ -264,7 +267,8 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 
 - **§3A 扫码路径**：已自动登记。setup 的 `owner` 项应是 ✅。
 - **§3B 沿用已有应用**：`owner` 是 🙋。你需要人的 open_id，做法如下：
-  1. 前台启动并把日志写进文件：`npm start >> bridge.log 2>&1`。
+  1. 前台启动并把日志写进文件：`npm start > bridge.log 2>&1`。
+     - 用 `>` 覆盖旧日志：只看本次启动之后的私聊，旧日志里别人的私聊不会混进候选。
      - 这是长驻进程。用你的工具在后台跑，并记下 PID；或请人在另一个终端跑。
   2. **`[需要人]` 私聊机器人**
      - **转告人**：
@@ -272,9 +276,10 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
        >
        > In Feishu, find the bot and send it any direct message (it will reply that the owner record is missing — that's expected), then tell me.
   3. **命令**：`npm run setup`。
-     - `owner` 一项会列出日志里发过消息的 open_id，最近的在前，并给出 `npm run setup -- --set-owner ou_…`。
-     - 只有一个人发过时就是他。有多个时请人确认。
+     - 只有 1 个人私聊过：`owner` 一项给出他的 open_id 和 `npm run setup -- --set-owner ou_…`。
+     - 2 个及以上：只列出全部候选，**不给命令**。不能判定谁是 owner，不要猜，也不要让人从列表里挑：请其他人暂停私聊，停掉第 1 步的进程，从第 1 步用新日志重做。
   4. **命令**：`npm run setup -- --set-owner ou_…`，`set_owner` ✅。
+     - `.env` 里已有不同的 `OWNER_OPEN_ID` 时 `set_owner` 报 ❌「已有 owner」，不会覆盖。确实要换 owner，先请人确认，再加 `--force`。值相同时不改动。
   5. 停掉第 1 步的进程（`kill <你记下的 PID>`），回到 §6 重新启动。
   - 已知 open_id 的人可以直接写 `.env` 的 `OWNER_OPEN_ID=`。
   - **不要**为此开 `ALLOW_OWNER_CLAIM=true`（「首个私聊者自动认领」）。真要开，登记完立刻删掉；doctor 会对它报 ⚠️。
@@ -313,6 +318,9 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
   - 它用当前 node、本仓库目录、`which claude` 的结果生成 `~/Library/LaunchAgents/<label>.plist`，并立即启动。
   - label 默认是 `com.<用户名>.feishu-claude-bridge`，可用 `LAUNCHD_LABEL` 改。
   - plist 带 `ExitTimeOut`（= `SHUTDOWN_GRACE_SEC` + 10），重启时不会被提前强杀。
+- **失败**：
+  - 退出码 `1`，提示「label <x> 已被 <dir> 的桥接占用」：这台机器上另一个目录已经用这个 label 装了桥接（重装、第二份克隆）。**不要加 `--force`**，那会把别人的服务改成指向本目录。在 `.env` 设 `LAUNCHD_LABEL=<x>-2` 后重跑。确定那个目录已经不用了、要改指向本目录，才加 `--force`。
+  - doctor 的 `service` 报「这个 label 属于另一个目录」是同一个原因，处理同上。
 - **验证**：
   - `launchctl print gui/$(id -u)/<label> | grep -E "state|pid"`，应有 `state = running`。
   - `grep "ws client ready" ~/Library/Logs/<label>.log`。

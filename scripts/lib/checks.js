@@ -105,7 +105,9 @@ export function maskEmail(email) {
  */
 export function checkClaudeAuth({ bin = 'claude', run = defaultRun, env = process.env, envFile = {} } = {}) {
   const hasToken = Boolean(env.CLAUDE_CODE_OAUTH_TOKEN || envFile.CLAUDE_CODE_OAUTH_TOKEN);
-  const r = run(bin, ['auth', 'status'], { env: { ...envFile, ...env } });
+  // 子进程只多给它需要的那一项（.env 里的 App Secret 等不进 claude 的环境）
+  const extra = envFile.CLAUDE_CODE_OAUTH_TOKEN ? { CLAUDE_CODE_OAUTH_TOKEN: envFile.CLAUDE_CODE_OAUTH_TOKEN } : {};
+  const r = run(bin, ['auth', 'status'], { env: { ...extra, ...env } });
   let loggedIn = null;
   let email = null;
   try {
@@ -156,8 +158,8 @@ export function checkRequiredEnv(values) {
   if (values.OWNER_OPEN_ID) out.push(item('owner', 'ok', 'owner 身份', 'OWNER_OPEN_ID 已填'));
   else {
     out.push(item('owner', 'needs_human', 'owner 身份', 'OWNER_OPEN_ID 未填',
-      '扫码注册会自动写入；手工建的应用：先 npm start >> bridge.log 2>&1 启动，请 owner 在飞书私聊机器人一句话，' +
-      '再运行 npm run setup，它会从日志里找出这次私聊者的 open_id，确认后 npm run setup -- --set-owner <open_id>'));
+      '扫码注册会自动写入；沿用已有应用：先 npm start > bridge.log 2>&1 启动（> 覆盖旧日志，只看本次启动之后的私聊），' +
+      '只请 owner 一个人在飞书私聊机器人一句话，再运行 npm run setup，它会从日志里找出这次私聊者的 open_id（AGENTS.md §5）'));
   }
   return out;
 }
@@ -229,6 +231,26 @@ export function findOwnerCandidates(logText) {
   return [...new Set(ids.reverse())];
 }
 
+/**
+ * owner 候选 → 附加到 owner 项的 { message, fix }（setup 与 doctor 共用）。没有候选返回 null。
+ * 恰好 1 个才预填 --set-owner；2 个及以上不能判定谁是 owner（可能有人抢先私聊），只列出、不给可直接执行的命令。
+ */
+export function ownerHint(ids = []) {
+  const list = [...new Set(ids)].filter(Boolean);
+  if (!list.length) return null;
+  if (list.length === 1) {
+    return {
+      message: `；日志里有 1 人在 owner 未登记时私聊过机器人：${list[0]}`,
+      fix: `确认这是 owner 本人后：npm run setup -- --set-owner ${list[0]}`,
+    };
+  }
+  return {
+    message: `；日志里有 ${list.length} 人在 owner 未登记时私聊过机器人：${list.join('、')}`,
+    fix: '多人私聊过，不能判定，不要猜：请其他人暂停私聊，按 AGENTS §5 用新日志重做' +
+      '（停掉桥接，npm start > bridge.log 2>&1 重新启动，只让 owner 私聊一句，再 npm run setup）',
+  };
+}
+
 /** 日志只读末尾一段，避免大日志整读 */
 export function readTail(file, bytes = 512 * 1024) {
   try {
@@ -247,18 +269,47 @@ export function readTail(file, bytes = 512 * 1024) {
   }
 }
 
-/** 可能的日志位置（按平台） */
-export function logCandidates({ root, home, label, platform = process.platform }) {
-  const list = [];
-  if (platform === 'darwin' && home && label) list.push(path.join(home, 'Library', 'Logs', `${label}.log`));
-  list.push(path.join(root, 'bridge.log'));
-  return list;
-}
-
 /** plist 里 EnvironmentVariables.PATH 的值（不解析整个 plist，只取 PATH 那一项） */
 export function plistEnvPath(xml) {
   const m = String(xml ?? '').match(/<key>PATH<\/key>\s*<string>([^<]*)<\/string>/);
   return m ? m[1].replace(/&amp;/g, '&') : null;
+}
+
+const unescapeXml = (v) => v.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+/** plist 里的 WorkingDirectory（这个 label 的服务跑的是哪份仓库）；没有返回 null */
+export function plistWorkingDir(xml) {
+  const m = String(xml ?? '').match(/<key>WorkingDirectory<\/key>\s*<string>([^<]*)<\/string>/);
+  return m ? unescapeXml(m[1]) : null;
+}
+
+const sameDir = (a, b) => path.resolve(a) === path.resolve(b);
+
+/**
+ * install-service 覆盖前的守卫：同一用户的默认 label 是固定的，第二份克隆 / 重装到别的目录时，
+ * 直接覆盖会把已有的服务改成指向新目录。已有 plist 指向别的目录、又没加 --force → 返回拒绝说明；否则 null。
+ */
+export function serviceLabelConflict({ existingXml, root, label, force = false }) {
+  if (force || !existingXml) return null;
+  const dir = plistWorkingDir(existingXml);
+  if (!dir || sameDir(dir, root)) return null;
+  return `label ${label} 已被 ${dir} 的桥接占用：在 .env 设 LAUNCHD_LABEL=${label}-2 后重跑；确实要改指向本目录加 --force`;
+}
+
+/**
+ * 找 owner 候选时要读的日志：本目录的 bridge.log、--log 指定的文件；macOS 上再加 launchd 日志，
+ * 但只在这个 label 的 plist 指向本目录时（否则读到的是别的桥接的私聊者）。
+ */
+export function ownerLogFiles({ root, home, label, extra, platform = process.platform, exists = fs.existsSync, readFile = (p) => fs.readFileSync(p, 'utf8') }) {
+  const list = [path.join(root, 'bridge.log')];
+  if (extra) list.push(extra);
+  if (platform === 'darwin' && home && label) {
+    const plist = path.join(home, 'Library', 'LaunchAgents', `${label}.plist`);
+    let dir = null;
+    try { if (exists(plist)) dir = plistWorkingDir(readFile(plist)); } catch { /* 读不了就不读它的日志 */ }
+    if (dir && sameDir(dir, root)) list.push(path.join(home, 'Library', 'Logs', `${label}.log`));
+  }
+  return list;
 }
 
 export function plistExitTimeout(xml) {
@@ -281,7 +332,7 @@ export function withExitTimeout(xml, seconds) {
  * macOS 常驻服务检查（只读：读 plist、launchctl print；不装不改）。
  * 其它平台只给提示：Windows 看启动项快捷方式；Linux 没有内置安装脚本。
  */
-export function checkService({ platform = process.platform, home, label, uid, graceSec = 120, run = defaultRun, exists = fs.existsSync, readFile = (p) => fs.readFileSync(p, 'utf8'), appData } = {}) {
+export function checkService({ platform = process.platform, home, label, uid, graceSec = 120, root, run = defaultRun, exists = fs.existsSync, readFile = (p) => fs.readFileSync(p, 'utf8'), appData } = {}) {
   if (platform === 'darwin') {
     const plist = path.join(home, 'Library', 'LaunchAgents', `${label}.plist`);
     if (!exists(plist)) {
@@ -289,6 +340,12 @@ export function checkService({ platform = process.platform, home, label, uid, gr
     }
     const out = [];
     const xml = readFile(plist);
+    // 同 label 的服务跑的是别的目录：它的运行状态、PATH、ExitTimeOut 都和本目录无关，不能报成本目录「运行中」
+    const dir = plistWorkingDir(xml);
+    if (root && dir && !sameDir(dir, root)) {
+      return [item('service', 'warn', '常驻服务（launchd）', `这个 label 属于另一个目录（${dir}）`,
+        `本目录要装常驻服务：在 .env 设 LAUNCHD_LABEL=${label}-2 后 npm run install-service；不要覆盖那个服务`)];
+    }
     const r = run('launchctl', ['print', `gui/${uid}/${label}`]);
     const pid = (r.stdout.match(/\bpid = (\d+)/) ?? [])[1];
     out.push(r.ok

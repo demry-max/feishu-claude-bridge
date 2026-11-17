@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { checkNode, checkNpm, checkEnvFile } from '../src/doctor.js';
 import {
   item, defaultRun, checkDeps, checkClaudeCli, checkClaudeAuth, checkRequiredEnv, checkEnvSanity,
-  checkShadowed, checkOptionalBins, checkService, findOwnerCandidates, readTail, logCandidates,
+  checkShadowed, checkOptionalBins, checkService, findOwnerCandidates, readTail, ownerLogFiles, ownerHint,
   readEnvFile, renderLine, toJson, scrubSecrets, exitCodeFor,
 } from './lib/checks.js';
 
@@ -91,11 +91,11 @@ if (!envFile.exists) {
   const owner = required.find((r) => r.id === 'owner');
   if (owner?.status === 'needs_human') {
     const label = process.env.LAUNCHD_LABEL || (await import('../src/launchd.js')).defaultLabel();
-    const logs = logCandidates({ root: ROOT, home: os.homedir(), label });
-    const ids = [...new Set(logs.flatMap((f) => findOwnerCandidates(readTail(f))))];
-    if (ids.length) {
-      owner.message += `；日志里有 owner 未登记时私聊过机器人的人：${ids.join('、')}（最近的在前）`;
-      owner.fix = `请人确认哪个是 owner 后：npm run setup -- --set-owner ${ids[0]}`;
+    const logs = ownerLogFiles({ root: ROOT, home: os.homedir(), label });
+    const hint = ownerHint(logs.flatMap((f) => findOwnerCandidates(readTail(f))));
+    if (hint) {
+      owner.message += hint.message;
+      owner.fix = hint.fix;
     }
   }
   add(required.filter((r) => r.status !== 'ok'), checkEnvSanity(after), checkShadowed(after, process.env, ['CLAUDE_MODEL', 'CLAUDE_EFFORT', 'GUEST_TOOLS', 'OWNER_OPEN_ID', 'OWNER_TOOL_PROFILE']));
@@ -118,6 +118,7 @@ if (!flag('--no-service')) {
     label: defaultLabel(),
     uid: process.getuid?.(),
     graceSec: shutdownGraceSec(process.env, () => {}),
+    root: ROOT,
     appData: process.env.APPDATA,
   }));
 }
