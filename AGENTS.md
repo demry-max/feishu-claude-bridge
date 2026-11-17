@@ -361,6 +361,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | owner 工具档 | `legacy` | `OWNER_TOOL_PROFILE=audit` 或 `strict` | 先用 `audit` 跑一段，看审计；`strict` 下 `ALLOWED_TOOLS` / `LARK_CLI` 不起作用 |
 | 工具审计每日汇总 | audit / strict 下 `21:30` | `TOOL_AUDIT_SUMMARY_AT=`（留空关闭） | owner 工具档为 audit / strict |
 | 忙时连续发消息（owner 私聊排队、合并、接着办） | 关 | `OWNER_MESSAGE_QUEUE=true` | 无；只影响 owner 私聊，队列在内存里，重启不保留 |
+| 每日新会话（owner 私聊每天换一次会话，带上交接内容） | 关 | `DAILY_SESSION=shadow` 先只记录，确认后 `on` | 无；只影响 owner 私聊；先 `shadow` 跑一天、用 `scripts/daily-session-replay.js` 对比后再 `on`；运行时 `/session`（owner 私聊） |
 | lark-cli（日历、审批、任务等） | 关 | `LARK_CLI=true` | 同「外部增量」 |
 | 语音兜底转写 | 自动 | — | `ffmpeg` 在 PATH 里（常驻服务的 PATH 也要有） |
 | 优雅退出等待 | `120` 秒 | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |

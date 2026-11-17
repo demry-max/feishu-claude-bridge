@@ -58,6 +58,7 @@ Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-
 | 🚧 Write-destination gate, skill frontmatter allowlist, quarantine of foreign `.claude` files | on with audit / strict; legacy unchanged | `OWNER_TOOL_PROFILE` | [strict hardening](#strict-hardening-audit--strict-only-legacy-unchanged) |
 | 🩺 No-tool profile for scheduled-task self-diagnosis | on with audit / strict; legacy unchanged | `OWNER_TOOL_PROFILE` | same |
 | 📨 Messaging while busy (owner DM: queue, merge, carry on) | off | `OWNER_MESSAGE_QUEUE=true` | [Messaging while busy](#-messaging-while-busy-queue-merge-carry-on-off-by-default) |
+| 📅 Daily fresh session (owner DM gets a new session each day, with a handoff) | off | `DAILY_SESSION=shadow` (record only) / `on`; at runtime `/session` | [Daily fresh session](#-daily-fresh-session-off-by-default) |
 | 🧩 lark-cli (calendar, approvals, tasks, message search, …) | off | `LARK_CLI=true` | [What the Feishu tools can do](#-what-the-feishu-tools-can-and-cannot-do) |
 
 ## Quick Start
@@ -378,6 +379,34 @@ Group chats, guests, non-owners, scheduled jobs and the heartbeat are not affect
 - **Restart**: the queue lives in memory only and is not persisted; on graceful shutdown, messages that haven't had their turn each get "restarting, please resend" instead of being silently dropped (exceptions: no grace period, second signal, forced kill, crash — see "Graceful shutdown").
 - Queued text is treated as the owner's own input, as usual; quoted / forwarded third-party content stays inside the untrusted fence; the merged prompt is passed to claude over stdin as before, never on the command line.
 
+### 📅 Daily fresh session (off by default)
+
+The owner DM keeps `--resume`-ing one session, which grows forever and makes every message slower. With `DAILY_SESSION` on, **in the owner's DM only**: a "handoff" runs early each morning, and from the first message after the cut-over time the DM gets a new session that starts with yesterday's handoff material.
+Group chats, guests, scheduled tasks, heartbeat, verification and digest are unaffected; unset or `off` behaves exactly as before (no `data/daily-session/`, no transcript ring, no timer, no extra `/status` line).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DAILY_SESSION` | `off` | `off` (as before) / `shadow` (record recent rounds and log "would rotate / deferred" only; no session change, no handoff) / `on` (really rotate). Unknown values are logged and treated as `off` |
+| `DAILY_SESSION_AT` | `04:00` | Cut-over time (local): the first owner DM message after it starts a new session |
+| `DAILY_SESSION_HANDOFF_AT` | `03:30` | Pre-handoff time; empty = no pre-handoff (carry recent rounds only); must be earlier than `DAILY_SESSION_AT`, otherwise treated as empty |
+| `DAILY_SESSION_ROUNDS` | `10` | How many of the previous session's last rounds to carry over (0–30) |
+| `DAILY_SESSION_KEEP_DAYS` | `14` | How long old sessions stay available for `/session back` (1–28 days) |
+
+- **Pre-handoff**: at `DAILY_SESSION_HANDOFF_AT`, if the owner has been idle for ≥60 minutes, there has been new conversation since the last handoff, rotation isn't paused and nothing is running, the bridge resumes the old session for one handoff turn:
+  unfinished items go into `tasks/`, new facts into `memory/`, the day's journal gets the details, and the turn ends with a ≤600-character "where we left off" summary. The handoff turn has a fixed tool surface —
+  read the workspace, write only `memory/` and `tasks/`, no Bash, web or Feishu tools, unaffected by `OWNER_TOOL_PROFILE` / `ALLOWED_TOOLS` / `LARK_CLI`; its answer is sent to no one; hard timeout 5 minutes.
+  The handoff runs in the owner session's own queue, so it never overlaps a conversation turn; messages sent meanwhile wait behind it instead of getting "the previous task is still running".
+- **Rotation**: the first message after `DAILY_SESSION_AT` starts a new session, prefixed with carry-over material: an intro (drafts from the old session are void — anything to execute must be re-drafted and confirmed again), the handoff summary, the two most recent journals (last 6000 characters each),
+  and the last N rounds (inside an untrusted fence), 20,000 characters at most. The first reply in the new session ends with one line: "(new session from today; last night's handoff: …; `/session back` to go back)".
+- **Turns that don't rotate**: a "确认" (confirm) turn — it would let an old draft run in the new session — a single message released from the busy queue, and a merged turn containing a confirm never rotate on that turn; the next message does.
+  A bare `/do` or `/redirect` is deferred, and the third consecutive deferral forces the rotation. A session that already exists when the switch is first turned on is adopted as-is and rotates at the next cut-over.
+- **Fallback**: if the first turn of the new session fails before producing any output, the bridge restores the old session and says so in the reply; a failure after output was produced does not roll back.
+- **Commands** (owner DM only; ignored in groups): `/session` status; `/session back` restore the previous session and pause daily rotation; `/session auto` resume; `/session rotate` hand off now and rotate on the next message.
+  `/new` is unchanged (no handoff, no carry-over); when the switch isn't `off`, the cleared session is also kept in the list you can go back to.
+- **Data**: state, the last 30 rounds and handoff summaries live in `data/daily-session/`; the format of `data/sessions.json` is unchanged. Rounds are redacted for credentials before being written; logs contain lengths, counts and file names only, never message text.
+- **Rollout**: run `shadow` for a day, then compare old vs new with `scripts/daily-session-replay.js` (blind review) and switch to `on` only if the new way doesn't lose; when switching to `on`, merge [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) into `workspace/CLAUDE.md`.
+- When `ALLOWED_TOOLS` is set explicitly the defaults are not merged in; at startup the bridge logs one `[config] ⚠️` line listing any `Edit(./…/**)` write entries from the default owner tools that are missing (e.g. `Edit(./tasks/**)`). It only warns; permissions are not changed.
+
 ## 🚦 Two models: chat/planning vs execution
 
 ```
@@ -410,7 +439,7 @@ For those, use Feishu's official [lark-cli](https://github.com/larksuite/cli) (2
 
 ## 🧩 Optional prompt supplements
 
-`workspace/CLAUDE.md` is the owner's prompt template, and the repo doesn't change it by default. The four documents below are prompt supplements for the optional features; merge them into `workspace/CLAUDE.md` as needed. The features work without them; the model just won't know the corresponding conventions. (The documents are in Chinese.)
+`workspace/CLAUDE.md` is the owner's prompt template, and the repo doesn't change it by default. The five documents below are prompt supplements for the optional features; merge them into `workspace/CLAUDE.md` as needed. The features work without them; the model just won't know the corresponding conventions. (The documents are in Chinese.)
 
 | Document | Content | Prerequisite |
 |---|---|---|
@@ -418,6 +447,7 @@ For those, use Feishu's official [lark-cli](https://github.com/larksuite/cli) (2
 | [`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md) | how to fill `watch`, how to relay external content, actions on heartbeat messages | merge the previous one first |
 | [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md) | the `verify` status and `done_evidence`, escalation ladder, digest | merge the previous two first |
 | [`docs/owner-tools-prompt-proposal.md`](docs/owner-tools-prompt-proposal.md) | tool description fixes, usage under the audit / strict profiles | when switching tool profiles |
+| [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) | daily fresh session: reading the carry-over, void drafts, the handoff turn (the seed file already has a conditional version) | when setting `DAILY_SESSION=on` |
 
 ## Architecture
 

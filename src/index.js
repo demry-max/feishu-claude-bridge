@@ -16,6 +16,7 @@ import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
 import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
+import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.js';
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -130,6 +131,7 @@ const HELP_TEXT = [
   '- `/do <任务>` 用执行模型跑这一轮；说「执行」「去做」也一样，会话上下文保留',
   '- `/tasks` 查看定时任务：上次/下次触发时间（仅 owner）',
   '- `/heartbeat on|off|status` 心跳开关与状态（仅 owner 私聊；只改运行时开关，不写 .env）',
+  '- `/session [status|back|auto|rotate]` 每日新会话：状态 / 退回旧会话并暂停 / 恢复 / 立即交接换新（仅 owner 私聊；DAILY_SESSION 非 off 时）',
   '',
   '**能做什么**',
   '- 直接对话；群里 @我 即可',
@@ -185,6 +187,8 @@ const ownerQueue = createOwnerMessageQueue({
   log: console.log,
   warn: console.error,
 });
+// 每日新会话（DAILY_SESSION 默认 off）：真实实例在启动时建（见下方 createLiveDailySession）；建好之前按 off 处理，原样放行
+let dailySession = { beforeTurn: ({ prompt }) => prompt, failureNote: () => '', onManualNew: () => {}, command: async () => undefined, statusLine: () => '' };
 
 async function reply(messageId, text) {
   const safe = redact(text);
@@ -346,6 +350,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   if (text === '/new' && ownerQueue.applies(isOwner, message.chat_type)) await ownerQueue.clearAndTell(sessionKey, message.message_id);
 
   if (text === '/new') {
+    dailySession.onManualNew(sessionKey, { isOwner, chatType: message.chat_type }); // 每日新会话：非 off 时把被清的 id 记进 prev（reason=manual）
     resetSession(sessionKey);
     if (isRunning(sessionKey)) { cancelRun(sessionKey); abortRetries(sessionKey); } // 否则旧任务收尾时会把会话写回来
     // 群里 owner 的 /new 一并清掉访客那条共用会话（访客自己在群里无权重置）
@@ -377,6 +382,12 @@ async function handleMessage(data, seq = ++arrivalSeq) {
     await reply(message.message_id, out);
     return;
   }
+  // 每日新会话：/session 只在 owner 私聊生效；群聊不回复（同 /heartbeat）；off 时返回 undefined，照旧落到下面
+  if (text === '/session' || text.startsWith('/session ')) {
+    const out = await dailySession.command(sessionKey, text, { isOwner, chatType: message.chat_type, notify: (t) => reply(message.message_id, t) });
+    if (out === null) { console.log('[daily-session] 群聊里的 /session 不处理（只在 owner 私聊生效）'); return; }
+    if (out !== undefined) { await reply(message.message_id, out); return; }
+  }
   // 引用回复心跳消息（BRIDGE-EV-1，HEARTBEAT_REPLY_SHORTCUTS=true 才生效；关时恒为 null，逐字走原流程）：
   // 正文恰好是「知道了」「推迟一天」「不做了」→ 桥接确定性回写并回一句确认，不进模型；
   // 其余 → 照常进 owner 对话，ledgerHint 在下面拼提示词时加在末尾
@@ -390,7 +401,8 @@ async function handleMessage(data, seq = ++arrivalSeq) {
     ledgerHint = shortcut?.hint ?? '';
   }
   if (text === '/status') {
-    await reply(message.message_id, sessionInfo(sessionKey, isOwner) + ownerQueue.statusLine(sessionKey, isOwner, message.chat_type)); // BRIDGE-MQ-1：owner 私聊且开关开时多一行排队条数，其余为空串
+    // 每日新会话开着时（owner 私聊）末尾再多一行：本会话从何时起、下次何时换新；off 时为空串
+    await reply(message.message_id, sessionInfo(sessionKey, isOwner) + ownerQueue.statusLine(sessionKey, isOwner, message.chat_type) + dailySession.statusLine(sessionKey, { isOwner, chatType: message.chat_type })); // BRIDGE-MQ-1：owner 私聊且开关开时多一行排队条数，其余为空串
     return;
   }
   if (text === '/help' || text === '帮助') {
@@ -543,6 +555,8 @@ async function runTurn(spec) {
   // BRIDGE-MQ-1：合并的一轮、排队后单条出队的一轮恒不放行（夹在里面 / 排队等着的「确认」不算确认，提示光总看完再单独回）
   const confirm = (merged || queued) ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner);
   const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm, runClaude, redact });
+  // 每日新会话：「确认」轮不换会话——对原 prompt 再判一次，不用上面的 confirm（排队 / 合并轮里它被强制成不放行）
+  const dsConfirmed = detectConfirm(prompt, message.chat_type, isOwner).confirmed;
   prompt = toolTurn.prompt;
 
   // 群聊带上发言人姓名，机器人才知道是谁在说话。
@@ -586,6 +600,7 @@ async function runTurn(spec) {
     await react(message.message_id, 'OnIt');
     const progress = createProgressChannel(client, message.message_id);
     try {
+      prompt = dailySession.beforeTurn({ sessionKey, prompt, text, isOwner, chatType: message.chat_type, confirmed: dsConfirmed, queued, merged, route, toolTurn }); // 每日新会话（off 原样返回；排队轮、带确认提示的合并轮不换）
       const runClaude = toolTurn.runClaude; // BRIDGE-PERM-1：audit/strict 收集工具事件、strict 私聊确认；legacy 下就是原函数
       const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });
       await progress.finish();
@@ -610,7 +625,7 @@ async function runTurn(spec) {
       if (e?.cancelled) return; // /cancel 主动终止，不报错
       console.error('[claude]', e);
       // 登录类失败（含钥匙串锁住）给确定性修复步骤；瞬时刷新不算登录失效；其余原样报错
-      await reply(message.message_id, await claudeFailureReply(String(e.message ?? e)));
+      await reply(message.message_id, (await claudeFailureReply(String(e.message ?? e))) + dailySession.failureNote(e));
     }
   });
 }
@@ -867,6 +882,10 @@ const heartbeat = startHeartbeat({
   verifyRunner: createLarkRunner(),
   getOwner: () => OWNER_OPEN_ID || loadOwner(),
 });
+// owner 私聊每日新会话（DAILY_SESSION 默认 off：不建目录、不挂定时器、逐字照旧）。
+// 预交接走同一个 enqueue 队列（和 owner 轮串行，turnsInFlight 已经 +1，优雅退出会等它）；进入退出流程后不再起新的交接
+dailySession = createLiveDailySession({ dataDir: DATA_DIR, workspaceDir: WORKSPACE_DIR, enqueue, redact, isDraining: () => shutdown.isDraining() });
+dailySession.start();
 
 // ---- 优雅退出（BRIDGE-VR-1）：SIGTERM / SIGINT 先停接新消息、停心跳，等进行中的对话做完再退出 ----
 // 最多等 SHUTDOWN_GRACE_SEC 秒（默认 120）；等待期间新来的消息回「正在重启，请稍后重发」；第二次信号立即退出。
@@ -940,6 +959,9 @@ async function scopeSelfCheck() {
   if (shadowed.length) {
     console.error(`[config] ⚠️ 以下变量被 shell 环境覆盖，.env 里的值未生效：${shadowed.join(', ')}`);
   }
+  // 显式 ALLOWED_TOOLS 不并入默认值：缺了默认里的 Edit(./…/**) 写入项就只警告（只列项名，不改权限）
+  const ownerEdits = ownerToolsWarning(process.env);
+  if (ownerEdits) console.error(ownerEdits);
 }
 
 // 启动通知放在全部自检之后：此前 announceStartup() 在 config 块之前调用，

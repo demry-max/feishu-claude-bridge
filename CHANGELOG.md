@@ -198,6 +198,26 @@
   - 附件下载慢时出队先等更早到、还没接收完的消息（最多 30 秒，`ARRIVAL_HOLD_MS`），合并仍按到达顺序；下载失败照旧告知、不拖住后面的；到点先办已排好的，迟到的进下一轮；
   - 文档写明优雅退出的例外：`SHUTDOWN_GRACE_SEC=0`、二次信号、SIGKILL、崩溃、launchd 提前强杀时排队消息直接丢、不回「请重发」。
 
+### owner 私聊每日新会话（凌晨预交接 + 换新后首条懒切换，默认关闭）
+
+> owner 私聊不再永远续同一条会话：每天凌晨先交接（写台账 / 记忆、出一段摘要），换新时刻之后的第一条消息起换新会话并带上接续材料。新开关 `DAILY_SESSION` 默认 `off`，关着时逐字照旧。
+
+- **开关**：`DAILY_SESSION=off|shadow|on`（乱值按 off 并打日志）；`DAILY_SESSION_AT`（默认 `04:00`）、`DAILY_SESSION_HANDOFF_AT`（默认 `03:30`，留空不预交接，不早于 AT 时按留空）、
+  `DAILY_SESSION_ROUNDS`（默认 10，0–30）、`DAILY_SESSION_KEEP_DAYS`（默认 14，1–28）。只作用于 owner 私聊。`shadow` 只记原话、只打「该切 / 推迟」日志（无正文）。
+- **新模块 `src/daily-session.js`**（纯逻辑，时钟 / 文件系统 / 定时器可注入）与接线 `src/daily-session-live.js`：状态 `data/daily-session/state.json`（原子写、永不抛，读坏按无状态）、
+  原话环形文件（最近 30 轮，落盘前脱敏）、交接摘要文件；`data/sessions.json` 格式不变（零迁移）。
+- **交接档**（`src/claude.js`，`toolProfile: 'handoff'`）：续调用方给的会话、`--tools Read,Grep,Glob,Edit,Write`、只预批 `Read(./**)`、`Edit(./memory/**)`、`Edit(./tasks/**)`，
+  黑名单在心跳的基础上再点名 Bash / 联网 / 飞书与 schedules、skills、outbox、CLAUDE.md、`.claude`；`--setting-sources ''`、`--strict-mcp-config`；不受任何 owner 工具配置影响；没有 resumeId 直接抛错。
+  `runClaude` 新增 `persistSession:false`（交接轮的结果 id 不写回）；新增 `getSessionId` / `restoreSession`（回退用，不动代际计数）。
+- **切换规则**：AT 之后第一条消息换新；第一次见到的会话先接管不换；「确认」、排队出队的单条、带「确认」的合并轮永远不在当轮换（判定对原 prompt 做，不复用排队轮里被强制成不放行的确认结果）；
+  裸 `/do`、`/redirect` 推迟、连续第 3 条强制换。切换那轮删掉已拼上的固化提醒；新会话首轮没输出就失败自动退回原会话。
+- **命令**：`/session [status|back|auto|rotate]`（只在 owner 私聊；群里不回复）；`/status` 末尾多一行（off 时不加）；`/new` 在非 off 时把被清的会话记进可退回列表。HELP 加一行。
+- **预交接定时器**：照日结的 arm / tick 写法，排进 owner 会话同一个队列（和对话串行、计入优雅退出的在途数），硬超时 5 分钟取消；进入优雅退出后不再开始新的交接；重启时把 `running` 记为 `failed`。
+- **启动自检**：显式配置 `ALLOWED_TOOLS` 且缺默认 owner 工具里的 `Edit(./…/**)` 写入项时，打一行 `[config] ⚠️` 列出缺的项名（不打整行配置、不改权限）。
+- **回放对比脚本** `scripts/daily-session-replay.js`（只读两臂、盲评、产物只写 `--out`、`--dry-run` 只打 argv）与占位题目 `scripts/daily-session-replay.questions.example.txt`。
+- **提示词**：新增 `docs/ds-prompt-proposal.md`；种子文件 `workspace/CLAUDE.md` 按条件式写法加「接续材料」「交接轮」两节并改写「新写入的记忆当天写全」一句。README 中英、AGENTS.md 可选功能表补一行。
+- 测试：新增 `test/daily-session.test.js`、`test/daily-session-replay.test.js`；既有测试与夹具一条未改。
+
 ## [2.3.0] - 2026-09-14
 
 ### 新增

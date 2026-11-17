@@ -32,6 +32,9 @@ function triggerTable() {
   return table;
 }
 
+// 裸 /do（命令后没有正文）时代填的提示词。每日新会话用它识别「这一轮是在执行上一会话已确认的计划」
+export const BARE_EXEC_PROMPT = '按照上面已经确认的计划直接执行，完成后汇报结果。';
+
 /**
  * 判定一条消息该走哪条车道。返回 { lane: 'chat'|'exec', prompt }。
  * 命令式前缀（/do）会被剥掉；自然语言触发词是正文的一部分，原样保留。
@@ -43,7 +46,7 @@ export function routeTurn(text) {
     if (!re.test(t)) continue;
     if (!cmd) return { lane: 'exec', prompt: t };
     const rest = t.slice(trig.length).trim();
-    return { lane: 'exec', prompt: rest || '按照上面已经确认的计划直接执行，完成后汇报结果。' };
+    return { lane: 'exec', prompt: rest || BARE_EXEC_PROMPT };
   }
   return { lane: 'chat', prompt: t };
 }
