@@ -345,7 +345,13 @@ describe('launchd 优雅退出的真实上限', () => {
   });
   test('install-service --dry-run（默认 120）：ExitTimeOut=60，plist 环境变量钉 SHUTDOWN_GRACE_SEC=50，提示走 stderr', { skip: process.platform !== 'darwin' && '只在 macOS 上运行' }, () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pub1-home-'));
-    const r = spawnSync(process.execPath, [path.join(REPO, 'scripts', 'install-service.js'), '--dry-run'],
+    // 脚本按自身位置定位仓库根并读根下 .env：拷一份 scripts/ 到临时根（src/ 用软链，同 setup.test.js 的 register e2e），
+    // 让结果与真实检出目录里有没有 .env、写了什么 SHUTDOWN_GRACE_SEC 无关
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pub1-root-'));
+    fs.cpSync(path.join(REPO, 'scripts'), path.join(root, 'scripts'), { recursive: true });
+    fs.symlinkSync(path.join(REPO, 'src'), path.join(root, 'src'), 'dir');
+    assert.ok(!fs.existsSync(path.join(root, '.env')));
+    const r = spawnSync(process.execPath, [path.join(root, 'scripts', 'install-service.js'), '--dry-run'],
       { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, USER: 'tester' }, timeout: 30_000 });
     assert.equal(r.status, 0, r.stderr);
     assert.equal(checks.plistExitTimeout(r.stdout), 60);
