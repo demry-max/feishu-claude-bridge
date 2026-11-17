@@ -200,7 +200,7 @@
 
 ### 业务系统只读查询（bms / ias）
 
-> owner 的私聊、定时任务和心跳可以只读查询两个内部业务系统。新开关 `BMS_TOOL_ENABLED` 默认关，关着时所有轮次的参数与以前逐字相同。
+> owner 的私聊、发往 owner 私聊的定时任务和心跳可以只读查询两个内部业务系统。新开关 `BMS_TOOL_ENABLED` 默认关，关着时所有轮次的参数与以前逐字相同。
 
 - **新工具 `mcp__biz__biz_get`**（`BMS_TOOL_ENABLED=1`，只认恰好 `1`；三个工具档下都生效）。
   - 由桥接自带的 stdio MCP 服务 `src/mcp-biz.js` 提供。参数是 `target`（`bms` 业务管理系统 / `ias` 财务会计系统）、`path`、`query`。
@@ -216,17 +216,19 @@
   - 不进环境变量、命令行参数、临时 MCP 配置、日志、审计或报错文本。响应里出现的 Key 也会被打码。
   - 缺条目时只有那个系统不可用，回固定提示和写入命令模板。
 - **谁有这个工具**：
-  - 有：owner 私聊（legacy / audit / strict 对话）、定时任务（含 strict 的只读定时任务）、心跳。
+  - 有：owner 私聊（legacy / audit / strict 对话）、结果发往 owner 私聊的定时任务（含 strict 的只读定时任务）、心跳。
+  - 定时任务看目的地：`src/index.js` 只在内存里记 owner 私聊的会话 ID，任务的 `chat_id` 恰好等于它才有；发往群或其他会话、桥接重启后 owner 还没私聊过时都没有。
   - 心跳另挂一份只含这个工具的临时 MCP 配置，轮次结束删除；系统提示多一行说明。
-  - 没有：群聊（含 owner 在群里）、访客、sched-diag、验收、交接。
-  - 有这个工具的轮次另加 `Read(<仓库>/.env)`、`Read(<仓库>/.env.*)` 拒读。免询问白名单里没有任何 `Bash(security…)`。
+  - 没有：群聊（含 owner 在群里）、发往群或目的地判断不出的定时任务、访客、sched-diag、验收、交接。
+  - 有这个工具的轮次另加 `Read(<仓库>/.env)`、`Read(<仓库>/.env.*)` 拒读，并拒绝 `Bash(security:*)`、`Bash(/usr/bin/security:*)`。免询问白名单里没有任何 `Bash(security…)`。
+  - MCP 服务经 `/usr/bin/env -u …` 启动，去掉 `NODE_OPTIONS`、`NODE_EXTRA_CA_CERTS` 和各种 `*_PROXY`（含小写）。
 - **审计**：audit / strict 下这个工具记为放行，只记工具名、target、GET 和路径第一段的大类。
 - **技能**：开关开时，桥接把 `docs/skills/biz-readonly/`（端点速查）作为保留技能同步进 `workspace/.claude/skills/`。
   - legacy 直拷，audit / strict 过 frontmatter 白名单重建。
   - 不写 `workspace/skills/`。
 - **自检**：`npm run -s biz-check`（`bms-check` 只查 bms），每个系统一行打码结论，退出码 0 / 1。
 - **新增文件**：`src/biz-targets.js`、`src/mcp-biz.js`、`src/biz-wiring.js`、`scripts/biz-check.js`、`docs/skills/biz-readonly/SKILL.md`。
-  - `src/claude.js` 只加接线。`src/tool-audit.js`、`src/tool-policy.js` 认这个工具名。`src/index.js` 未改。
+  - `src/claude.js` 只加接线。`src/tool-audit.js`、`src/tool-policy.js` 认这个工具名。`src/index.js` 只加记 owner 私聊会话 ID、给定时任务带目的地的几行。
 - **测试**：
   - 新增 `test/biz-targets.test.js`、`test/mcp-biz.test.js`、`test/biz-profiles.test.js`、`test/biz-check.test.js`。
   - `test/biz-profiles.test.js` 在开关关时，把三档的 17 个用例与改动前生成的夹具逐字比对。

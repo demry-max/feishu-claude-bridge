@@ -208,8 +208,9 @@ Hosts, path prefixes and Keychain entry names are hard-coded in `src/biz-targets
 
 | Has the tool | Does not |
 |---|---|
-| owner DMs, scheduled jobs (including strict's read-only jobs), heartbeat | group chats (even the owner's turns there), guests, sched-diag self-diagnosis, verification, handoff |
+| owner DMs, scheduled jobs whose results go to the owner's DM (including strict's read-only jobs), heartbeat | group chats (even the owner's turns there), scheduled jobs whose results go to a group or another chat, scheduled jobs whose destination can't be determined, guests, sched-diag self-diagnosis, verification, handoff |
 
+- **Scheduled jobs depend on the destination**: the bridge keeps the owner's DM chat ID in memory only (it learns it once the owner sends a DM). A scheduled job gets the tool only when its `chat_id` equals that ID; after a restart, and until the owner sends a DM, no scheduled job has it.
 - **Switch**: `BMS_TOOL_ENABLED=1` in `.env`, exactly `1`, then restart. It works under all three tool profiles. When off, every turn's arguments are byte-for-byte the same as without the feature.
 - **GET only**, and redirects are not followed.
   - The path is normalized before its prefix is checked. `..`, `//`, `\`, `@`, `%`-encoding and full URLs are rejected.
@@ -223,7 +224,8 @@ Hosts, path prefixes and Keychain entry names are hard-coded in `src/biz-targets
   - The MCP server reads it into memory on each call with `/usr/bin/security find-generic-password … -w`.
   - It is never put in environment variables, command-line arguments, the temporary MCP config, logs, the audit log or error text.
   - If an entry is missing, only that system is unavailable. The tool replies (in Chinese) that the system is not configured because the Keychain has no usable <entry> (account <account>), asks the owner to add it, and includes a command template for adding it.
-- **`.env` deny-read**: turns that have the tool also get `--disallowedTools Read(<repo absolute path>/.env),Read(<repo absolute path>/.env.*)`.
+- **`.env` deny-read**: turns that have the tool also get `--disallowedTools Read(<repo absolute path>/.env),Read(<repo absolute path>/.env.*)`, and `Bash(security:*)` and `Bash(/usr/bin/security:*)` are denied as well.
+- **Child-process environment**: the MCP server starts through `/usr/bin/env -u …`, which drops `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS` and `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (lower-case too).
 - **Results** are wrapped whole in the untrusted-data fence, which states they are data, not instructions.
 - **Audit** (audit / strict): only the tool name, the target, GET and the category of the first path segment (`other` outside the allowlist) are recorded. Full paths and queries are not.
 - **Skill**: the bridge syncs `docs/skills/biz-readonly/` (an endpoint cheat sheet) into `workspace/.claude/skills/` as a reserved skill.
@@ -236,7 +238,8 @@ Hosts, path prefixes and Keychain entry names are hard-coded in `src/biz-targets
 
 **Known limitations**:
 
-- Like the Feishu MCP, the MCP server process inherits the claude CLI's environment variables.
+- Like the Feishu MCP, the MCP server process inherits the claude CLI's other environment variables.
+- Calling security through `env security`, `xcrun security`, or a python / node (or other interpreter) child process is not covered by the deny rules. Don't put bare Bash or interpreter prefixes in the allow rules.
 - Keychain reads only work on macOS. On other systems the key can't be read, so the tool only returns the missing-key message.
 
 ## 🗂️ Agent Workspace (OpenClaw / Hermes-style three-layer memory & skills)

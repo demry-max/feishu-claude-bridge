@@ -1,6 +1,9 @@
 // BRIDGE-BMS-1：把 biz_get（src/mcp-biz.js）接进 claude CLI 参数的零件。claude.js 只做最小接线，细节都在这里。
 // - mcp.json 里的 biz 条目不带任何 env：Key 由 MCP 子进程自己从钥匙串读，不经过 argv、env、临时文件。
-// - .env 拒读规则按仓库绝对路径写成 Read(//<abs>/.env)、Read(//<abs>/.env.*)（拒绝优先于任何允许）。
+// - .env 拒读规则按仓库绝对路径写成 Read(//<abs>/.env)、Read(//<abs>/.env.*)，另拒 Bash 直接调用 security
+//   （钥匙串条目对 /usr/bin/security 免提示；拒绝优先于任何允许）。
+// - biz 子进程经 /usr/bin/env -u 启动：去掉 NODE_OPTIONS、NODE_EXTRA_CA_CERTS 与各种 *_PROXY，免得改信任链或绕代理。
+// - 定时任务只有目的地是 owner 私聊时才挂 biz_get（schedDestOf / schedToOwnerDm），目的地未知按「不是」处理。
 // - 心跳档本来不挂任何 MCP：开关开时另写一份「只含 biz」的临时 mcp.json，cleanup 连目录一起删。
 // 本模块加载时没有副作用（不读环境变量、不碰文件系统）。
 import fs from 'node:fs';
@@ -15,15 +18,38 @@ export const BIZ_MCP_FILE = path.join(SRC_DIR, 'mcp-biz.js');
 export const BIZ_SKILL_SRC = path.join(REPO_DIR, 'docs', 'skills', BIZ_SKILL);
 const MCP_DIR_PREFIX = 'feishu-biz-mcp-';
 
-/** mcp.json 里的 biz 条目：固定的 node + 固定的脚本路径，env 为空。 */
+/** 启动 biz 子进程前从环境里去掉的变量：能改 TLS 信任链、走代理或往 node 里预加载代码的都去掉。 */
+export const BIZ_ENV_STRIP = Object.freeze([
+  'NODE_OPTIONS', 'NODE_EXTRA_CA_CERTS',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
+]);
+export const ENV_BIN = '/usr/bin/env';
+
+/** mcp.json 里的 biz 条目：/usr/bin/env -u <上面各变量> <node> <固定脚本>，env 为空。 */
 export function bizMcpServer() {
-  return { type: 'stdio', command: process.execPath, args: [BIZ_MCP_FILE], env: {} };
+  const unset = BIZ_ENV_STRIP.flatMap((k) => ['-u', k]);
+  return { type: 'stdio', command: ENV_BIN, args: [...unset, process.execPath, BIZ_MCP_FILE], env: {} };
 }
 
-/** 桥接仓库 .env 的拒读规则（绝对路径：// 开头）。 */
+/** 有工具的档一律拒绝经 Bash 直接调用 security（钥匙串条目对它免提示）。 */
+export const SECURITY_DENY = Object.freeze(['Bash(security:*)', 'Bash(/usr/bin/security:*)']);
+
+/** .env 拒读 + security 拒绝：.env 按仓库绝对路径（// 开头）。 */
 export function envDenyRules(repo = REPO_DIR) {
   const r = String(repo).replace(/^\/+/, '');
-  return [`Read(//${r}/.env)`, `Read(//${r}/.env.*)`];
+  return [`Read(//${r}/.env)`, `Read(//${r}/.env.*)`, ...SECURITY_DENY];
+}
+
+/** 定时任务的目的地：恰好是 owner 私聊时为 SCHED_DEST_OWNER_P2P；owner 私聊未知、目的地缺失或不同一律 'other'。 */
+export const SCHED_DEST_OWNER_P2P = 'owner-p2p';
+export function schedDestOf(destChatId, ownerDmChatId) {
+  const ok = typeof destChatId === 'string' && destChatId !== '' && destChatId === ownerDmChatId;
+  return ok ? SCHED_DEST_OWNER_P2P : 'other';
+}
+
+/** 定时这一轮能不能挂 biz_get：只认调用方显式带的 schedDest。 */
+export function schedToOwnerDm(opts) {
+  return opts?.schedDest === SCHED_DEST_OWNER_P2P;
 }
 
 /** 写一份只含 biz 的临时 mcp.json（0600，独立临时目录）；cleanup 删整个目录，可重复调用。 */
@@ -73,7 +99,7 @@ export const BIZ_HEARTBEAT_LINE =
 
 /**
  * 心跳参数加上 biz_get（只在开关开时由 claude.js 调用）：不改心跳档原有的构造，只在结果上做加法——
- *   --allowedTools 末尾加工具名；--disallowedTools 末尾加 .env 拒读；提示词末尾加一行；
+ *   --allowedTools 末尾加工具名；--disallowedTools 末尾加 .env 拒读与 security 拒绝；提示词末尾加一行；
  *   紧跟 --strict-mcp-config 插入 --mcp-config <只含 biz 的临时文件>；cleanup 先跑原来的，再删临时目录。
  */
 export function withBizHeartbeat(res, { deny = envDenyRules(), mcp = writeBizOnlyMcpConfig } = {}) {

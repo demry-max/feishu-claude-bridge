@@ -1,8 +1,9 @@
 // BRIDGE-BMS-1：BMS_TOOL_ENABLED 开 / 关时各条路径的 claude CLI 参数。
 // 对应卡片测试 11（工具面）、12（.env 拒读与白名单）、13（审计名的一部分）。
 // - 关：三档各 17 个用例与基线 419d56f 生成的夹具逐字一致。夹具从不在测试里重新生成，sha256 钉死。
-// - 开：只做加法。私聊、定时、心跳多一个 mcp__biz__biz_get、一组 .env 拒读、一份不带任何 env 的 biz MCP 条目；
-//   群聊（含 owner）、sched-diag、验收、交接、访客与关时逐字一致。
+// - 开：只做加法。私聊、发往 owner 私聊的定时、心跳多一个 mcp__biz__biz_get、一组 .env 拒读与 security 拒绝、
+//   一份不带任何 env 的 biz MCP 条目（经 /usr/bin/env -u 启动）；群聊（含 owner）、发往群或目的地缺失的定时、
+//   sched-diag、验收、交接、访客与关时逐字一致。
 // 全程用假 claude CLI；不碰钥匙串、不联网。
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CASES, PROFILES, makeHarness, runMatrix, snapCase } from './fixtures/biz-off-matrix.mjs';
 import { BIZ_TOOL, BIZ_SERVER, BIZ_SKILL } from '../src/biz-targets.js';
-import { BIZ_HEARTBEAT_LINE } from '../src/biz-wiring.js';
+import { BIZ_HEARTBEAT_LINE, SECURITY_DENY, BIZ_ENV_STRIP, ENV_BIN, SCHED_DEST_OWNER_P2P, schedDestOf } from '../src/biz-wiring.js';
 import { safeToolName } from '../src/tool-policy.js';
 
 const REPO = fs.realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
@@ -24,14 +25,25 @@ const FIXTURE = JSON.parse(fs.readFileSync(FIXTURE_FILE, 'utf8')).profiles;
 const h = makeHarness(REPO, 'biz-prof-');
 after(() => fs.rmSync(h.p.tmp, { recursive: true, force: true }));
 
-// 开关开时该有 biz_get 的用例 / 永远不该有的用例（两者合起来正好是全部 CASES）
+// 开关开时该有 biz_get 的用例 / 永远不该有的用例（两者合起来正好是全部 CASES）。
+// CASES 里的三个定时用例不带 schedDest（＝目的地未知），开关开也不给；带上 owner 私聊目的地的版本见 SCHED 与 callOf。
 const ELIGIBLE = ['ownerP2p', 'ownerP2pFresh', 'ownerP2pConfirm', 'ownerP2pAllowed', 'ownerP2pNoFeishu', 'ownerP2pFile',
-  'ownerExec', 'sched', 'schedPlain', 'schedNoFeishu', 'heartbeat'];
-const NEVER = ['ownerNoChatType', 'ownerGroup', 'schedDiag', 'verifier', 'guest', 'guestFile'];
+  'ownerExec', 'heartbeat'];
+const SCHED = ['sched', 'schedPlain', 'schedNoFeishu'];
+const NEVER = ['ownerNoChatType', 'ownerGroup', ...SCHED, 'schedDiag', 'verifier', 'guest', 'guestFile'];
 
-const RAW_DENY = [`Read(//${REPO.replace(/^\/+/, '')}/.env)`, `Read(//${REPO.replace(/^\/+/, '')}/.env.*)`];
-const DENY = ['Read(/<repo>/.env)', 'Read(/<repo>/.env.*)']; // 归一化之后（仓库路径换成 <repo>）
-const BIZ_ENTRY = { type: 'stdio', command: '<node>', args: ['<repo>/src/mcp-biz.js'], env: {} };
+/** CASES 的调用参数；定时用例可指定目的地（dest 为 undefined 时原样）。 */
+function callOf(name, dest = SCHED.includes(name) ? SCHED_DEST_OWNER_P2P : undefined) {
+  const c = structuredClone(CASES[name].call);
+  if (dest === undefined) return c;
+  if (c.length < 4) c[3] = {};
+  c[3] = { ...c[3], schedDest: dest };
+  return c;
+}
+
+const RAW_DENY = [`Read(//${REPO.replace(/^\/+/, '')}/.env)`, `Read(//${REPO.replace(/^\/+/, '')}/.env.*)`, 'Bash(security:*)', 'Bash(/usr/bin/security:*)'];
+const DENY = ['Read(/<repo>/.env)', 'Read(/<repo>/.env.*)', 'Bash(security:*)', 'Bash(/usr/bin/security:*)']; // 归一化之后（仓库路径换成 <repo>）
+const BIZ_ENTRY = { type: 'stdio', command: '/usr/bin/env', args: [...BIZ_ENV_STRIP.flatMap((k) => ['-u', k]), '<node>', '<repo>/src/mcp-biz.js'], env: {} };
 const BIZ_ONLY = { text: JSON.stringify({ mcpServers: { [BIZ_SERVER]: BIZ_ENTRY } }), mode: 0o600 };
 
 // 环境里就算有像 Key 的变量，也不许被抄进参数或 mcp.json
@@ -117,7 +129,7 @@ test('11 只有恰好 "1" 才算开：空串 / true / yes / 前后空格 / 01 / 
   }
 });
 
-test('11 开关开：私聊 / 定时 / 心跳只做加法；群聊（含 owner）、sched-diag、验收、访客与关时逐字一致；参数与 mcp.json 里没有 Key', async () => {
+test('11 开关开：私聊 / 心跳只做加法；群聊（含 owner）、目的地缺失的定时、sched-diag、验收、访客与关时逐字一致；参数与 mcp.json 里没有 Key', async () => {
   const on = await onMatrix();
   for (const pname of Object.keys(PROFILES)) {
     for (const name of ELIGIBLE) assert.deepEqual(on[pname][name], expectOn(pname, name, FIXTURE[pname][name]), `${pname}/${name}`);
@@ -137,12 +149,13 @@ test('11 开关开 + 显式 ALLOWED_TOOLS（生产就是这样配的）：三档
   }
 });
 
-test('12 开关开：legacy / audit / strict 对话 / strict 定时与心跳都带 Read(//<仓库绝对路径>/.env) 拒读；参数里没有 Key、没有 security', async () => {
+test('12 开关开：legacy / audit / strict 对话 / strict 定时与心跳都带 .env 拒读与 security 拒绝；白名单与 mcp.json 里没有 Key、没有 security', async () => {
+  assert.deepEqual([...SECURITY_DENY], ['Bash(security:*)', 'Bash(/usr/bin/security:*)']);
   for (const [pname, profile] of Object.entries(PROFILES)) {
     const m = await h.load({ LARK_CLI: 'true', OWNER_TOOL_PROFILE: profile, BMS_TOOL_ENABLED: '1' });
     for (const name of ['ownerP2p', 'ownerP2pConfirm', 'sched', 'schedPlain', 'heartbeat']) {
       const tag = `${pname}/${name}`;
-      const r = m.buildClaudeArgs(...structuredClone(CASES[name].call));
+      const r = m.buildClaudeArgs(...callOf(name));
       try {
         const a = r.args;
         assert.equal(count(a, '--allowedTools'), 1, tag);
@@ -150,17 +163,59 @@ test('12 开关开：legacy / audit / strict 对话 / strict 定时与心跳都�
         assert.equal(count(a, '--mcp-config'), 1, tag);
         assert.ok(flag(a, '--allowedTools').split(',').includes(BIZ_TOOL), tag);
         const deny = flag(a, '--disallowedTools').split(',');
-        if (profile === 'strict' || name === 'heartbeat') assert.deepEqual(deny.slice(-2), RAW_DENY, `${tag}：追加在原拒绝表末尾`);
+        for (const rule of ['Bash(security:*)', 'Bash(/usr/bin/security:*)']) assert.ok(deny.includes(rule), `${tag}：拒绝表缺 ${rule}`);
+        if (profile === 'strict' || name === 'heartbeat') assert.deepEqual(deny.slice(-RAW_DENY.length), RAW_DENY, `${tag}：追加在原拒绝表末尾`);
         else assert.deepEqual(deny, RAW_DENY, tag);
         if (name === 'heartbeat') assert.equal(a[a.indexOf('--strict-mcp-config') + 1], '--mcp-config', tag);
         else assert.equal(a.at(-2), '--mcp-config', `${tag}：--mcp-config 仍是最后两个参数`);
-        const text = `${a.join('\n')}\n${fs.readFileSync(flag(a, '--mcp-config'), 'utf8')}`;
+        const text = `${a.filter((x, i) => a[i - 1] !== '--disallowedTools').join('\n')}\n${fs.readFileSync(flag(a, '--mcp-config'), 'utf8')}`;
         assert.doesNotMatch(text, /bms_sk_|acc_[A-Za-z0-9]{8}|find-generic-password|\/usr\/bin\/security|Bash\(security/, tag);
       } finally {
         r.cleanup();
       }
     }
   }
+});
+
+test('12 开关开 + ALLOWED_TOOLS=Read,Bash：legacy / audit 私聊白名单里有裸 Bash 时，拒绝表里仍有两条 security 拒绝', async () => {
+  for (const profile of [undefined, 'audit']) {
+    const m = await h.load({ OWNER_TOOL_PROFILE: profile, BMS_TOOL_ENABLED: '1', ALLOWED_TOOLS: 'Read,Bash' });
+    const r = m.buildClaudeArgs('oc_x', true, [], { lane: 'chat', chatType: 'p2p' });
+    try {
+      const allowed = flag(r.args, '--allowedTools').split(',');
+      assert.ok(allowed.includes('Bash') && allowed.includes(BIZ_TOOL), `${profile}：${allowed}`);
+      assert.equal(count(r.args, '--disallowedTools'), 1, String(profile));
+      const deny = flag(r.args, '--disallowedTools').split(',');
+      for (const rule of ['Bash(security:*)', 'Bash(/usr/bin/security:*)']) assert.ok(deny.includes(rule), `${profile}：拒绝表缺 ${rule}`);
+    } finally {
+      r.cleanup();
+    }
+  }
+});
+
+test('11 定时任务按目的地：发往 owner 私聊才有 biz_get（只做加法）；发往群 / 别的会话、目的地缺失或写法不对都与关时逐字一致', async () => {
+  assert.equal(schedDestOf('oc_owner', 'oc_owner'), SCHED_DEST_OWNER_P2P);
+  for (const [d, o] of [['oc_group', 'oc_owner'], ['oc_owner', null], ['oc_owner', undefined], [undefined, undefined], ['', ''], [null, null]]) {
+    assert.equal(schedDestOf(d, o), 'other', `${d} / ${o}`);
+  }
+  for (const [pname, profile] of Object.entries(PROFILES)) {
+    for (const name of SCHED) {
+      const m = await h.load({ ...CASES[name].env, OWNER_TOOL_PROFILE: profile, BMS_TOOL_ENABLED: '1' });
+      const snap = (dest) => snapCase(m.buildClaudeArgs(...callOf(name, dest)), h.norm);
+      assert.deepEqual(snap(SCHED_DEST_OWNER_P2P), expectOn(pname, name, FIXTURE[pname][name]), `${pname}/${name} 发往 owner 私聊`);
+      assert.deepEqual(snap(schedDestOf('oc_group', 'oc_owner')), FIXTURE[pname][name], `${pname}/${name} 发往群`);
+      assert.deepEqual(snapCase(m.buildClaudeArgs(...structuredClone(CASES[name].call)), h.norm), FIXTURE[pname][name], `${pname}/${name} 目的地缺失`);
+      for (const bad of ['p2p', 'owner', 'OWNER-P2P', true, 1]) {
+        assert.deepEqual(snap(bad), FIXTURE[pname][name], `${pname}/${name} schedDest=${JSON.stringify(bad)}`);
+      }
+    }
+  }
+  // index.js 接线（源码断言，只证明写法）：owner 私聊的 chat_id 只在 owner 私聊消息里记下；定时把它和目的地交给 schedDestOf
+  const src = fs.readFileSync(path.join(REPO, 'src', 'index.js'), 'utf8');
+  assert.match(src, /\n {2}if \(isOwner && message\.chat_type === 'p2p'\) ownerDmChatId = message\.chat_id;\n/);
+  assert.equal(src.match(/ownerDmChatId =/g).length, 2, '只有声明与上面那一处赋值');
+  assert.match(src, /\{ \.\.\.schedOpts, schedDest: schedDestOf\(chatId, ownerDmChatId\) \}/);
+  assert.equal(src.match(/schedDest:/g).length, 1, 'schedDest 只在定时那一处传');
 });
 
 test('12 任何档、开或关：免询问白名单里没有 Bash(security / Bash(env / Bash(printenv / Bash(ps，也没有裸 Bash', async () => {
@@ -193,7 +248,7 @@ test('11 开关开：心跳与 FEISHU_TOOLS=false 时另写只含 biz 的临时 
     for (const name of ['heartbeat', 'ownerP2pNoFeishu', 'schedNoFeishu', 'ownerP2p', 'sched']) {
       const tag = `${pname}/${name}`;
       const m = await h.load({ ...CASES[name].env, OWNER_TOOL_PROFILE: profile, BMS_TOOL_ENABLED: '1' });
-      const r = m.buildClaudeArgs(...structuredClone(CASES[name].call));
+      const r = m.buildClaudeArgs(...callOf(name));
       const file = flag(r.args, '--mcp-config');
       const dir = path.dirname(file);
       try {
@@ -205,9 +260,10 @@ test('11 开关开：心跳与 FEISHU_TOOLS=false 时另写只含 biz 的临时 
         const biz = servers[BIZ_SERVER];
         assert.deepEqual(Object.keys(biz), ['type', 'command', 'args', 'env'], tag);
         assert.equal(biz.type, 'stdio');
-        assert.equal(biz.command, process.execPath);
-        assert.equal(biz.args.length, 1);
-        assert.equal(fs.realpathSync(biz.args[0]), MCP_FILE);
+        assert.equal(biz.command, ENV_BIN);
+        assert.deepEqual(biz.args.slice(0, -2), BIZ_ENV_STRIP.flatMap((k) => ['-u', k]), `${tag}：先去掉那几个变量`);
+        assert.equal(biz.args.at(-2), process.execPath);
+        assert.equal(fs.realpathSync(biz.args.at(-1)), MCP_FILE);
         assert.deepEqual(biz.env, {}, `${tag}：biz 条目不带任何 env`);
       } finally {
         r.cleanup();

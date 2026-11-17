@@ -170,6 +170,24 @@ describe('biz-targets：query 与 URL（卡片测试 2 / 5）', () => {
     assert.equal(u.searchParams.get('q'), 'a&b=c#d/../@evil.example:443?x');
     assert.deepEqual([...u.searchParams.keys()], ['q', 'name']);
   });
+  test('最后一道断言 urlIsSane：他域 origin、带 userinfo、带 hash、pathname 不等都返回 false；buildBizUrl 用的就是它', () => {
+    for (const id of T.TARGET_IDS) {
+      const t = T.TARGETS[id];
+      const full = `${t.prefix}/tickets`;
+      assert.equal(T.urlIsSane(new URL(`${t.origin}${full}?q=1`), t, full), true, id);
+      const bad = {
+        otherOrigin: new URL(`https://evil.example${full}`),
+        otherPort: new URL(`${t.origin}:8443${full}`),
+        userinfo: new URL(`${t.origin.replace('https://', 'https://u:p@')}${full}`),
+        userOnly: new URL(`${t.origin.replace('https://', 'https://u@')}${full}`),
+        hash: new URL(`${t.origin}${full}#frag`),
+        pathname: new URL(`${t.origin}${full}/x`),
+        pathCase: new URL(`${t.origin}${full.toUpperCase()}`),
+      };
+      for (const [name, u] of Object.entries(bad)) assert.equal(T.urlIsSane(u, t, full), false, `${id}/${name}`);
+    }
+    assert.match(SRC, /const sane = \(\) => urlIsSane\(u, t, full\);/);
+  });
 });
 
 describe('biz-targets：脱敏与输出（卡片测试 6 / 8 的纯函数部分）', () => {

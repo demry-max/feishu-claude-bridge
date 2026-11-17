@@ -746,13 +746,13 @@ export { detectConfirm } from './tool-policy.js';
 export { startToolAuditSummary } from './tool-audit.js';
 
 // ---------------- BRIDGE-BMS-1：业务系统只读查询工具 biz_get（默认关闭） ----------------
-// 只有 BMS_TOOL_ENABLED=1 才开（模块加载时读一次）。开时 owner 私聊、owner 定时任务（含 strict 只读定时）、心跳挂上
-// mcp__biz__biz_get，并给这些档加 .env 拒读（Read(//<仓库>/.env)、Read(//<仓库>/.env.*)）；群里的 owner 轮次、访客、
-// sched-diag、验收一律不给。关时所有档的 argv 与基线逐字一致。主机、钥匙串条目、请求逻辑在 biz-targets.js / mcp-biz.js。
+// 只有 BMS_TOOL_ENABLED=1 才开（模块加载时读一次）。开时 owner 私聊、发往 owner 私聊的定时任务（含 strict 只读定时）、心跳挂上
+// mcp__biz__biz_get，并给这些档加 .env 拒读（Read(//<仓库>/.env)、Read(//<仓库>/.env.*)）与 security 拒绝；群里的 owner 轮次、
+// 发往群或目的地未知的定时任务、访客、sched-diag、验收一律不给。关时所有档的 argv 与基线逐字一致。主机、钥匙串条目、请求逻辑在 biz-targets.js / mcp-biz.js。
 import { BIZ_SERVER, BIZ_TOOL, BIZ_SKILL } from './biz-targets.js';
-import { bizMcpServer, envDenyRules, writeBizOnlyMcpConfig, installBizSkill, withBizHeartbeat } from './biz-wiring.js';
+import { bizMcpServer, envDenyRules, writeBizOnlyMcpConfig, installBizSkill, withBizHeartbeat, schedToOwnerDm } from './biz-wiring.js';
 const BIZ_ON = process.env.BMS_TOOL_ENABLED === '1';
-const BIZ_ENV_DENY = BIZ_ON ? envDenyRules(path.resolve(__dirname, '..')) : [];
+const BIZ_ENV_DENY = BIZ_ON ? envDenyRules(path.resolve(__dirname, '..')) : []; // .env 拒读 + 拒绝 Bash 直接调用 security
 const BIZ_GRANT = Symbol('biz-grant'); // buildOwnerProfileArgs 把判定结果交给递归的基线构造（定时档的 opts 只剩 model/effort）
 
 /** 这一轮挂不挂 biz_get。owner 私聊靠 opts.chatType 认出来（由下面的 createToolTurn 包装带进来）。 */
@@ -762,9 +762,10 @@ function bizGranted(chatId, isOwner, opts = {}) {
   const id = String(chatId);
   const tp = opts?.toolProfile;
   if (id.startsWith('sched-diag:')) return false;
-  if (tp === 'heartbeat' || tp === 'sched') return true;
+  if (tp === 'heartbeat') return true;
+  if (tp === 'sched') return schedToOwnerDm(opts); // 定时：只有结果发往 owner 私聊时才给（index.js 带 schedDest）
   if (tp != null) return false; // 验收（verifier）、交接（handoff）等其余档一律不给
-  if (id.startsWith('sched:')) return true;
+  if (id.startsWith('sched:')) return schedToOwnerDm(opts);
   return opts?.chatType === 'p2p';
 }
 

@@ -158,13 +158,18 @@ export function bizQueryPairs(target, query) {
   return out;
 }
 
-/** 拼 URL：new URL 之后再断言 origin 与 pathname 逐字等于预期，不带 userinfo / hash。 */
+/** 最后一道断言（纯函数）：u 的 origin 与 pathname 逐字等于预期，不带 userinfo / hash。 */
+export function urlIsSane(u, t, full) {
+  return u.origin === t.origin && u.pathname === full && !u.username && !u.password && !u.hash;
+}
+
+/** 拼 URL：new URL 之后再用 urlIsSane 断言（拼 query 前后各一次）。 */
 export function buildBizUrl(target, p, query) {
   const t = targetOf(target);
   const full = normalizeBizPath(target, p);
   const pairs = bizQueryPairs(target, query);
   const u = new URL(full, `${t.origin}/`);
-  const sane = () => u.origin === t.origin && u.pathname === full && !u.username && !u.password && !u.hash;
+  const sane = () => urlIsSane(u, t, full);
   if (!sane() || u.search) throw bad('path 无法安全拼成 URL');
   for (const [k, v] of pairs) u.searchParams.append(k, v);
   if (!sane()) throw bad('path 无法安全拼成 URL');

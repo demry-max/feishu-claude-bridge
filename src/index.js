@@ -16,6 +16,7 @@ import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
 import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
+import { schedDestOf } from './biz-wiring.js';
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -109,6 +110,8 @@ const ALLOW_USERS = parseList(process.env.ALLOW_USERS); // open_id 白名单
 const ALLOW_CHATS = parseList(process.env.ALLOW_CHATS); // chat_id 白名单（群）
 // owner 身份的权威来源：配了它，owner.json 丢失/损坏也能直接恢复，无需认领流程
 const OWNER_OPEN_ID = (process.env.OWNER_OPEN_ID ?? '').trim();
+// owner 私聊的 chat_id：只记在内存（owner 在私聊发过消息才知道，重启后未知）；定时任务据此判断结果是否发往 owner 私聊
+let ownerDmChatId = null;
 const voiceChats = new Set(); // 开启语音回复的会话
 
 function isAllowed(openId, chatId, isP2p) {
@@ -298,6 +301,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
     return;
   }
   const isOwner = senderOpenId === owner;
+  if (isOwner && message.chat_type === 'p2p') ownerDmChatId = message.chat_id;
 
   // 会话键必须区分身份：群里 owner 与访客共用一个 chat_id，但现在两者的 cwd 不同
   // （workspace vs workspace-guest）。若共用同一个 session，访客一次 --resume 就能
@@ -779,6 +783,8 @@ startScheduler({
     }
     // 定时任务用独立会话上下文，避免污染用户正在进行的对话
     const schedChatId = `sched:${job._file}`;
+    // 任务可自带档位，未指定则用全局配置；工具档固定为定时（BRIDGE-PERM-1）
+    const schedOpts = { model: job.model, effort: job.effort, toolProfile: 'sched' };
     try {
       const answer = await runClaude(
         schedChatId,
@@ -786,7 +792,7 @@ startScheduler({
         true,
         [],
         (p) => sendToChat(chatId, `⏳ ${p}`),
-        { model: job.model, effort: job.effort, toolProfile: 'sched' } // 任务可自带档位，未指定则用全局配置；工具档固定为定时（BRIDGE-PERM-1）
+        { ...schedOpts, schedDest: schedDestOf(chatId, ownerDmChatId) } // schedDest 只决定 biz_get 挂不挂：目的地恰好是 owner 私聊才挂
       );
       const late = job._late ? `（迟到补跑 ${Math.round(job._late / 60000)} 分钟）` : '';
       // 无事不报：答案整条就是 HEARTBEAT_OK（或为空）时静默跳过，

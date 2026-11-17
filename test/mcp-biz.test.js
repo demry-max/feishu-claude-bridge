@@ -14,13 +14,15 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { createBizHandler, createBmsHandler, createBizServer, readKeychainKey, INPUT_SCHEMA, TOOL_DESCRIPTION } from '../src/mcp-biz.js';
 import { missingKeyText, BIZ_TOOL } from '../src/biz-targets.js';
 import { createToolRecorder, formatReceipt } from '../src/tool-audit.js';
+import { bizMcpServer, BIZ_ENV_STRIP, ENV_BIN } from '../src/biz-wiring.js';
+import { spawnSync } from 'node:child_process';
 
 const MCP_FILE = fileURLToPath(new URL('../src/mcp-biz.js', import.meta.url));
 const SRC = fs.readFileSync(MCP_FILE, 'utf8');
 const KEY = 'bms_sk_ZZTESTMARK_0123456789abcdef';
 const IAS_KEY = `acc_ZZTESTMARK${'A'.repeat(33)}`;
 const MARK = /ZZTESTMARK/;
-const LOG_LINE = /^\[biz\] (bms|ias|-) (keychain-miss|http-\d{3}|timeout|too-large|network|redirect|rate-limit|tls-insecure|invalid)$/;
+const LOG_LINE = /^\[biz\] (bms|ias|-) (keychain-miss|http-\d{3}|timeout|too-large|network|redirect|rate-limit|tls-insecure|invalid|internal)$/;
 const FENCE = /^<<<UNTRUSTED_([0-9a-f]{16}) 来源：[^\n]*>>>\n[\s\S]*\n---UNTRUSTED_END_\1---$/;
 
 const json = (status, body, headers = {}) => new Response(JSON.stringify(body), {
@@ -266,7 +268,8 @@ describe('mcp-biz：穿越 / 注入经 handler 也是 0 次请求（卡片测试
 });
 
 describe('mcp-biz：Key 不出现在任何输出里（卡片测试 6）', () => {
-  const huge = () => new Response(new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(256 * 1024).fill(0x61)); } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  // 有限流（5 × 256 KiB 后 close）：去掉 1 MiB 上限时用例以断言失败告终，而不是挂起
+  const huge = () => { let n = 0; return new Response(new ReadableStream({ pull(c) { if (n++ < 5) c.enqueue(new Uint8Array(256 * 1024).fill(0x61)); else c.close(); } }), { status: 200, headers: { 'content-type': 'application/json' } }); };
   const situations = {
     success: () => json(200, { data: [{ id: 1, owner: 'a' }] }, { 'x-request-id': 'rid-ok' }),
     unauthorized: () => json(401, { error: { code: 'UNAUTHORIZED', message: `bad key ${KEY}` } }, { 'x-request-id': `rid-${KEY}` }),
@@ -291,6 +294,19 @@ describe('mcp-biz：Key 不出现在任何输出里（卡片测试 6）', () => 
       assert.equal(s.calls.length, 1);
     });
   }
+
+  test('内部错误（走到最外层 catch）：固定文案、在围栏里、stderr 只有一行 [biz] bms internal，不带异常原文', async () => {
+    const boom = () => { throw new Error(`ZZTESTMARK at /Users/someone/secret/path ${KEY}`); };
+    const s = setup({ now: boom, log: undefined }); // log 用默认值：直接写 process.stderr
+    const { value: r, seen } = await captureStd(() => s.handler({ target: 'bms', path: '/tickets', query: { q: 'x' } }));
+    assert.equal(r.isError, true);
+    assert.equal(inner(r), '查询没有完成（内部错误），请稍后再试。');
+    assert.deepEqual(seen, ['[biz] bms internal\n']);
+    for (const l of seen) assert.match(l.trimEnd(), LOG_LINE);
+    assert.doesNotMatch(`${r.content[0].text}\n${seen.join('')}`, /ZZTESTMARK|\/Users\/someone/);
+    assert.equal(s.calls.length, 0);
+    assert.deepEqual(s.keyReads, []);
+  });
 
   test('审计记录与回执里没有 Key、没有 query；biz_get 记为 allow 且只记 target / 类别 / get', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'biz-audit-'));
@@ -421,10 +437,16 @@ describe('mcp-biz：超时 / 过大 / 截断 / 非 JSON（卡片测试 8）', ()
     const s = setup({
       respond: (u, init) => {
         signal = init.signal;
+        // 有限流：16 块 64 KiB（正好 1 MiB）再 1 字节，然后 close——去掉上限时以断言失败告终，不会挂起
         return new Response(new ReadableStream({
-          pull(c) { pulls += 1; c.enqueue(new Uint8Array(64 * 1024).fill(0x61)); },
+          pull(c) {
+            pulls += 1;
+            if (pulls <= 16) c.enqueue(new Uint8Array(64 * 1024).fill(0x61));
+            else if (pulls === 17) c.enqueue(new Uint8Array(1).fill(0x61));
+            else c.close();
+          },
           cancel() { cancelled = true; },
-        }), { status: 200, headers: { 'content-type': 'application/json' } });
+        }, { highWaterMark: 0 }), { status: 200, headers: { 'content-type': 'application/json' } }); // 按需 pull：超限时流还没 close，取消可观察
       },
     });
     const r = await s.handler({ target: 'bms', path: '/tickets' });
@@ -515,6 +537,42 @@ describe('mcp-biz：限流（卡片测试 10）', () => {
 });
 
 describe('mcp-biz：stdio 子进程', () => {
+  test('biz 条目经 /usr/bin/env -u 启动：NODE_OPTIONS、NODE_EXTRA_CA_CERTS、*_PROXY（含小写）进不了子进程，其余变量照常', async () => {
+    const s = bizMcpServer();
+    assert.equal(s.command, ENV_BIN);
+    assert.deepEqual(s.env, {});
+    assert.equal(fs.realpathSync(s.args.at(-1)), MCP_FILE);
+    assert.equal(s.args.at(-2), process.execPath);
+    const want = ['NODE_OPTIONS', 'NODE_EXTRA_CA_CERTS', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
+    assert.deepEqual([...BIZ_ENV_STRIP].sort(), [...want].sort());
+    assert.deepEqual(s.args.slice(0, -2), BIZ_ENV_STRIP.flatMap((k) => ['-u', k]));
+    // 实跑：同一条命令行，只把脚本换成打印 env 的一行代码
+    const dirty = {
+      PATH: '/usr/bin:/bin', HOME: os.tmpdir(), KEEP_ME: 'kept',
+      NODE_OPTIONS: '--no-deprecation', NODE_EXTRA_CA_CERTS: '/nonexistent/zz-ca.pem',
+      HTTP_PROXY: 'http://127.0.0.1:9', HTTPS_PROXY: 'http://127.0.0.1:9', ALL_PROXY: 'socks5://127.0.0.1:9',
+      http_proxy: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', all_proxy: 'socks5://127.0.0.1:9',
+    };
+    const out = spawnSync(s.command, [...s.args.slice(0, -1), '-e', 'process.stdout.write(JSON.stringify(process.env))'], { env: dirty, encoding: 'utf8', timeout: 20_000 });
+    assert.equal(out.status, 0, out.stderr);
+    const env = JSON.parse(out.stdout);
+    for (const k of want) assert.equal(Object.hasOwn(env, k), false, `${k} 进了子进程`);
+    assert.equal(env.KEEP_ME, 'kept');
+    // 整条命令行（含真脚本）在脏 env 下照样能起来并列出 biz_get
+    const transport = new StdioClientTransport({ command: s.command, args: s.args, env: dirty, stderr: 'pipe', cwd: os.tmpdir() });
+    let err = '';
+    transport.stderr.on('data', (c) => { err += String(c); });
+    const client = new Client({ name: 't', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      assert.deepEqual((await client.listTools()).tools.map((t) => t.name), ['biz_get']);
+    } finally {
+      await client.close();
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(err, 'mcp-biz: ready\n');
+  });
+
   test('node src/mcp-biz.js 能起来并列出 biz_get；stderr 只有固定的就绪行（不调用工具，不碰钥匙串）', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'biz-mcp-home-'));
     const transport = new StdioClientTransport({
