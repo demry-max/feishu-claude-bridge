@@ -210,12 +210,14 @@
   黑名单在心跳的基础上再点名 Bash / 联网 / 飞书与 schedules、skills、outbox、CLAUDE.md、`.claude`；`--setting-sources ''`、`--strict-mcp-config`；不受任何 owner 工具配置影响；没有 resumeId 直接抛错。
   `runClaude` 新增 `persistSession:false`（交接轮的结果 id 不写回）；新增 `getSessionId` / `restoreSession`（回退用，不动代际计数）。
 - **切换规则**：AT 之后第一条消息换新；第一次见到的会话先接管不换；「确认」、排队出队的单条、带「确认」的合并轮永远不在当轮换（判定对原 prompt 做，不复用排队轮里被强制成不放行的确认结果）；
-  裸 `/do`、`/redirect` 推迟、连续第 3 条强制换。切换那轮删掉已拼上的固化提醒；新会话首轮没输出就失败自动退回原会话。
+  裸 `/do`、`/redirect` 推迟、连续第 3 条强制换。切换那轮删掉已拼上的固化提醒；新会话首轮确定没动过手（`producedOutput === false`）就失败才自动退回原会话，已有输出或说不清的不退回、不叫重发；
+  换新那轮结束后还没有新会话 id，下一条重带接续材料。`runClaude` 的取消、超时、启动失败三种错误也带上 `producedOutput`（重试判定不变）。
+- **接续材料**：交接摘要与 journal 也放进与原话同一 nonce 的不可信围栏；新会话首条回复与 `/session` 列出交接改了哪几个文件（最多 5 个，状态里只存路径、最多 20 条）。
 - **命令**：`/session [status|back|auto|rotate]`（只在 owner 私聊；群里不回复）；`/status` 末尾多一行（off 时不加）；`/new` 在非 off 时把被清的会话记进可退回列表。HELP 加一行。
 - **预交接定时器**：照日结的 arm / tick 写法，排进 owner 会话同一个队列（和对话串行、计入优雅退出的在途数），硬超时 5 分钟取消；进入优雅退出后不再开始新的交接；重启时把 `running` 记为 `failed`。
 - **启动自检**：显式配置 `ALLOWED_TOOLS` 且缺默认 owner 工具里的 `Edit(./…/**)` 写入项时，打一行 `[config] ⚠️` 列出缺的项名（不打整行配置、不改权限）。
 - **回放对比脚本** `scripts/daily-session-replay.js`（只读两臂、盲评、产物只写 `--out`、`--dry-run` 只打 argv）与占位题目 `scripts/daily-session-replay.questions.example.txt`。
-- **提示词**：新增 `docs/ds-prompt-proposal.md`；种子文件 `workspace/CLAUDE.md` 按条件式写法加「接续材料」「交接轮」两节并改写「新写入的记忆当天写全」一句。README 中英、AGENTS.md 可选功能表补一行。
+- **提示词**：新增 `docs/ds-prompt-proposal.md`（「接续材料」「交接轮」两节与「新写入的记忆当天写全」一句）；本版不改 `workspace/CLAUDE.md`，把 `DAILY_SESSION` 改成 `on` 的当天再并入。README 中英、AGENTS.md 可选功能表补一行。
 - 测试：新增 `test/daily-session.test.js`、`test/daily-session-replay.test.js`；既有测试与夹具一条未改。
 
 ## [2.3.0] - 2026-09-14

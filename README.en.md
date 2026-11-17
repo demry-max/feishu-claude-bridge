@@ -397,10 +397,12 @@ Group chats, guests, scheduled tasks, heartbeat, verification and digest are una
   read the workspace, write only `memory/` and `tasks/`, no Bash, web or Feishu tools, unaffected by `OWNER_TOOL_PROFILE` / `ALLOWED_TOOLS` / `LARK_CLI`; its answer is sent to no one; hard timeout 5 minutes.
   The handoff runs in the owner session's own queue, so it never overlaps a conversation turn; messages sent meanwhile wait behind it instead of getting "the previous task is still running".
 - **Rotation**: the first message after `DAILY_SESSION_AT` starts a new session, prefixed with carry-over material: an intro (drafts from the old session are void — anything to execute must be re-drafted and confirmed again), the handoff summary, the two most recent journals (last 6000 characters each),
-  and the last N rounds (inside an untrusted fence), 20,000 characters at most. The first reply in the new session ends with one line: "(new session from today; last night's handoff: …; `/session back` to go back)".
+  and the last N rounds (the summary and journals, and the rounds, each inside an untrusted fence), 20,000 characters at most. The first reply in the new session ends with one line: "(new session from today; last night's handoff: updated N memory / ledger files: …; `/session back` to go back)", naming the files the handoff changed (up to 5).
+  If no new session id was recorded by the end of that turn (disconnect, killed process), the next message carries the material again.
 - **Turns that don't rotate**: a "确认" (confirm) turn — it would let an old draft run in the new session — a single message released from the busy queue, and a merged turn containing a confirm never rotate on that turn; the next message does.
   A bare `/do` or `/redirect` is deferred, and the third consecutive deferral forces the rotation. A session that already exists when the switch is first turned on is adopted as-is and rotates at the next cut-over.
-- **Fallback**: if the first turn of the new session fails before producing any output, the bridge restores the old session and says so in the reply; a failure after output was produced does not roll back.
+- **Fallback**: if the first turn of the new session fails while it is certain nothing was done yet (the process didn't start, or it timed out / was cancelled / exited before any output), the bridge restores the old session and says so in the reply;
+  a failure after output was produced (tools may already have run), or where that can't be told, does not roll back and doesn't ask you to resend.
 - **Commands** (owner DM only; ignored in groups): `/session` status; `/session back` restore the previous session and pause daily rotation; `/session auto` resume; `/session rotate` hand off now and rotate on the next message.
   `/new` is unchanged (no handoff, no carry-over); when the switch isn't `off`, the cleared session is also kept in the list you can go back to.
 - **Data**: state, the last 30 rounds and handoff summaries live in `data/daily-session/`; the format of `data/sessions.json` is unchanged. Rounds are redacted for credentials before being written; logs contain lengths, counts and file names only, never message text.
@@ -447,7 +449,7 @@ For those, use Feishu's official [lark-cli](https://github.com/larksuite/cli) (2
 | [`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md) | how to fill `watch`, how to relay external content, actions on heartbeat messages | merge the previous one first |
 | [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md) | the `verify` status and `done_evidence`, escalation ladder, digest | merge the previous two first |
 | [`docs/owner-tools-prompt-proposal.md`](docs/owner-tools-prompt-proposal.md) | tool description fixes, usage under the audit / strict profiles | when switching tool profiles |
-| [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) | daily fresh session: reading the carry-over, void drafts, the handoff turn (the seed file already has a conditional version) | when setting `DAILY_SESSION=on` |
+| [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) | daily fresh session: reading the carry-over, void drafts, the handoff turn (the repo's `workspace/CLAUDE.md` is unchanged) | when setting `DAILY_SESSION=on` |
 
 ## Architecture
 

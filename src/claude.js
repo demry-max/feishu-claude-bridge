@@ -1313,7 +1313,9 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       cleanup(); // 凭据临时文件
       clearInterval(timer);
       running.delete(chatId);
-      reject(new Error(`claude CLI 启动失败: ${e.message}`));
+      const err = new Error(`claude CLI 启动失败: ${e.message}`);
+      err.producedOutput = false; // 进程没起来，什么都没做
+      reject(err);
     });
     // CLI 启动后立刻退出（损坏的 --resume 会话、盘不可读）时写 stdin 会抛 EPIPE，
     // 无监听器会直接冒泡成 uncaughtException 打死整个桥接进程
@@ -1327,9 +1329,14 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       if (child.__cancelled) {
         const err = new Error('CANCELLED');
         err.cancelled = true;
+        err.producedOutput = producedOutput; // 取消前是否已动过手（每日新会话据此决定能否退回旧会话）
         return reject(err);
       }
-      if (timedOut) return reject(new Error(`claude CLI 超时（${timedOut}）`));
+      if (timedOut) {
+        const err = new Error(`claude CLI 超时（${timedOut}）`);
+        err.producedOutput = producedOutput;
+        return reject(err);
+      }
       // 标记「本次是否已经动过手」——重试层据此决定能否安全重放
       const mark = (err) => {
         err.producedOutput = producedOutput;

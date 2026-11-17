@@ -396,10 +396,12 @@ owner 私聊一直 `--resume` 同一条会话，越聊越长、每条都慢。�
   只能读工作区、只能写 `memory/` 与 `tasks/`，没有 Bash、联网和飞书工具，不受 `OWNER_TOOL_PROFILE` / `ALLOWED_TOOLS` / `LARK_CLI` 影响；回答不发给任何人，硬超时 5 分钟。
   交接排在 owner 会话同一条队列里，和对话不会并发；这期间发来的消息排在它后面，不会收到「上一个任务还在跑」。
 - **换新**：`DAILY_SESSION_AT` 之后的第一条消息换新会话，消息前面附「接续材料」：开头说明（旧会话里的草稿全部失效，要执行必须重新出稿、等确认）、交接摘要、最近两份 journal（各取末尾 6000 字）、
-  最后 N 轮原话（放在不可信围栏里），总长不超过 2 万字。新会话第一条回复末尾附一行「（今天起是新会话；昨夜交接：…；`/session back` 可退回）」。
+  最后 N 轮原话（摘要与 journal、原话都放在不可信围栏里），总长不超过 2 万字。新会话第一条回复末尾附一行「（今天起是新会话；昨夜交接：更新了 N 个记忆 / 台账文件：…；`/session back` 可退回）」，列出交接改了哪几个文件（最多 5 个）。
+  换新那一轮结束后如果还没拿到新会话 id（断连、被杀），下一条消息会重新带上接续材料。
 - **哪些消息先不换**：「确认」（会让旧草稿在新会话里被执行）、排队后出队的一条、带「确认」的合并轮，这几种永远不在当轮换，留到下一条；
   裸 `/do`、`/redirect` 推迟，连续推迟到第 3 条强制换。第一次打开开关时已有的会话先接管、不换，下一次过 `DAILY_SESSION_AT` 再换。
-- **失败回退**：新会话第一轮还没输出就失败，自动退回原会话，回复里说明「今天换新会话没成功，已退回原会话；重发这条即可」；已经有输出再失败的不退回。
+- **失败回退**：新会话第一轮确定还没动过手就失败（进程没起来，或在任何输出之前就超时 / 取消 / 退出），自动退回原会话，回复里说明「今天换新会话没成功，已退回原会话；重发这条即可」；
+  已经有输出（可能已调过工具）或说不清是否动过手的都不退回，也不叫你重发。
 - **命令**（只在 owner 私聊；群里不回复）：`/session` 看状态；`/session back` 退回上一个会话并暂停每日切换；`/session auto` 恢复；`/session rotate` 立刻交接，下一条消息换新。
   `/new` 语义不变（不交接、不带接续材料），开关非 `off` 时被清掉的会话也记进可退回列表。
 - **数据**：状态、原话（最近 30 轮）、交接摘要都在 `data/daily-session/`，`data/sessions.json` 格式不变。原话落盘前过凭据脱敏；日志里只有字数、条数和文件名，没有正文。
@@ -446,7 +448,7 @@ CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EF
 | [`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md) | `watch` 怎么填、外部原文怎么转述、心跳消息上的操作 | 先并入上一份 |
 | [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md) | `verify` 状态与 `done_evidence` 的写法、升级阶梯、日结 | 先并入上两份 |
 | [`docs/owner-tools-prompt-proposal.md`](docs/owner-tools-prompt-proposal.md) | 工具描述修正、audit / strict 工具档下的用法 | 切换工具档时 |
-| [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) | 每日新会话：接续材料怎么读、草稿失效、交接轮（种子文件已含条件式写法） | 把 `DAILY_SESSION` 改成 `on` 时 |
+| [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) | 每日新会话：接续材料怎么读、草稿失效、交接轮（仓库里的 `workspace/CLAUDE.md` 未改） | 把 `DAILY_SESSION` 改成 `on` 时 |
 
 ## 架构 Architecture
 
