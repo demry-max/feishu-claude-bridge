@@ -1,4 +1,4 @@
-// BRIDGE-PUB-1：OWNER_EXTRA_WRITE_DIRS——owner 自己在别处另有、strict 档必须写不了的目录（逗号分隔的绝对路径，默认空）。
+// BRIDGE-PUB-1：OWNER_STRICT_DENY_WRITE_DIRS——owner 自己在别处另有、strict 档必须写不了的目录（逗号分隔的绝对路径，默认空）。
 // 以前 strict 的拒绝清单里写死了 owner 个人的一个目录；公开仓库里不该有，改成配置。
 // 只驱动 strict 档 --disallowedTools 里的 Edit(//<目录>/**)：legacy / audit 的 argv 不受影响（它们本来就没有这条）。
 // 规则会拼进逗号分隔的 CLI 参数，所以路径必须干净：绝对路径、规范化后不是 /、家目录及其上级、桥接目录及其上级，
@@ -28,7 +28,7 @@ function problemOf(dir, norm, { home, bridgeRoot, workspaces }) {
 }
 
 /**
- * 解析 OWNER_EXTRA_WRITE_DIRS → 规范化后的绝对路径数组（去重、保持顺序）。
+ * 解析 OWNER_STRICT_DENY_WRITE_DIRS → 规范化后的绝对路径数组（去重、保持顺序）。
  * @param {string|undefined} raw
  * @param {{home?: string, bridgeRoot?: string, workspaces?: string[], warn?: (msg: string) => void}} ctx
  */
@@ -40,7 +40,7 @@ export function parseExtraWriteDirs(raw, { home, bridgeRoot, workspaces = [], wa
     const norm = dir.startsWith('/') ? path.posix.resolve(dir) : dir;
     const problem = problemOf(dir, norm, { home, bridgeRoot, workspaces });
     if (problem) {
-      warn(`[config] ⚠️ OWNER_EXTRA_WRITE_DIRS 忽略 ${quote(dir)}：${problem}`);
+      warn(`[config] ⚠️ OWNER_STRICT_DENY_WRITE_DIRS 忽略 ${quote(dir)}：${problem}`);
       continue;
     }
     if (!out.includes(norm)) out.push(norm);

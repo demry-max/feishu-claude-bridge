@@ -163,7 +163,7 @@ owner 对话与定时任务能用什么，由仓库里的策略表 `src/tool-pol
 strict 档：
 - **对话**：读类 lark-cli 直接用。发消息（`im +messages-send` / `+messages-reply`）、导入云文档（`drive +import`）、建日程（`calendar +create`）直接执行，回复末尾附一行「— 本轮以你名义：…」回执（目标 ID 只显示末 4 位；**回执只在和 owner 的私聊里附，群聊不附**）。回邮件、审批操作、撤回消息、建群改群、增删群成员先起草；owner 私聊里以「确认」或 `/confirm` 开头的那一轮才放行，只管这一轮，群聊里不生效。
 - **定时任务**：只读，没有例外开关。lark-cli 只放行读类子命令，飞书 MCP 只有 6 个读工具，文件只能写 `memory/`、`outbox/`；任务文件里的任何字段都不参与权限判定。
-- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `OWNER_EXTRA_WRITE_DIRS` 列出的目录（逗号分隔的绝对路径，默认空；不能是 `/`、家目录、桥接目录或它们的上级，也不能与工作区重叠，不合格的逐条忽略并告警）；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路已收窄（frontmatter 白名单重建、`.claude/skills` 整树重建、隔离外来文件、lark-cli 落点闸；覆盖范围与已知缺口见下）。
+- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `OWNER_STRICT_DENY_WRITE_DIRS` 列出的目录（逗号分隔的绝对路径，默认空；不能是 `/`、家目录、桥接目录或它们的上级，也不能与工作区重叠，不合格的逐条忽略并告警）；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路已收窄（frontmatter 白名单重建、`.claude/skills` 整树重建、隔离外来文件、lark-cli 落点闸；覆盖范围与已知缺口见下）。
 - lark-cli 的全局参数写在子命令后面（`--as user|bot` 写在前面也认）。
 
 audit 与 strict 共有：

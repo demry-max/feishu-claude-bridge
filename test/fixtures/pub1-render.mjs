@@ -20,7 +20,7 @@ const home = path.join(TMP, 'home');
 for (const d of [ws, gws, data, home]) fs.mkdirSync(d, { recursive: true });
 process.on('exit', () => fs.rmSync(TMP, { recursive: true, force: true }));
 
-// 模块在加载时读的环境变量全部钉死（OWNER_NAME / OWNER_EXTRA_WRITE_DIRS 由父进程决定，不在这里改）
+// 模块在加载时读的环境变量全部钉死（OWNER_NAME / OWNER_STRICT_DENY_WRITE_DIRS 由父进程决定，不在这里改）
 Object.assign(process.env, {
   WORKSPACE_DIR: ws, GUEST_WORKSPACE_DIR: gws, DATA_DIR: data, HOME: home,
   CLAUDE_BIN: path.join(TMP, 'no-claude'), CLAUDE_MODEL: 'claude-test-chat', CLAUDE_EFFORT: 'high',
@@ -28,9 +28,9 @@ Object.assign(process.env, {
 });
 for (const k of ['CLAUDE_EXEC_MODEL', 'CLAUDE_EXEC_EFFORT', 'ALLOWED_TOOLS', 'NON_OWNER_TOOLS', 'GUEST_TOOLS', 'GUEST_DENIED_TOOLS',
   'FEISHU_TOOLS', 'FEISHU_DOMAIN', 'OWNER_TOOL_PROFILE', 'OWNER_EXTRA_SKILLS', 'TOOL_AUDIT_SUMMARY_AT', 'DIAG_MODEL']) delete process.env[k];
-// OWNER_EXTRA_WRITE_DIRS 要落在本脚本的临时 HOME 下：父进程用 PUB1_EXTRA_DIRS_UNDER_HOME 给相对路径（逗号分隔），这里拼成绝对路径
+// OWNER_STRICT_DENY_WRITE_DIRS 要落在本脚本的临时 HOME 下：父进程用 PUB1_EXTRA_DIRS_UNDER_HOME 给相对路径（逗号分隔），这里拼成绝对路径
 if (process.env.PUB1_EXTRA_DIRS_UNDER_HOME !== undefined) {
-  process.env.OWNER_EXTRA_WRITE_DIRS = process.env.PUB1_EXTRA_DIRS_UNDER_HOME.split(',').map((r) => path.join(home, r)).join(',');
+  process.env.OWNER_STRICT_DENY_WRITE_DIRS = process.env.PUB1_EXTRA_DIRS_UNDER_HOME.split(',').map((r) => path.join(home, r)).join(',');
 }
 
 const mod = (rel, q = '') => import(pathToFileURL(path.join(ROOT, rel)).href + q);

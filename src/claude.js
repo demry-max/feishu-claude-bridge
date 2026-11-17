@@ -739,8 +739,8 @@ import { fenceUntrusted } from './messages.js'; // BRIDGE-PERM-2：sched-diag �
 import { DATA_DIR } from './store.js';
 import { ownerText, OWNER } from './owner-name.js';
 import { parseExtraWriteDirs, extraWriteDenyRules } from './extra-write-dirs.js';
-// BRIDGE-PUB-1：strict 档额外拒写的 owner 目录（OWNER_EXTRA_WRITE_DIRS，默认空）
-const OWNER_EXTRA_WRITE_DENY = extraWriteDenyRules(parseExtraWriteDirs(process.env.OWNER_EXTRA_WRITE_DIRS, {
+// BRIDGE-PUB-1：strict 档额外拒写的 owner 目录（OWNER_STRICT_DENY_WRITE_DIRS，默认空）
+const OWNER_STRICT_DENY_WRITE = extraWriteDenyRules(parseExtraWriteDirs(process.env.OWNER_STRICT_DENY_WRITE_DIRS, {
   home: os.homedir(), bridgeRoot: path.resolve(__dirname, '..'), workspaces: [WORKSPACE_DIR, GUEST_WORKSPACE_DIR],
 }));
 export { detectConfirm } from './tool-policy.js';
@@ -825,7 +825,7 @@ function ownerHookSettings(strict) {
 function ownerDenyList(sched) {
   const deny = [
     ...ACCOUNT_TOOLS, 'WebFetch', 'Bash(lark-cli api:*)', 'Bash(lark-cli auth logout:*)', 'Bash(codex:*)', 'Bash(nohup:*)',
-    'Bash(npx:*)', ...OWNER_EXTRA_WRITE_DENY, 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)',
+    'Bash(npx:*)', ...OWNER_STRICT_DENY_WRITE, 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)',
   ];
   if (sched) {
     // 定时只读的纵深拒绝：即便哪天 allow 规则写宽了，写类 lark 子命令与飞书写工具也过不去

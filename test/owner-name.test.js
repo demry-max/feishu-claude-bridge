@@ -1,4 +1,4 @@
-// BRIDGE-PUB-1：称呼可配置（OWNER_NAME）、OWNER_EXTRA_WRITE_DIRS、.env 回写权限、附件文件名、模型别名、launchd 等待上限。
+// BRIDGE-PUB-1：称呼可配置（OWNER_NAME）、OWNER_STRICT_DENY_WRITE_DIRS、.env 回写权限、附件文件名、模型别名、launchd 等待上限。
 // 逐字对照的夹具 test/fixtures/pub1-baseline-419d56f.json 用基线 419d56f 的源码生成（见 test/fixtures/pub1-render.mjs 开头），
 // 测试只用子进程对当前源码跑同一个渲染脚本再比对，从不重新生成夹具。全部用桩：不连飞书、不调真实 claude / lark-cli。
 import { test, describe } from 'node:test';
@@ -26,7 +26,7 @@ const { buildPlist } = await import('../src/launchd.js');
 
 function render(extraEnv = {}) {
   const env = { ...process.env, TZ: 'Asia/Shanghai' };
-  for (const k of ['OWNER_NAME', 'OWNER_EXTRA_WRITE_DIRS', 'PUB1_EXTRA_DIRS_UNDER_HOME']) delete env[k];
+  for (const k of ['OWNER_NAME', 'OWNER_STRICT_DENY_WRITE_DIRS', 'PUB1_EXTRA_DIRS_UNDER_HOME']) delete env[k];
   Object.assign(env, extraEnv);
   const r = spawnSync(process.execPath, [RENDER, REPO], { encoding: 'utf8', env, timeout: 60_000 });
   assert.equal(r.status, 0, r.stderr);
@@ -169,7 +169,7 @@ describe('PUB-4 .env 回写权限', { skip: process.platform === 'win32' && 'Win
   });
 });
 
-describe('PUB-5 OWNER_EXTRA_WRITE_DIRS', () => {
+describe('PUB-5 OWNER_STRICT_DENY_WRITE_DIRS', () => {
   test('设成等价目录：legacy / audit / strict 的 argv 与基线逐字相同', () => {
     const { json } = SET();
     for (const p of ['legacy', 'audit', 'strict']) assert.deepEqual(json.argv[p], FIXTURE.argv[p], p);
@@ -202,7 +202,7 @@ describe('PUB-5 OWNER_EXTRA_WRITE_DIRS', () => {
       const warns = [];
       assert.deepEqual(parseExtraWriteDirs(b, { ...ctx, warn: (m) => warns.push(m) }), [], JSON.stringify(b));
       assert.equal(warns.length, 1, JSON.stringify(b));
-      assert.match(warns[0], /^\[config\] ⚠️ OWNER_EXTRA_WRITE_DIRS 忽略 "/);
+      assert.match(warns[0], /^\[config\] ⚠️ OWNER_STRICT_DENY_WRITE_DIRS 忽略 "/);
       assert.ok(!/[\u0007\u202e]/.test(warns[0]), '控制 / 格式字符不原样进日志');
     }
     // 根目录不靠家目录检查兜底也要拒（没给 home / bridgeRoot 时）
@@ -215,6 +215,13 @@ describe('PUB-5 OWNER_EXTRA_WRITE_DIRS', () => {
     assert.deepEqual(parseExtraWriteDirs('/Users/me/code/bridge/data', { ...ctx, warn: () => {} }), ['/Users/me/code/bridge/data']);
     // 合法与非法混排：合法的留下
     assert.deepEqual(parseExtraWriteDirs('/, /Users/me/code/other,,', { ...ctx, warn: () => {} }), ['/Users/me/code/other']);
+  });
+  test('只是字符串前缀相同的相邻路径不算上级 / 重叠：全部放行、顺序不变、无告警', () => {
+    const ctx = { home: '/Users/me', bridgeRoot: '/Users/me/code/bridge', workspaces: ['/Users/me/code/bridge/workspace', '/srv/guest-ws'] };
+    const near = ['/Users/me2/x', '/Users/m', '/Users/me/code/bridge2', '/srv/guest-ws2'];
+    const warns = [];
+    assert.deepEqual(parseExtraWriteDirs(near.join(','), { ...ctx, warn: (m) => warns.push(m) }), near);
+    assert.deepEqual(warns, []);
   });
 });
 
