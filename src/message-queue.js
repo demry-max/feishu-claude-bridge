@@ -7,20 +7,28 @@
 // - enqueue() 每接一轮对话调 turnStarted(key)，该轮 finally 里调 turnEnded(key)——成功、报错、被取消都会走到；
 // - isBusy(key)＝本会话有进行中的轮次（含起子进程前、回复收尾这些 isRunning 为 false 的窗口）/ 刚出队还没接上的一批 / 队列非空；
 //   不变式：队列非空 ⇒ 有进行中的轮次或刚出队的一批，总有人负责出队，不会卡死；
-// - 出队在最后一轮结束时同步完成，取当时队列里的全部：1 条原样交回 index.js 的平时路径（同一个 spec 对象），
-//   多条合并成一轮；新轮由 startTurn 同步接进 enqueue 的串行链，同一会话不会两轮同时跑，每条只会被取走一次。
+// - 出队在最后一轮结束时同步完成，取当时队列里的全部：1 条照 index.js 的平时路径走（同一份内容，只多标 queued），
+//   多条合并成一轮；新轮由 startTurn 同步接进 enqueue 的串行链，同一会话不会两轮同时跑，每条只会被取走一次；
+// - 到达登记（R1-4）：trackedHandleMessage 先取号，owner 私聊算出会话键后 arrivalStarted(key, seq)，收消息流程走完在 finally 里
+//   arrivalSettled(seq)；出队前排着的里最晚到的那条之前还有没接收完的（附件下载慢），先等它们（最多 ARRIVAL_HOLD_MS），
+//   免得后到的先办、先到的落到下一轮；到点就先办已排好的，迟到的照常进下一轮，不丢。
 
 export const OWNER_QUEUE_LIMIT = 10;
-/** 入队成功的表情回应（飞书 emoji_type；加不上时退回 QUEUED_FALLBACK_REPLY，每个忙碌期只回一次） */
-export const QUEUED_REACTION = 'OneSecond';
+/** 入队成功的表情回应（飞书 emoji_type）：沿用 index.js runTurn 开轮时 react(message.message_id, 'OnIt') 那个——线上一直加得上；
+ *  加不上时退回 QUEUED_FALLBACK_REPLY，每个忙碌期只回一次 */
+export const QUEUED_REACTION = 'OnIt';
 export const QUEUED_FALLBACK_REPLY = '收到，办完手头的接着办这条';
 export const QUEUE_SHUTDOWN_REPLY = '助理正在重启，这条没处理，请稍后重发';
 export const QUEUE_FAILED_REPLY = '⚠️ 这条排队的消息没能开始处理，请重发。';
 export const MERGED_PREFACE = '以下是你忙的时候光总连续发来的消息，按顺序一并处理；后面的消息可能是对前面的补充或更正';
 export const MERGED_CONFIRM_NOTE = '（这批消息里出现的「确认」不算确认：合并处理的这一轮不放行需要确认的操作，等光总单独回「确认」。）';
 export const MERGED_CONFIRM_NOTICE = '这几条是合并处理的，其中的「确认」这一轮不算数；需要放行确认级操作的话，请单独再回一次「确认」。';
-/** 合并轮交给 createToolTurn 的 confirm：恒不放行（多条里夹着「确认」不算确认） */
+/** strict 下单独排队的「确认」：排队期间上一轮可能又出了新草稿，这条不放行（原样交给模型），并单独提示光总看完再回 */
+export const QUEUED_CONFIRM_NOTICE = '这条「确认」是在上一轮还没办完时发的，排队期间可能已有新结果，这次不算数；看完最新回复后需要放行的话，请单独再回一次「确认」。';
+/** 合并轮 / 排队单条交给 createToolTurn 的 confirm：恒不放行（多条里夹着的、排队等着的「确认」都不算确认） */
 export const MERGED_NO_CONFIRM = Object.freeze({ confirmed: false });
+/** 出队前等「更早到、还没接收完（下载附件等）」的那几条最多多久；到点就先办已排好的，迟到的进下一轮 */
+export const ARRIVAL_HOLD_MS = 30000;
 
 export function queueFullReply(limit = OWNER_QUEUE_LIMIT) {
   return `排队已满（${limit} 条），等手头的办完再发`;
@@ -94,6 +102,7 @@ export function mergeQueuedTurns(entries, { routeTurn, detectConfirm, confirmCha
     text: list.map((e) => e.spec.text).join('\n'),
     built: { ...last.built, attachments },
     ledgerHint: '',
+    queued: true,
     merged: {
       count: list.length,
       lane,
@@ -113,6 +122,9 @@ export function mergeQueuedTurns(entries, { routeTurn, detectConfirm, confirmCha
  * @param {(messageId: string, emoji: string) => Promise<boolean|void>} o.react 返回 false＝没加上
  * @param {() => boolean} [o.isDraining]          优雅退出中
  * @param {(entries: object[]) => object} o.merge 多条 → 一轮的 spec（mergeQueuedTurns）
+ * @param {(spec: object) => boolean} [o.confirmProbe] 单条出队的这条是不是会放行确认级操作的「确认」（strict 才可能为真；抛错按否）
+ * @param {number} [o.holdMs]                     出队前等更早到的那几条接收完，最多多久（ARRIVAL_HOLD_MS）
+ * @param {{ setTimeout: Function, clearTimeout: Function }} [o.timers] 等待用的定时器（测试注入）
  */
 export function createOwnerMessageQueue({
   enabled = false,
@@ -122,11 +134,15 @@ export function createOwnerMessageQueue({
   react,
   isDraining = () => false,
   merge,
+  confirmProbe = () => false,
+  holdMs = ARRIVAL_HOLD_MS,
+  timers = { setTimeout, clearTimeout },
   log = () => {},
   warn = log,
 } = {}) {
   const on = enabled === true;
-  const states = new Map(); // key → { items, active, reservation, period }
+  const states = new Map(); // key → { items, active, reservation, period, holdTimer }
+  const arriving = new Map(); // seq → key：已到达、还没交给队列（下载附件、拼提示词、处理命令中）的 owner 私聊消息（R1-4）
   let pending = 0; // 已发出、还没回来的通知回复（优雅退出要等它们）
 
   const quiet = (fn) => { try { fn(); } catch { /* 日志出口本身出错不影响队列 */ } };
@@ -137,14 +153,54 @@ export function createOwnerMessageQueue({
   function stateOf(key) {
     let s = states.get(key);
     if (!s) {
-      s = { items: [], active: 0, reservation: null, period: { fallbackSent: false } };
+      s = { items: [], active: 0, reservation: null, period: { fallbackSent: false }, holdTimer: null };
       states.set(key, s);
     }
     return s;
   }
   function gc(key) {
     const s = states.get(key);
-    if (s && s.active === 0 && !s.reservation && !s.items.length) states.delete(key);
+    if (s && s.active === 0 && !s.reservation && !s.items.length && !s.holdTimer) states.delete(key);
+  }
+  /** 本会话排着的里最晚到的那条之前、还没接收完的（seq 更小的在途消息）：出队要等它们 */
+  function blockersOf(key, s) {
+    let top = 0;
+    for (const it of s.items) if (it.seq > top) top = it.seq;
+    const out = [];
+    for (const [seq, k] of arriving) if (k === key && seq < top) out.push(seq);
+    return out;
+  }
+  function stopHold(s) {
+    if (!s?.holdTimer) return;
+    const t = s.holdTimer;
+    s.holdTimer = null;
+    try { timers.clearTimeout(t); } catch { /* 定时器出口出错不影响队列 */ }
+  }
+  /** 开始等（已在等就不重设）；返回 true＝在等。定时器 unref，不拖住进程退出；设不上就不等（宁可照旧先办，也不卡住） */
+  function holdFor(key, s) {
+    if (s.holdTimer) return true;
+    let t;
+    try {
+      t = timers.setTimeout(() => {
+        try {
+          const cur = states.get(key);
+          if (!cur || cur.holdTimer !== t) return;
+          cur.holdTimer = null;
+          const late = blockersOf(key, cur);
+          for (const seq of late) arriving.delete(seq); // 到点：不再等当时还没到的（它们之后到了照常进下一轮）
+          if (late.length) oops(`[queue] ${key} 更早到的 ${late.length} 条 ${Math.round(holdMs / 1000)} 秒还没接收完，先办已排好的（它们到了进下一轮）`);
+          maybeDrain(key);
+        } catch (e) {
+          oops(`[queue] 出队出错：${e?.message ?? e}`);
+        }
+      }, holdMs);
+    } catch (e) {
+      oops(`[queue] ${key} 设等待定时器失败，不等了：${e?.message ?? e}`);
+      return false;
+    }
+    s.holdTimer = t;
+    try { t?.unref?.(); } catch { /* 拿不到 unref 也无妨 */ }
+    return true;
   }
   /** 发一条通知；失败只记日志，永不抛 */
   function say(messageId, text) {
@@ -190,18 +246,28 @@ export function createOwnerMessageQueue({
   function maybeDrain(key) {
     const s = states.get(key);
     if (!s || s.active > 0 || s.reservation) return;
-    if (!s.items.length) { gc(key); return; }
-    const taken = s.items.splice(0).sort((a, b) => a.seq - b.seq);
-    s.period = { fallbackSent: false }; // 出队那一轮是新的忙碌期
+    if (!s.items.length) { stopHold(s); gc(key); return; }
     if (draining()) {
+      stopHold(s);
+      const taken = s.items.splice(0).sort((a, b) => a.seq - b.seq);
+      s.period = { fallbackSent: false };
       for (const it of taken) say(it.messageId, QUEUE_SHUTDOWN_REPLY);
       info(`[queue] ${key} 退出中：${taken.length} 条排队消息没处理，已逐条请光总稍后重发`);
       gc(key);
       return;
     }
+    // R1-4：排着的里最晚到的那条之前还有没接收完的 → 先不出队，等它们到（offer / arrivalSettled / 到点都会再来这里）
+    if (blockersOf(key, s).length && holdFor(key, s)) return;
+    stopHold(s);
+    const taken = s.items.splice(0).sort((a, b) => a.seq - b.seq);
+    s.period = { fallbackSent: false }; // 出队那一轮是新的忙碌期
     let spec;
     if (taken.length === 1) {
-      spec = taken[0].spec; // 只有 1 条：原样走平时路径
+      // 只有 1 条：照平时路径走（同一份内容）；标 queued——strict 下排队的「确认」不放行（排队期间可能已出新草稿），并提示光总看完再单独回
+      const one = taken[0];
+      let isConfirm = false;
+      try { isConfirm = !!confirmProbe(one.spec); } catch { isConfirm = false; }
+      spec = { ...one.spec, queued: true, notices: isConfirm ? [{ messageId: one.messageId, text: QUEUED_CONFIRM_NOTICE }] : [] };
     } else {
       try {
         spec = merge(taken);
@@ -222,7 +288,7 @@ export function createOwnerMessageQueue({
     let p;
     try { p = Promise.resolve(startTurn(spec)); } catch (e) { p = Promise.reject(e); }
     p.then(
-      () => { for (const n of spec?.merged?.notices ?? []) say(n.messageId, n.text); },
+      () => { for (const n of spec?.notices ?? spec?.merged?.notices ?? []) say(n.messageId, n.text); },
       (e) => {
         oops(`[queue] ${key} 出队的 ${taken.length} 条没能开始处理：${e?.message ?? e}`);
         for (const it of taken) say(it.messageId, QUEUE_FAILED_REPLY);
@@ -254,9 +320,12 @@ export function createOwnerMessageQueue({
       await say(messageId, queueFullReply(limit));
       return 'full';
     }
-    s.items.push({ spec, messageId, seq: Number(spec?.seq) || 0, at: spec?.at });
+    const seq = Number(spec?.seq) || 0;
+    s.items.push({ spec, messageId, seq, at: spec?.at });
     const period = s.period;
     info(`[queue] ${key} 入队，排队 ${s.items.length} 条`);
+    arriving.delete(seq); // R1-4：这条已交给队列，不再算「还没接收完」
+    try { maybeDrain(key); } catch (e) { oops(`[queue] 出队出错：${e?.message ?? e}`); } // 正在等的就是它（或更早的都到齐了）→ 现在出队；有轮次在跑 / 刚出队时什么也不做
     let ok;
     try { ok = (await react(messageId, QUEUED_REACTION)) !== false; } catch { ok = false; }
     if (!ok && states.get(key)?.period === period && !period.fallbackSent) {
@@ -270,6 +339,7 @@ export function createOwnerMessageQueue({
   function clear(key) {
     const s = states.get(key);
     if (!s || !s.items.length) return 0;
+    stopHold(s);
     const n = s.items.splice(0).length;
     s.period = { fallbackSent: false };
     info(`[queue] ${key} 清空排队 ${n} 条`);
@@ -293,6 +363,7 @@ export function createOwnerMessageQueue({
     for (const key of [...states.keys()]) {
       const s = states.get(key);
       if (!s?.items.length) continue;
+      stopHold(s);
       const taken = s.items.splice(0).sort((a, b) => a.seq - b.seq);
       total += taken.length;
       for (const it of taken) say(it.messageId, QUEUE_SHUTDOWN_REPLY);
@@ -308,7 +379,33 @@ export function createOwnerMessageQueue({
     return n;
   }
 
+  /** R1-4：owner 私聊消息算出会话键后登记「已到达、还没交给队列」；开关关时空操作 */
+  function arrivalStarted(key, seq) {
+    if (!on) return;
+    try { arriving.set(Number(seq), key); } catch (e) { oops(`[queue] 到达登记出错：${e?.message ?? e}`); }
+  }
+  /** R1-4：收消息流程走完（入队 / 直接起轮 / 命令 / 失败 / 被拒都算）销号；正在等它的话现在就能出队。没登记过的直接返回 */
+  function arrivalSettled(seq) {
+    if (!on) return;
+    try {
+      const n = Number(seq);
+      if (!arriving.has(n)) return;
+      const key = arriving.get(n);
+      arriving.delete(n);
+      maybeDrain(key);
+    } catch (e) {
+      oops(`[queue] 出队出错：${e?.message ?? e}`);
+    }
+  }
+  /** 已到达、还没交给队列的条数（只读，排查 / 测试用）；不给 key 时是全部会话合计 */
+  function arrivals(key) {
+    if (key === undefined) return arriving.size;
+    let n = 0;
+    for (const k of arriving.values()) if (k === key) n += 1;
+    return n;
+  }
+
   if (on) info(`[queue] OWNER_MESSAGE_QUEUE=true：owner 私聊忙时排队、轮次结束后合并接着办（上限 ${limit} 条）`);
 
-  return { enabled: on, applies, isBusy, shouldQueue, offer, turnStarted, turnEnded, clear, clearAndTell, size, statusLine, flushForShutdown, inflight };
+  return { enabled: on, applies, isBusy, shouldQueue, offer, turnStarted, turnEnded, clear, clearAndTell, size, statusLine, flushForShutdown, inflight, arrivalStarted, arrivalSettled, arrivals };
 }

@@ -166,8 +166,9 @@ function enqueue(chatId, task) {
 }
 // 收到的消息从进 handleMessage 起就算进行中（下载附件、拼提示词时还没进队列），优雅退出也等它（BRIDGE-VR-1）
 function trackedHandleMessage(data) {
+  const seq = ++arrivalSeq; // BRIDGE-MQ-1：先取号＝到达顺序（早于任何 await）；收消息流程走完在 finally 里销号（等更早到的那条，R1）
   turnsInFlight += 1;
-  return handleMessage(data).finally(() => { turnsInFlight -= 1; });
+  return handleMessage(data, seq).finally(() => { turnsInFlight -= 1; ownerQueue.arrivalSettled(seq); });
 }
 // ---- owner 私聊忙时排队（BRIDGE-MQ-1，OWNER_MESSAGE_QUEUE=true 才启用；关时 shouldQueue 恒 false、钩子全空操作，逐项同基线）----
 // 忙时 owner 私聊的普通消息进内存队列（上限 10），当前轮结束（成功 / 报错 / 取消）后按到达顺序取出：
@@ -180,6 +181,7 @@ const ownerQueue = createOwnerMessageQueue({
   react,
   isDraining: () => shutdown.isDraining(),
   merge: (entries) => mergeQueuedTurns(entries, { routeTurn, detectConfirm, confirmChannel: OWNER_TOOL_PROFILE === 'strict' }),
+  confirmProbe: (s) => OWNER_TOOL_PROFILE === 'strict' && detectConfirm(routeTurn(s.text).prompt, s.message?.chat_type, s.isOwner)?.confirmed === true,
   log: console.log,
   warn: console.error,
 });
@@ -238,12 +240,11 @@ async function getBotOpenId() {
   return botOpenId;
 }
 
-async function handleMessage(data) {
+async function handleMessage(data, seq = ++arrivalSeq) {
   const message = data.message;
   const senderOpenId = data.sender?.sender_id?.open_id;
   if (!message || !senderOpenId) return;
   if (isDuplicate(message.message_id)) return;
-  const seq = ++arrivalSeq; // BRIDGE-MQ-1：在第一个 await 之前取号＝到达顺序
 
   // 群聊仅在 @机器人 时响应
   if (message.chat_type !== 'p2p') {
@@ -306,6 +307,7 @@ async function handleMessage(data) {
     // 再按发言人细分：同一个群里访客 A 的历史不该出现在访客 B 的上下文里，
     // 也避免任一访客往共用会话里植入长效指令
     : `guest:${message.chat_id}:${senderOpenId}`;
+  if (ownerQueue.applies(isOwner, message.chat_type)) ownerQueue.arrivalStarted(sessionKey, seq); // BRIDGE-MQ-1：登记「已到达、还没交给队列」，出队等它（R1）
 
   // ---- 消息 → 提示词（文本/图片/文件/富文本/合并转发/卡片） ----
   // 附件落在各自工作区：非 owner 的文件不该出现在 owner 的工作区里，反之亦然
@@ -340,8 +342,8 @@ async function handleMessage(data) {
     await reply(message.message_id, '群会话里只有 owner 能使用会话控制指令（可以私聊我使用）。');
     return;
   }
-  // BRIDGE-MQ-1：/new、/voice、/tasks 等照旧处理；owner 私聊队列非空时先清空并单独回一句清掉几条（/cancel、/redirect 在各自分支里清）
-  if (isLifecycle && text !== '/cancel' && text !== '取消' && !text.startsWith('/redirect') && ownerQueue.applies(isOwner, message.chat_type)) await ownerQueue.clearAndTell(sessionKey, message.message_id);
+  // BRIDGE-MQ-1：/new 照旧处理；owner 私聊队列非空时先清空并单独回一句清掉几条（/cancel、/redirect 在各自分支里清；/voice、/tasks 等不清）
+  if (text === '/new' && ownerQueue.applies(isOwner, message.chat_type)) await ownerQueue.clearAndTell(sessionKey, message.message_id);
 
   if (text === '/new') {
     resetSession(sessionKey);
@@ -510,7 +512,7 @@ async function handleMessage(data) {
 // ---- 起一轮对话（BRIDGE-MQ-1：从 handleMessage 原样拆出。空闲时由 handleMessage 直接调；
 // 排队出队时由 ownerQueue 调——1 条就是那条消息自己的 spec，多条是 mergeQueuedTurns 合并后的 spec，带 merged）----
 async function runTurn(spec) {
-  const { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, merged } = spec;
+  const { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, merged, queued } = spec;
   // 附件存放于 workspace/incoming/，即使非 owner 也放行该目录的只读访问
   const extraTools = built.attachments.length ? ['Read(./incoming/**)'] : [];
   // 注意：prompt 必须在 /redirect 分支之前声明。此前它声明在分支之后，
@@ -538,8 +540,9 @@ async function runTurn(spec) {
   if (merged) { route.lane = merged.lane; prompt = merged.prompt; } // BRIDGE-MQ-1：多条合并的一轮——车道按各条分别判定（任一条要执行就执行），提示词换成逐条标号的合并稿
   // BRIDGE-PERM-1：strict 档 owner 私聊句首「确认」放行上一轮草稿里的确认级操作（只管这一轮）；
   // audit/strict 收集本轮工具事件给回复附回执。legacy 与访客原样透传。
-  // BRIDGE-MQ-1：合并的一轮恒不放行（夹在里面的「确认」不算确认，提示光总单独再回）
-  const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm: merged ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner), runClaude, redact });
+  // BRIDGE-MQ-1：合并的一轮、排队后单条出队的一轮恒不放行（夹在里面 / 排队等着的「确认」不算确认，提示光总看完再单独回）
+  const confirm = (merged || queued) ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner);
+  const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm, runClaude, redact });
   prompt = toolTurn.prompt;
 
   // 群聊带上发言人姓名，机器人才知道是谁在说话。

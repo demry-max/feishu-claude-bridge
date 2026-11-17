@@ -38,7 +38,7 @@ function indexFactory() {
   const code = [
     cut('const chatQueues = new Map();', 'async function reply(messageId, text) {'),
     cut('async function react(messageId, emoji) {', '\n}\n', { inclusive: true }),
-    cut('async function handleMessage(data) {', '\nconst eventDispatcher'),
+    cut('async function handleMessage(data', '\nconst eventDispatcher'),
     cut('const shutdown = createShutdown({', '\n});', { inclusive: true }),
   ].join('\n');
   // eslint-disable-next-line no-new-func
@@ -51,11 +51,13 @@ function bridge(opts = {}) {
   // 显式传 queue: undefined ＝「环境里没有这个键」，不能被解构默认值吞成 'true'
   const queue = Object.hasOwn(opts, 'queue') ? opts.queue : 'true';
   const r = {
-    replies: [], reacts: [], calls: [], logs: [], errors: [], resets: [], exits: [], timers: [],
+    replies: [], reacts: [], calls: [], logs: [], errors: [], resets: [], exits: [], timers: [], holds: [],
     running: new Set(), live: new Map(), maxLive: 0, clock: 0, heartbeatStops: 0, n: 0,
     reactResult: () => ({ code: 0 }),
     replyHook: null,
     shortcut: () => null,
+    recallThrows: null, // 设成一段文字：recallHint 碰到含它的文本就抛错（出队那轮在接进串行链之前失败）
+    onBatch: null, // 观察出队：每批交给 startTurn 之前同步回调（只看不改，原样转交 index.js 的 startTurn）
   };
   const timers = {
     setTimeout: (fn, ms) => { const t = { fn, ms, cleared: false, ran: false }; r.timers.push(t); return t; },
@@ -67,14 +69,29 @@ function bridge(opts = {}) {
     t.ran = true; r.clock += t.ms; t.fn();
     return true;
   };
+  // 队列「等更早到的那条接收完」用的定时器（R1-4）：注入桩，测试里手动到点
+  const qtimers = {
+    setTimeout: (fn, ms) => { const t = { fn, ms, cleared: false, ran: false, unrefed: false, unref() { this.unrefed = true; return this; } }; r.holds.push(t); return t; },
+    clearTimeout: (t) => { if (t) t.cleared = true; },
+  };
+  r.pendingHolds = () => r.holds.filter((t) => !t.cleared && !t.ran);
+  r.fireHolds = () => {
+    const due = r.pendingHolds();
+    for (const t of due) { t.ran = true; t.fn(); }
+    return due.length;
+  };
   const scope = {
     console: {
       log: (...a) => r.logs.push(a.map(String).join(' ')),
       error: (...a) => r.errors.push(a.map((x) => String(x?.message ?? x)).join(' ')),
     },
     process: { env: queue === undefined ? {} : { OWNER_MESSAGE_QUEUE: queue } },
-    // 被测模块（真实）
-    createOwnerMessageQueue: mq.createOwnerMessageQueue,
+    // 被测模块（真实；只把等待定时器换成桩，holdMs 用模块默认值；startTurn 原样转交，只多一个观察口）
+    createOwnerMessageQueue: (o) => mq.createOwnerMessageQueue({
+      ...o,
+      timers: qtimers,
+      startTurn: (spec) => { if (r.onBatch) r.onBatch(spec); return o.startTurn(spec); },
+    }),
     messageQueueEnabled: mq.messageQueueEnabled,
     mergeQueuedTurns: mq.mergeQueuedTurns,
     MERGED_NO_CONFIRM: mq.MERGED_NO_CONFIRM,
@@ -146,7 +163,10 @@ function bridge(opts = {}) {
     },
     redact: (s) => s,
     resolveSenderName: async () => '张三',
-    recallHint: (_ws, text) => (String(text).includes('安排') ? '（相关记忆：memory/schedule.md）' : ''),
+    recallHint: (_ws, text) => {
+      if (r.recallThrows && String(text).includes(r.recallThrows)) throw new Error('召回记忆出错');
+      return String(text).includes('安排') ? '（相关记忆：memory/schedule.md）' : '';
+    },
     WORKSPACE_DIR: '/tmp/mq-ws',
     shouldRecycleSession: () => false,
     consumeMemoryNudge: () => false,
@@ -204,6 +224,43 @@ describe('BRIDGE-MQ-1 纯逻辑（src/message-queue.js）', () => {
     assert.ok(Object.isFrozen(mq.MERGED_NO_CONFIRM));
   });
 
+  test('R1：排队表情用 runTurn 开轮时已在用的 OnIt；排队「确认」提示原话；等更早到的那条最多 30 秒', () => {
+    assert.equal(mq.QUEUED_REACTION, 'OnIt');
+    assert.ok(SRC.includes("react(message.message_id, 'OnIt')"), 'runTurn 开轮时加的就是这个表情（线上一直加得上）');
+    assert.equal(mq.QUEUED_CONFIRM_NOTICE, '这条「确认」是在上一轮还没办完时发的，排队期间可能已有新结果，这次不算数；看完最新回复后需要放行的话，请单独再回一次「确认」。');
+    assert.equal(mq.ARRIVAL_HOLD_MS, 30000);
+  });
+
+  test('R1：开关关时到达登记全是空操作；没登记过的 seq 直接返回；确认探针抛错按「不是确认」处理', async () => {
+    const holds = [];
+    const timers = { setTimeout: (fn, ms) => { const t = { fn, ms, unref() { return this; } }; holds.push(t); return t; }, clearTimeout: () => {} };
+    const off = mq.createOwnerMessageQueue({ enabled: false, timers, startTurn: () => assert.fail('关着不该起轮') });
+    off.arrivalStarted(P2P, 1);
+    assert.equal(off.arrivals(), 0, '关着时什么都不登记');
+    off.arrivalSettled(1);
+    off.arrivalSettled(99);
+    off.turnStarted(P2P); off.turnEnded(P2P);
+    assert.equal(holds.length, 0);
+    assert.equal(off.isBusy(P2P), false);
+
+    const started = [];
+    const q = mq.createOwnerMessageQueue({
+      enabled: true, timers, reply: async () => {}, react: async () => true,
+      startTurn: (s) => { started.push(s); },
+      confirmProbe: () => { throw new Error('探针坏了'); },
+    });
+    q.arrivalSettled(7); // 没登记过：直接返回、不抛
+    q.turnStarted(P2P);
+    assert.equal(await q.offer(P2P, { message: { message_id: 'om_1' }, text: '确认', seq: 1 }), 'queued');
+    q.turnEnded(P2P);
+    await settle();
+    assert.equal(started.length, 1);
+    assert.equal(started[0].queued, true, '出队的单条带 queued 标记');
+    assert.deepEqual(started[0].notices, [], '探针抛错：不当确认，不发提示');
+    assert.equal(started[0].text, '确认', '其余字段原样');
+    assert.equal(q.isBusy(P2P), false);
+  });
+
   test('时间标签 HH:MM（本地时区）；坏时间不抛', () => {
     assert.equal(mq.formatQueueTime(at(9, 5)), '09:05');
     assert.equal(mq.formatQueueTime(String(at(23, 59))), '23:59');
@@ -240,6 +297,7 @@ describe('BRIDGE-MQ-1 纯逻辑（src/message-queue.js）', () => {
     assert.ok(p.indexOf(HINT) > i1 && p.indexOf(HINT) < i2, '台账提示跟在它那条后面');
     assert.ok(p.indexOf('第三条') > i3 && !p.includes('/do'), '/do 前缀照平时剥掉');
     assert.deepEqual(m.merged.notices, []);
+    assert.equal(m.queued, true, '合并轮也带 queued 标记（runTurn 据此不开确认通道）');
     const chat = mq.mergeQueuedTurns([entries[1], entries[2]], { routeTurn, detectConfirm, confirmChannel: false });
     assert.equal(chat.merged.lane, 'chat');
     assert.throws(() => mq.mergeQueuedTurns([], { routeTurn, detectConfirm }));
@@ -369,7 +427,145 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     assert.deepEqual(c.extraTools, ['Read(./incoming/**)'], '合并轮里有附件就照平时放行 incoming 只读');
   });
 
-  test('MQ-3 只排了 1 条：走平时路径——与空闲时直接发送的调用参数逐项相同（车道、确认、台账提示、记忆提示、附件），回复挂原消息', async () => {
+  // R1-4（复审 P2）：更早到的那条还在下载时当前轮结束——先等它，免得它被甩到后一批、排在后发的消息之后
+  const slowly = (prompt, attachments = []) => {
+    const g = {};
+    g.gate = new Promise((res, rej) => { g.release = res; g.fail = rej; });
+    g.build = async () => { await g.gate; return { prompt, attachments }; };
+    return g;
+  };
+
+  test('MQ-2 附件 R1-4① A 慢 B 快、当前轮在 A 下载完之前结束：先不起新轮；A 到了只起一轮，A 在 B 前', async () => {
+    const b = bridge();
+    b.send('先做这个');
+    await settle();
+    const g = slowly('A:看这张图', ['/incoming/a.png']);
+    const a = b.send('', { build: g.build });
+    const m = b.send('B:把图里第三行加总');
+    await settle();
+    assert.equal(b.ownerQueue.size(P2P), 1);
+    assert.equal(b.ownerQueue.arrivals(P2P), 1, 'A 已到、还在接收');
+    b.calls[0].resolve('ok');
+    await settle();
+    assert.equal(b.calls.length, 1, '更早到的 A 还没接收完：先不出队');
+    assert.equal(b.ownerQueue.isBusy(P2P), true, '等的时候仍算忙：后来的照样排队');
+    const hold = b.pendingHolds();
+    assert.equal(hold.length, 1, '只设一个等待定时器');
+    assert.equal(hold[0].ms, mq.ARRIVAL_HOLD_MS);
+    assert.equal(hold[0].unrefed, true, '等待定时器不拖住进程退出');
+    g.release();
+    await settle();
+    assert.equal(b.calls.length, 2, 'A 到了：只起一轮');
+    const p = b.calls[1].prompt;
+    assert.ok(p.startsWith(mq.MERGED_PREFACE), p);
+    assert.ok(p.indexOf('A:看这张图') > 0 && p.indexOf('A:看这张图') < p.indexOf('B:把图里第三行加总'), p);
+    assert.deepEqual(b.calls[1].extraTools, ['Read(./incoming/**)']);
+    assert.equal(b.pendingHolds().length, 0, '真出队时清掉等待定时器');
+    assert.equal(b.ownerQueue.arrivals(P2P), 0);
+    b.calls[1].resolve('合并答复');
+    await settle();
+    assert.deepEqual(b.to(m.id), ['合并答复'], '回复挂最后到达的 B');
+    assert.deepEqual(b.to(a.id), []);
+    assert.equal(b.ownerQueue.isBusy(P2P), false);
+  });
+
+  test('MQ-2 附件 R1-4② A 下载失败：照旧回失败原因，B 随即单独出队（不等定时器）', async () => {
+    const b = bridge();
+    b.send('先做这个');
+    await settle();
+    const g = slowly('不会走到这里');
+    const a = b.send('', { build: g.build });
+    const m = b.send('B:单独这条');
+    await settle();
+    b.calls[0].resolve('ok');
+    await settle();
+    assert.equal(b.calls.length, 1, '还在等 A');
+    g.fail(new Error('下载失败 403'));
+    await settle();
+    assert.deepEqual(b.to(a.id), ['⚠️ 处理该消息失败：下载失败 403']);
+    assert.equal(b.calls.length, 2, 'A 失败了就不再等');
+    assert.equal(b.calls[1].prompt, 'B:单独这条', '只剩 1 条：平时路径');
+    assert.equal(b.pendingHolds().length, 0);
+    assert.equal(b.holds.filter((t) => t.ran).length, 0, '没靠定时器到点');
+    b.calls[1].resolve('B 的答复');
+    await settle();
+    assert.deepEqual(b.to(m.id), ['B 的答复']);
+  });
+
+  test('MQ-2 附件 R1-4③ A 一直卡着：等待定时器到点后 B 单独出队；A 之后到了进下一轮，一条不丢', async () => {
+    const b = bridge();
+    b.send('先做这个');
+    await settle();
+    const g = slowly('A:迟到的图', ['/incoming/a.png']);
+    const a = b.send('', { build: g.build });
+    const m = b.send('B:先办这条');
+    await settle();
+    b.calls[0].resolve('ok');
+    await settle();
+    assert.equal(b.calls.length, 1);
+    assert.equal(b.fireHolds(), 1, '等待定时器到点');
+    await settle();
+    assert.equal(b.calls.length, 2, '不再等 A');
+    assert.equal(b.calls[1].prompt, 'B:先办这条');
+    assert.ok(b.errors.some((e) => e.startsWith('[queue]') && e.includes(`${mq.ARRIVAL_HOLD_MS / 1000} 秒`)), b.errors.join('\n'));
+    assert.equal(b.ownerQueue.arrivals(P2P), 0, '到点时把还没接收完的那几条摘掉');
+    g.release();
+    await settle();
+    assert.equal(b.ownerQueue.size(P2P), 1, 'A 到了：B 那轮还在跑，排队');
+    b.calls[1].resolve('B 的答复');
+    await settle();
+    assert.equal(b.calls.length, 3, 'A 进下一轮');
+    assert.equal(b.calls[2].prompt, 'A:迟到的图');
+    assert.deepEqual(b.calls[2].extraTools, ['Read(./incoming/**)']);
+    b.calls[2].resolve('A 的答复');
+    await settle();
+    assert.deepEqual(b.to(m.id), ['B 的答复']);
+    assert.deepEqual(b.to(a.id), ['A 的答复']);
+    assert.equal(b.ownerQueue.isBusy(P2P), false);
+    assert.equal(b.pendingHolds().length, 0);
+  });
+
+  test('MQ-2 附件 R1-4④ 更早到的那条原来是 /status：它处理完 B 就出队', async () => {
+    const b = bridge();
+    b.send('先做这个');
+    await settle();
+    const g = slowly('/status');
+    const a = b.send('', { build: g.build });
+    b.send('B:这条');
+    await settle();
+    b.calls[0].resolve('ok');
+    await settle();
+    assert.equal(b.calls.length, 1, '还不知道 A 是什么：先等');
+    g.release();
+    await settle();
+    assert.deepEqual(b.to(a.id), [`**会话状态**\n- 会话: ${P2P}\n- 排队消息: 1 条`]);
+    assert.equal(b.calls.length, 2, 'A 处理完（不是要排队的消息）：B 出队');
+    assert.equal(b.calls[1].prompt, 'B:这条');
+    assert.equal(b.pendingHolds().length, 0);
+    assert.equal(b.ownerQueue.arrivals(P2P), 0);
+  });
+
+  test('MQ-2 附件 R1-4⑤ 开关关：不登记到达、不设定时器；忙时回复与基线逐字相同', async () => {
+    const b = bridge({ queue: undefined });
+    b.send('先做这个');
+    await settle();
+    const g = slowly('A:看这张图');
+    const a = b.send('', { build: g.build });
+    const m = b.send('B:这条');
+    await settle();
+    assert.equal(b.ownerQueue.arrivals(), 0, '关着时什么都不登记');
+    assert.deepEqual(b.to(m.id), [BUSY]);
+    g.release();
+    await settle();
+    assert.deepEqual(b.to(a.id), [BUSY]);
+    b.calls[0].resolve('ok');
+    await settle();
+    assert.equal(b.calls.length, 1, '关着时忙时消息照旧不处理');
+    assert.equal(b.holds.length, 0);
+    assert.equal(b.ownerQueue.arrivals(), 0);
+  });
+
+  test('MQ-3 只排了 1 条：走平时路径——与空闲时直接发送的调用参数逐项相同（车道、确认、台账提示、记忆提示、附件），回复挂原消息（strict 下排队的「确认」例外，见 MQ-7）', async () => {
     const cases = [
       { text: '帮我看看下周安排' },
       { text: '/do 把表格按月汇总' },
@@ -381,6 +577,8 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     const hint = (m) => (m.parent_id ? { hint: HINT } : null);
     for (const profile of ['audit', 'strict', 'legacy']) {
       for (const k of cases) {
+        // R1-3：strict 下排队的单条「确认」故意不放行（排队期间可能已有新草稿），单独见 MQ-7；其余（含 audit / legacy 的「确认」）逐项相同
+        if (profile === 'strict' && detectConfirm(k.text, 'p2p', true).confirmed) continue;
         const direct = bridge({ profile });
         direct.shortcut = hint;
         direct.send(k.text, k);
@@ -473,12 +671,28 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     assert.equal(b.maxLive, 1);
   });
 
-  test('MQ-5 /new：照旧重置并取消当前，队列非空时一并清空并说明；其余生命周期命令（/voice、/tasks）同样一并清空', async () => {
+  test('MQ-5 /voice、/voice on、/voice off、/tasks、/status、/help、/model、/heartbeat 都不清队列（回复与基线逐字相同）；只有 /new 照旧重置、取消当前并一并清空说明', async () => {
     const b = bridge();
+    const base = bridge({ queue: undefined }); // 开关关＝基线（MQ-1）：同样的命令序列，逐条对照回复
     b.send('先做这个');
+    base.send('先做这个');
     await settle();
     b.send('apple'); b.send('banana');
     await settle();
+    assert.equal(b.ownerQueue.size(P2P), 2);
+    for (const cmd of ['/voice', '/voice on', '/voice off', '/tasks', '/status', '/help', '/model', '/heartbeat']) {
+      const x = b.send(cmd);
+      const y = base.send(cmd);
+      await settle();
+      assert.equal(b.ownerQueue.size(P2P), 2, `${cmd} 不清队列`);
+      const want = base.to(y.id);
+      assert.equal(want.length, 1, `${cmd} 基线回一条`);
+      // /status 在开关开 + owner 私聊时多一行排队条数（原卡 MQ-8 的既定设计），其余逐字同基线
+      assert.deepEqual(b.to(x.id), cmd === '/status' ? [`${want[0]}\n- 排队消息: 2 条`] : want, cmd);
+      assert.ok(!b.to(x.id).some((t) => t.includes(mq.clearedNote(2))), `${cmd} 不回清空说明`);
+    }
+    assert.equal(b.calls[0].settled, false, '这些命令不取消当前轮');
+    assert.deepEqual(b.resets, []);
     const n = b.send('/new');
     await settle();
     assert.deepEqual(b.to(n.id), [mq.clearedNote(2), NEW_REPLY]);
@@ -486,24 +700,10 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     assert.equal(b.calls[0].settled, true);
     assert.equal(b.ownerQueue.size(P2P), 0);
     await settle();
-    assert.equal(b.calls.length, 1);
+    assert.equal(b.calls.length, 1, '清掉的不再处理');
     const n2 = b.send('/new');
     await settle();
     assert.deepEqual(b.to(n2.id), [NEW_REPLY], '队列空时 /new 回复逐字不变');
-    for (const [cmd, out] of [['/tasks', '定时任务：无'], ['/voice on', '🔊 已开启语音回复（回答会附一条语音）。发 /voice off 关闭。']]) {
-      b.send('又一件');
-      await settle();
-      b.send('cherry');
-      await settle();
-      assert.equal(b.ownerQueue.size(P2P), 1);
-      const x = b.send(cmd);
-      await settle();
-      assert.deepEqual(b.to(x.id), [mq.clearedNote(1), out], cmd);
-      assert.equal(b.ownerQueue.size(P2P), 0);
-      b.open().forEach((c) => c.resolve('ok'));
-      await settle();
-    }
-    assert.equal(b.calls.length, 3, '清掉的都没再跑');
   });
 
   test('MQ-6 当前轮报错 / 被取消（非 /cancel，如子进程被杀）后仍出队；报错照常告知', async () => {
@@ -554,7 +754,29 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     assert.equal(b.inflight(), 0);
   });
 
-  test('MQ-7 strict：合并轮里夹着「确认」不触发确认通道，并提示光总单独再回「确认」；单条「确认」排队后照平时规则放行', async () => {
+  test('MQ-6 出队那轮在接进串行链之前就抛错（如召回记忆出错）：回「没能开始处理」、不再算忙、下一条立即起轮', async () => {
+    const b = bridge();
+    b.send('先做这个');
+    await settle();
+    b.recallThrows = '会出错';
+    const bad = b.send('这条会出错');
+    await settle();
+    assert.equal(b.ownerQueue.size(P2P), 1);
+    b.calls[0].resolve('ok');
+    await settle();
+    assert.equal(b.calls.length, 1, '这条没能起轮');
+    assert.deepEqual(b.to(bad.id), [mq.QUEUE_FAILED_REPLY]);
+    assert.ok(b.errors.some((e) => e.startsWith('[queue]') && e.includes('召回记忆出错')), b.errors.join('\n'));
+    assert.equal(b.ownerQueue.isBusy(P2P), false, '刚出队的预留位已释放');
+    assert.equal(b.ownerQueue.inflight(), 0, '优雅退出不会一直等它');
+    b.send('下一条');
+    await settle();
+    assert.equal(b.ownerQueue.size(P2P), 0, '没被当成忙去排队');
+    assert.equal(b.calls.length, 2, '下一条立即起轮');
+    assert.equal(b.calls[1].prompt, '下一条');
+  });
+
+  test('MQ-7 strict：合并轮里夹着「确认」不触发确认通道，并提示光总单独再回「确认」；单条「确认」排队后也不放行（原样交给模型）并提示看完最新回复再单独回', async () => {
     const b = bridge({ profile: 'strict' });
     b.send('先起草');
     await settle();
@@ -578,18 +800,73 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     b.calls[2].resolve('草稿2');
     await settle();
     const s = b.calls[3];
-    assert.equal(s.opts.confirm, true, '单条「确认」照平时放行');
-    assert.equal(s.prompt, CONFIRM_DEFAULT_PROMPT);
+    assert.equal(s.opts.confirm, false, '排队的单条「确认」不放行');
+    assert.equal(s.prompt, '确认', '原样交给模型，不改写成默认确认语');
+    assert.ok(!s.prompt.includes(CONFIRM_DEFAULT_PROMPT));
+    assert.deepEqual(b.to(m4.id), [mq.QUEUED_CONFIRM_NOTICE]);
+    s.resolve('答复');
+    await settle();
+    assert.deepEqual(b.to(m4.id), [mq.QUEUED_CONFIRM_NOTICE, '答复']);
+    // 空闲时单独回「确认」：照平时放行，与新开的桥逐项相同
+    const m5 = b.send('确认');
+    await settle();
+    const t = b.calls[4];
+    assert.equal(t.opts.confirm, true);
+    assert.equal(t.prompt, CONFIRM_DEFAULT_PROMPT);
     const d = bridge({ profile: 'strict' });
     d.send('确认');
     await settle();
-    assert.deepEqual(pick(s), pick(d.calls[0]));
-    s.resolve('执行完毕');
+    assert.deepEqual(pick(t), pick(d.calls[0]));
+    t.resolve('执行完毕');
     await settle();
-    assert.deepEqual(b.to(m4.id), ['执行完毕']);
+    assert.deepEqual(b.to(m5.id), ['执行完毕'], '空闲时的「确认」不带提示');
   });
 
-  test('MQ-7 audit（线上档）没有确认通道：合并轮不加确认说明、不发提示', async () => {
+  test('MQ-7 strict（复审 P3）：「确认」排队期间上一轮又出了新草稿——这条不放行新草稿，提示光总看完再单独回「确认」', async () => {
+    const b = bridge({ profile: 'strict' });
+    b.send('起草方案1');
+    await settle();
+    b.calls[0].resolve('草稿1：要删 A');
+    await settle();
+    b.send('再把 B 也删了'); // 这一轮会产出光总还没看到的草稿2
+    await settle();
+    const c = b.send('确认'); // 光总本意是确认草稿1
+    await settle();
+    assert.equal(b.ownerQueue.size(P2P), 1);
+    b.calls[1].resolve('草稿2：要删 A 和 B');
+    await settle();
+    assert.equal(b.calls.length, 3);
+    const q = b.calls[2];
+    assert.equal(q.opts.confirm, false, '没看过的草稿2 不放行');
+    assert.equal(q.prompt, '确认');
+    assert.deepEqual(b.to(c.id), [mq.QUEUED_CONFIRM_NOTICE]);
+    q.resolve('需要确认后才能删');
+    await settle();
+    b.send('确认'); // 看完草稿2 后单独回
+    await settle();
+    assert.equal(b.calls[3].opts.confirm, true);
+    assert.equal(b.calls[3].prompt, CONFIRM_DEFAULT_PROMPT);
+  });
+
+  test('MQ-7 strict：合并轮第 1 条就是「确认」也不放行（合并全文以「确认」开头也不算）', async () => {
+    const b = bridge({ profile: 'strict' });
+    b.send('先起草');
+    await settle();
+    const m1 = b.send('确认');
+    b.send('看下这个');
+    await settle();
+    b.calls[0].resolve('草稿');
+    await settle();
+    const c = b.calls[1];
+    assert.equal(c.opts.confirm, false, '合并轮不开确认通道');
+    assert.ok(c.prompt.startsWith(mq.MERGED_PREFACE), c.prompt);
+    assert.ok(c.prompt.includes(mq.MERGED_CONFIRM_NOTE));
+    const i1 = c.prompt.indexOf('第 1 条（'); const i2 = c.prompt.indexOf('第 2 条（');
+    assert.ok(i1 > 0 && c.prompt.slice(i1, i2).includes('确认') && c.prompt.indexOf('看下这个') > i2, c.prompt);
+    assert.deepEqual(b.to(m1.id), [mq.MERGED_CONFIRM_NOTICE]);
+  });
+
+  test('MQ-7 audit（线上档）没有确认通道：合并轮不加确认说明、不发提示；排队的单条「确认」与直接发参数相同、不发提示', async () => {
     const b = bridge({ profile: 'audit' });
     b.send('先起草');
     await settle();
@@ -601,6 +878,18 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     assert.equal(b.calls[1].opts.confirm, false);
     assert.ok(!b.calls[1].prompt.includes(mq.MERGED_CONFIRM_NOTE));
     assert.deepEqual(b.to(m2.id), []);
+    const m3 = b.send('确认');
+    await settle();
+    b.calls[1].resolve('草稿2');
+    await settle();
+    const s = b.calls[2];
+    const d = bridge({ profile: 'audit' });
+    d.send('确认');
+    await settle();
+    assert.deepEqual(pick(s), pick(d.calls[0]));
+    s.resolve('答复');
+    await settle();
+    assert.deepEqual(b.to(m3.id), ['答复'], '没有确认通道就不提示');
   });
 
   test('MQ-7 合并轮不触发引用回复快捷：快捷只在消息到达时判定一次（位置同基线），出队合并时不再判定', async () => {
@@ -643,7 +932,7 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     await settle();
     assert.deepEqual(b.to(gg.id), [BUSY]);
     assert.equal(b.calls.length, 3);
-    assert.deepEqual(b.reacts.filter(([, e]) => e === mq.QUEUED_REACTION), []);
+    for (const m of [g, gp, gg]) assert.deepEqual(b.emojis(m.id), [], '忙时被回「还在跑」的不加排队表情');
     const gs = b.send('/status', { type: 'group' });
     await settle();
     assert.deepEqual(b.to(gs.id), ['**会话状态**\n- 会话: oc_group']);
@@ -735,7 +1024,7 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     assert.equal(b.maxLive, 1);
   });
 
-  test('MQ-10 并发到达与轮次结束交错（固定种子的随机时序 ×30）：同一会话从不两轮同时跑、每条至多处理一次、没处理的都有交代、不卡死', async () => {
+  test('MQ-10 并发到达（含快慢不一 / 失败 / 卡住的下载）与轮次结束交错（固定种子的随机时序 ×30）：同一会话从不两轮同时跑、每条至多处理一次、同一轮按到达顺序、出队时不越过还在下载的更早消息（除非等待到点）、没处理的都有交代、不卡死不泄漏', async () => {
     const prng = (seed) => {
       let a = seed >>> 0;
       return () => {
@@ -746,50 +1035,112 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
         return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
       };
     };
+    const FAILED = '⚠️ 处理该消息失败：';
+    const seen = { holds: 0, fired: 0, failed: 0, stuck: 0, merged: 0, heldBatches: 0 };
     for (let seed = 1; seed <= 30; seed += 1) {
       const rnd = prng(seed);
       const b = bridge();
       b.replyHook = async () => { if (rnd() < 0.3) await tick(); };
       const sent = [];
+      const order = new Map(); // tok → 到达（发送）先后
+      const idTok = new Map(); // message_id → tok
+      const building = new Set(); // 附件还在下载的 tok（buildPrompt 进行中；登记到达在它之前同步完成）
+      const exempt = new Set(); // 等待定时器到点时还在下载的：允许被后到的越过（R1-4③）
+      const stuck = []; // 卡住的下载：放行函数
+      const violations = [];
+      b.onBatch = (spec) => {
+        const ids = spec.merged?.messageIds ?? [spec.message.message_id];
+        const top = Math.max(...ids.map((id) => order.get(idTok.get(id))));
+        if (ids.length > 1) seen.merged += 1;
+        for (const t of building) {
+          if (order.get(t) < top && !exempt.has(t)) violations.push(`${t} 还在下载，却先出队了更晚到的（到第 ${top} 条）`);
+        }
+      };
+      const slowBuild = (tok, kind, n) => async (msg) => {
+        building.add(tok);
+        try {
+          if (kind === 'stuck') await new Promise((res) => stuck.push(res));
+          for (let i = 0; i < n; i += 1) await tick();
+          if (kind === 'fail') throw new Error(`下载失败 ${tok}`);
+          return { prompt: msg.__text, attachments: [] };
+        } finally {
+          building.delete(tok);
+        }
+      };
+      const fire = () => {
+        if (!b.pendingHolds().length) return;
+        for (const t of building) exempt.add(t);
+        seen.fired += b.fireHolds();
+      };
       for (let step = 0; step < 40; step += 1) {
         const x = rnd();
         if (x < 0.5) {
           const tok = `‹${seed}-${step}›`;
-          const slow = rnd() < 0.3;
-          sent.push({ tok, m: b.send(tok, slow ? { build: async (msg) => { await tick(); await tick(); return { prompt: msg.__text, attachments: [] }; } } : {}) });
-        } else if (x < 0.85) {
+          const y = rnd();
+          const kind = y < 0.4 ? 'fast' : y < 0.7 ? 'slow' : y < 0.85 ? 'fail' : 'stuck';
+          const n = kind === 'slow' ? 1 + Math.floor(rnd() * 6) : kind === 'fail' ? Math.floor(rnd() * 4) : 0;
+          if (kind === 'stuck') seen.stuck += 1;
+          order.set(tok, sent.length);
+          const m = b.send(tok, kind === 'fast' ? {} : { build: slowBuild(tok, kind, n) });
+          idTok.set(m.id, tok);
+          sent.push({ tok, kind, m });
+        } else if (x < 0.8) {
           const c = b.open()[0];
           if (c) { const y = rnd(); if (y < 0.6) c.resolve(`答${step}`); else if (y < 0.85) c.reject(new Error('boom')); else c.cancel(); }
-        } else if (x < 0.9) {
+        } else if (x < 0.85) {
           b.send('/cancel');
+        } else if (x < 0.92) {
+          const go = stuck.shift();
+          if (go) go();
+        } else if (x < 0.97) {
+          fire();
         }
         if (rnd() < 0.5) await tick(); else await Promise.resolve();
       }
       for (let i = 0; i < 300; i += 1) {
+        while (stuck.length) stuck.shift()(); // 收尾：卡住的下载全部放行（不靠定时器到点）
         await settle(3);
         const open = b.open();
-        if (!open.length && b.inflight() === 0 && b.ownerQueue.inflight() === 0 && !b.ownerQueue.isBusy(P2P)) break;
+        if (!open.length && !stuck.length && b.inflight() === 0 && b.ownerQueue.inflight() === 0 && !b.ownerQueue.isBusy(P2P)) break;
         open.forEach((c) => c.resolve('收尾'));
       }
+      seen.holds += b.holds.length;
+      seen.heldBatches += b.holds.filter((t) => t.cleared).length;
+      assert.deepEqual(violations, [], `seed ${seed}：出队越过了还在下载的更早消息`);
       assert.equal(b.maxLive, 1, `seed ${seed}：同一会话出现两轮同时跑`);
       assert.equal(b.open().length, 0, `seed ${seed}`);
       assert.equal(b.ownerQueue.size(P2P), 0, `seed ${seed}：队列卡死`);
       assert.equal(b.ownerQueue.isBusy(P2P), false, `seed ${seed}`);
       assert.equal(b.inflight(), 0, `seed ${seed}`);
       assert.equal(b.ownerQueue.inflight(), 0, `seed ${seed}`);
+      assert.equal(b.ownerQueue.arrivals(), 0, `seed ${seed}：到达登记泄漏`);
+      assert.equal(b.pendingHolds().length, 0, `seed ${seed}：等待定时器泄漏`);
+      assert.ok(b.holds.every((t) => t.unrefed), `seed ${seed}：等待定时器都 unref（不拖住退出）`);
       const texts = b.replies.map(([, t]) => t);
       assert.ok(!texts.includes(BUSY), `seed ${seed}：开着时 owner 私聊不该再回「还在跑」`);
       let processed = 0;
-      for (const { tok } of sent) {
+      for (const { tok, kind } of sent) {
         const n = b.calls.reduce((s, c) => s + (c.prompt.split(tok).length - 1), 0);
         assert.ok(n <= 1, `seed ${seed}：${tok} 处理了 ${n} 次`);
+        if (kind === 'fail') assert.equal(n, 0, `seed ${seed}：${tok} 下载失败了却被处理`);
         processed += n;
       }
+      for (const c of b.calls) {
+        const toks = c.prompt.match(/‹\d+-\d+›/g) ?? [];
+        for (let k = 1; k < toks.length; k += 1) {
+          assert.ok(order.get(toks[k]) > order.get(toks[k - 1]), `seed ${seed}：同一轮里 ${toks[k - 1]} 与 ${toks[k]} 没按到达顺序`);
+        }
+      }
+      const failed = texts.filter((t) => t.startsWith(FAILED)).length;
+      assert.equal(failed, sent.filter((s) => s.kind === 'fail').length, `seed ${seed}：下载失败的每条都回了原因`);
+      seen.failed += failed;
       const full = texts.filter((t) => t === mq.QUEUE_FULL_REPLY).length;
       let cleared = 0;
       for (const t of texts) for (let k = 1; k <= mq.OWNER_QUEUE_LIMIT; k += 1) if (t.includes(mq.clearedNote(k))) cleared += k;
-      assert.equal(processed + full + cleared, sent.length, `seed ${seed}：有消息没处理也没交代（处理 ${processed} / 满 ${full} / 清 ${cleared} / 共 ${sent.length}）`);
+      assert.equal(processed + full + cleared + failed, sent.length, `seed ${seed}：有消息没处理也没交代（处理 ${processed} / 满 ${full} / 清 ${cleared} / 下载失败 ${failed} / 共 ${sent.length}）`);
     }
+    // 防空转：30 个种子合起来确实走到了等待、到点放行、下载失败、卡住、合并这些路径
+    assert.ok(seen.holds > 0 && seen.heldBatches > 0 && seen.fired > 0 && seen.failed > 0 && seen.stuck > 0 && seen.merged > 0, JSON.stringify(seen));
   });
 });
 
@@ -812,22 +1163,42 @@ describe('BRIDGE-MQ-1 源码断言（index.js 接线写法——只证明写法�
     assert.equal(SRC.match(/\benqueue\(/g).length, 2, '定义一处 + 调用一处');
   });
 
-  test('引用回复快捷仍在原位置、只出现一次，排在排队判定之前；合并轮的确认与车道在 runTurn 里覆写', () => {
+  test('引用回复快捷仍在原位置、只出现一次，排在排队判定之前；合并轮 / 排队单条的确认与车道在 runTurn 里覆写', () => {
     assert.equal(SRC.split('heartbeatReplyShortcut(').length - 1, 1);
     assert.ok(SRC.indexOf('heartbeatReplyShortcut(') < SRC.indexOf('ownerQueue.shouldQueue('));
-    assert.ok(SRC.includes('confirm: merged ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner)'));
+    assert.ok(SRC.includes('const { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, merged, queued } = spec;'));
+    assert.ok(SRC.includes('const confirm = (merged || queued) ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner);'));
+    assert.ok(SRC.includes('const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm, runClaude, redact });'));
+    assert.ok(!SRC.includes('confirm: merged ? MERGED_NO_CONFIRM'), '旧写法（只看 merged）已换掉');
+    assert.ok(SRC.includes("confirmProbe: (s) => OWNER_TOOL_PROFILE === 'strict' && detectConfirm(routeTurn(s.text).prompt, s.message?.chat_type, s.isOwner)?.confirmed === true,"));
     assert.ok(SRC.indexOf('if (merged) { route.lane = merged.lane; prompt = merged.prompt; }') > SRC.indexOf('const route = routeTurn(prompt);'));
   });
 
-  test('/cancel 在同一条回复里报清掉的条数；/redirect、其余生命周期命令清队列；/new 分支内部不含队列代码', () => {
+  test('/cancel 在同一条回复里报清掉的条数；/redirect 清队列；其余命令只有 /new 清（/voice*、/tasks 不清）；/new 分支内部不含队列代码', () => {
     const cancel = cut("if (text === '/cancel' || text === '取消') {", '\n  }\n');
     assert.ok(cancel.includes('ownerQueue.clear(sessionKey)'));
     assert.ok(cancel.includes("withClearedNote(killed ? '🛑 已取消当前任务。' : '当前没有正在运行的任务。', cleared)"));
     const redirect = cut("if (text.startsWith('/redirect')) {", '\n  }\n');
     assert.ok(redirect.indexOf('ownerQueue.clearAndTell(sessionKey, message.message_id)') > redirect.indexOf('abortRetries(sessionKey);'));
-    const iLife = SRC.indexOf('if (isLifecycle && text !== \'/cancel\' && text !== \'取消\' && !text.startsWith(\'/redirect\') && ownerQueue.applies(isOwner, message.chat_type)) await ownerQueue.clearAndTell(sessionKey, message.message_id);');
-    assert.ok(iLife > 0 && iLife < SRC.indexOf("if (text === '/new') {"));
+    const iNew = SRC.indexOf("if (text === '/new' && ownerQueue.applies(isOwner, message.chat_type)) await ownerQueue.clearAndTell(sessionKey, message.message_id);");
+    assert.ok(iNew > 0 && iNew < SRC.indexOf("if (text === '/new') {"));
+    assert.ok(!SRC.includes('if (isLifecycle && text !== '), '旧写法（生命周期命令一律清）已换掉');
+    assert.equal(SRC.match(/ownerQueue\.clear(AndTell)?\(/g).length, 3, '清队列只有 /new、/cancel、/redirect 三处');
     assert.ok(!cut("if (text === '/new') {", '\n  }\n').includes('ownerQueue'));
+  });
+
+  test('到达登记：取号在 trackedHandleMessage 第一句（早于任何 await），会话键算出后登记，收消息流程走完在 finally 里销号', () => {
+    const tracked = cut('function trackedHandleMessage(data) {', '\n}\n');
+    assert.ok(tracked.includes('const seq = ++arrivalSeq;'));
+    assert.ok(tracked.indexOf('const seq = ++arrivalSeq;') < tracked.indexOf('handleMessage(data, seq)'));
+    assert.ok(tracked.includes('return handleMessage(data, seq).finally(() => { turnsInFlight -= 1; ownerQueue.arrivalSettled(seq); });'));
+    assert.ok(SRC.includes('async function handleMessage(data, seq = ++arrivalSeq) {'));
+    assert.ok(!SRC.includes('const seq = ++arrivalSeq; // BRIDGE-MQ-1：在第一个 await 之前取号'), '旧的函数体内取号已删');
+    assert.equal(SRC.split('++arrivalSeq').length - 1, 2, '取号只有 trackedHandleMessage 与 handleMessage 默认参数两处');
+    const iKey = SRC.indexOf(': `guest:${message.chat_id}:${senderOpenId}`;');
+    const iArr = SRC.indexOf('if (ownerQueue.applies(isOwner, message.chat_type)) ownerQueue.arrivalStarted(sessionKey, seq);');
+    assert.ok(iKey > 0 && iArr > iKey && iArr - iKey < 200, '会话键算出后紧接着登记');
+    assert.ok(iArr < SRC.indexOf('built = await buildPrompt(client, message, myWorkspace, senderOpenId);'), '登记在下载附件之前');
   });
 
   test('优雅退出：onDrain 回「请重发」（心跳停失败也照发），inflight 计入未发完的通知', () => {
