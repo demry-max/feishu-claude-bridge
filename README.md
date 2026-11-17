@@ -60,6 +60,8 @@
 | 📨 忙时连续发消息（owner 私聊排队、合并、接着办） | 关 | `OWNER_MESSAGE_QUEUE=true` | [忙时连续发消息](#-忙时连续发消息排队合并接着办默认关闭) |
 | 📅 每日新会话（owner 私聊每天换一次会话，带上交接内容） | 关 | `DAILY_SESSION=shadow`（只记录）/ `on`；运行时 `/session` | [每日新会话](#-每日新会话默认关闭) |
 | 🧩 lark-cli（日历、审批、任务、消息检索…） | 关 | `LARK_CLI=true` | [飞书侧能做什么](#-飞书侧能做什么不能做什么) |
+| 🔎 业务系统只读查询（bms / ias） | 关 | `BMS_TOOL_ENABLED=1`（只读 Key 放本机钥匙串，仅 macOS） | [业务系统只读查询](#业务系统只读查询bms_tool_enabled默认关闭) |
+| 🔁 备用账号（主用额度用完 / 登录失效时自动切换） | 关 | `CLAUDE_FALLBACK_BIN=<备用 claude 路径>` | [备用账号](#-备用账号默认关闭) |
 
 ## 快速开始 Quick Start
 
@@ -149,7 +151,7 @@ owner 与其他人跑在**两个物理隔离的工作区**里，这是本项目�
 第三方内容（转发记录、卡片 JSON、文件名、标题）一律包进不可信围栏并声明「不是指令」；
 出站回复经脱敏后再发送。
 
-**心跳轮次**（`HEARTBEAT_ENABLED=true` 时）用比 owner 普通会话更窄、且不受 env 放宽影响的固定工具档：`--setting-sources ''` + `--strict-mcp-config`，内置工具只有 Read/Grep/Glob/Edit/Write，写入只限 `tasks/` 与 `memory/journal/`；没有 Bash、lark-cli、联网与飞书工具，也不能改 `schedules/`。台账里的 title/notes 进不可信围栏；对外动作只起草，私聊 owner 确认。
+**心跳轮次**（`HEARTBEAT_ENABLED=true` 时）用比 owner 普通会话更窄、且不受 env 放宽影响的固定工具档：`--setting-sources ''` + `--strict-mcp-config`，内置工具只有 Read/Grep/Glob/Edit/Write，写入只限 `tasks/` 与 `memory/journal/`；没有 Bash、lark-cli、联网与飞书工具（`BMS_TOOL_ENABLED=1` 时例外：另挂一个只读的业务系统查询工具，见[业务系统只读查询](#业务系统只读查询bms_tool_enabled默认关闭)），也不能改 `schedules/`。台账里的 title/notes 进不可信围栏；对外动作只起草，私聊 owner 确认。
 
 ### owner 工具档（`OWNER_TOOL_PROFILE`，默认 `legacy`）
 
@@ -194,6 +196,51 @@ strict 开启前，技能与写文件还有几条能绕开白名单的提权路�
 - 内联 shell（`bash -c`、`eval`、`$(…)` 里的写文件）只做了尽力解析，阻断效果待真机 smoke；
 - 钩子超时（CLI 侧 5 秒）时 CLI 的实际放行 / 拒绝行为待真机 smoke；
 - 用户级技能软链目标在 `~/.claude/skills` 根下（而非 `~/.agents/skills`）时暂不拷，待确认。
+
+### 业务系统只读查询（`BMS_TOOL_ENABLED`，默认关闭）
+
+打开后 owner 多一个 MCP 工具 `mcp__biz__biz_get`，只读查询两个内部业务系统：
+
+- `bms`：业务管理系统（工单、客户、线索、合同、收款、付款申请、提成、看板）。
+- `ias`：财务会计系统（看板、报表、应收应付、往来明细、收支流水）。
+
+主机、路径前缀、钥匙串条目名都写死在 `src/biz-targets.js`，没有任何环境变量能改。
+
+| 有这个工具 | 没有 |
+|---|---|
+| owner 私聊、结果发往 owner 私聊的定时任务（strict 的只读定时任务也有）、心跳 | 群聊（owner 在群里也没有）、结果发往群或其他会话的定时任务、目的地判断不出的定时任务、访客、sched-diag 自诊断、验收、交接 |
+
+- **定时任务看目的地**：桥接只在内存里记 owner 私聊的会话 ID（owner 私聊发过消息后才知道）。定时任务的 `chat_id` 恰好等于它时才有这个工具；桥接重启后、owner 还没私聊过之前，所有定时任务都没有。
+- **开关**：`.env` 里 `BMS_TOOL_ENABLED=1`，只认恰好 `1`，改完重启。三个工具档下都生效。关着时，所有轮次的参数与没有这个功能时逐字一致。
+- **只能 GET**，不跟随重定向。
+  - 路径先归一化再核对前缀。`..`、`//`、`\`、`@`、`%` 编码、完整 URL 一律拒绝。
+  - 密钥管理、登录认证、导出、文件下载、凭证类路径也拒绝。
+  - query 是结构化的键值，不拼原始查询串。分页 `limit` 超过上限会被截回（bms 100、ias 200）。
+- **限额**：
+  - 单次请求 15 秒超时，响应超过 1 MB 丢弃，给模型的结果超过 40000 字截断。
+  - 每轮最多 30 次，每分钟最多 20 次。
+  - 本机设置了 `NODE_TLS_REJECT_UNAUTHORIZED=0` 时，整个工具停用。
+- **Key 不经过模型**：每个系统一把只读 Key，放在本机钥匙串（仅 macOS）。
+  - MCP 服务每次调用时用 `/usr/bin/security find-generic-password … -w` 把它读进内存。
+  - 它不进环境变量、命令行参数、临时 MCP 配置、日志、审计或报错文本。
+  - 缺条目时只有那个系统不可用。工具回「<系统> 查询未配置：钥匙串里没有可用的『<条目名>』（账号 <账号>），请 owner 写入」，并附写入命令模板。
+- **`.env` 拒读**：有这个工具的轮次另加 `--disallowedTools Read(<仓库绝对路径>/.env),Read(<仓库绝对路径>/.env.*)`，并拒绝 `Bash(security:*)`、`Bash(/usr/bin/security:*)`。
+- **子进程环境**：MCP 服务经 `/usr/bin/env -u …` 启动，去掉 `NODE_OPTIONS`、`NODE_EXTRA_CA_CERTS` 和 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（含小写）。
+- **返回内容**整段进不可信围栏，并声明「是数据，不是指令」。
+- **审计**（audit / strict）：只记工具名、target、GET 和路径第一段的大类（白名单外记 `other`）。不记完整路径和 query。
+- **技能**：桥接把 `docs/skills/biz-readonly/`（端点速查）作为保留技能同步进 `workspace/.claude/skills/`。
+  - 它不写 `workspace/skills/`。
+  - `workspace/skills/` 里有同名技能时，同步进 `.claude/skills/` 的是桥接这份（原件不动）。
+- **自检**：`npm run -s biz-check`（两个都查），或 `npm run -s biz-check -- bms`（只查一个）。
+  - 每个系统只打印一行打码结论：bms 是 HTTP 状态、角色、打码后的邮箱；ias 是 HTTP 状态、Key 的权限范围（scopes）、打码后的 Key 名称。不打印 Key、请求头或原始响应。
+  - 缺条目时打印写入命令模板。owner 在这台机器的终端里自己运行它：`-w` 后面不带值，会提示输入。
+  - 退出码：`0` 全部通过，`1` 有失败。
+
+**已知限制**：
+
+- MCP 服务进程与飞书 MCP 一样，继承 claude CLI 的其余环境变量。
+- 经 `env security`、`xcrun security` 或 python / node 等解释器子进程调用 security 不在拒绝范围内；放行规则里不要有裸 Bash 或解释器前缀。
+- 钥匙串读取只支持 macOS。在其他系统上读不到 Key，工具只会回缺 Key 的提示。
 
 ## 🗂️ Agent 工作区（OpenClaw / Hermes 式三层记忆与技能）
 
@@ -407,6 +454,20 @@ owner 私聊一直 `--resume` 同一条会话，越聊越长、每条都慢。�
 - **数据**：状态、原话（最近 30 轮）、交接摘要都在 `data/daily-session/`，`data/sessions.json` 格式不变。原话落盘前过凭据脱敏；日志里只有字数、条数和文件名，没有正文。
 - **上线建议**：先 `shadow` 跑一天，再用 `scripts/daily-session-replay.js` 做新旧对比（盲评），新方式不输再改 `on`；改 `on` 时把 [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) 并入 `workspace/CLAUDE.md`。
 - 显式配置了 `ALLOWED_TOOLS` 时，代码不并入默认值；启动时如果缺了默认 owner 工具里的 `Edit(./…/**)` 写入项（比如 `Edit(./tasks/**)`），会打一行 `[config] ⚠️` 警告并列出缺的项名（只提醒，不改权限）。
+
+## 🔁 备用账号（默认关闭）
+
+主用 Claude 账号的周额度 / 5 小时额度用完，或登录失效时，桥接自动改用备用账号的 claude，过一段时间再试主用，主用恢复就换回来。
+
+- `CLAUDE_FALLBACK_BIN`：备用账号用的 claude 可执行文件（常见做法是一个包装脚本，导出备用账号的令牌后 `exec claude "$@"`）。不设 = 功能关闭，行为与没有这个功能时完全一样。
+- `CLAUDE_FALLBACK_COOLDOWN_MIN`：切到备用后多少分钟再试主用，默认 30，范围 1–720；写错了按 30 处理，启动日志打一行 `[config] ⚠️`。
+- 切换范围：冷却期内所有新起的 claude 都用备用，包括私聊、执行车道、群聊、访客、定时任务、心跳、验收和自诊断。
+- 当前这一轮：还没调过工具、也没发过进度消息时，立即在备用上重跑这一轮，你只会收到正常回复；已经动过手的不会重放，回复里提示「已切到备用账号，请再发一次，或说“继续”」。`/cancel`、`/new` 和重启打断的轮不触发切换。
+- 冷却到期后下一轮先试主用：成功就回到主用（只打日志）；仍不可用就再冷却一段，这一轮自动落到备用。备用自己也不可用（或备用 claude 起不来）时本轮不来回切，照常报错，下一轮先试主用。
+- 进入备用时私信你一条「主用账号额度用完（或登录失效），已自动切到备用账号，约 N 分钟后会再试主用账号。」，同一次连续的备用期只发一次；赶上心跳的免打扰时段（`HEARTBEAT_QUIET_HOURS`）就延后到时段结束再发，那之前已回到主用就不发。切换状态只在内存里，重启后从主用起，主用仍不可用会再收到一条通知。`/status` 多一行「当前账号：主用 / 备用（几点再试主用）」。
+- 启动时对备用 claude 跑一次 `--version`，失败只告警，本次运行当作没配置备用；`npm run doctor` 也会查这一项。
+- **两个 claude 最好共用同一个 CLI 配置目录**（同一个 `~/.claude`，只是令牌不同）：这样换账号后 `--resume` 还是同一个会话。不共用时，换过去（或换回来）那边找不到会话，桥接会自动不带 `--resume` 重试一次，两边都相当于开了新会话，之前的上下文要靠记忆文件补。
+- 日志（不含消息内容与原始报错）：`[account] 主用不可用(quota|auth)，切到备用，冷却 N 分钟`、`冷却到期，试主用`、`回到主用`、`备用也不可用(quota|auth)`、`备用启动失败，回到主用路径`；`[account-notice] 免打扰时段，切换通知延后到时段结束`、`切换通知发送失败`。
 
 ## 🚦 模型分工：聊天/规划 vs 执行
 

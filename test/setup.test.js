@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  parseEnvText, checkNodeVersion, checkDeps, checkClaudeCli, checkClaudeAuth, maskEmail, ensureEnvFile,
+  parseEnvText, checkNodeVersion, checkDeps, checkClaudeCli, checkFallbackCli, checkClaudeAuth, maskEmail, ensureEnvFile,
   checkRequiredEnv, checkEnvSanity, checkShadowed, validOpenId, findOwnerCandidates, withExitTimeout,
   plistExitTimeout, plistEnvPath, checkService, exitCodeFor, toJson, scrubSecrets, renderLine,
   ownerHint, plistWorkingDir, serviceLabelConflict, ownerLogFiles,
@@ -63,6 +63,17 @@ test('checkClaudeCli: 找不到 → fail（不倾倒 PATH）；有版本 → ok'
   assert.equal(ok.status, 'ok');
   assert.equal(ok.version, '2.9.1');
   assert.equal(checkClaudeCli({ run: run({ ok: true, stdout: 'weird' }) }).status, 'warn');
+});
+
+test('A10 checkFallbackCli（doctor）：备用 bin 找不到 / 无版本 → warn；有版本 → ok', () => {
+  const nf = checkFallbackCli({ bin: '/x/claude-b', run: run({ ok: false, error: 'ENOENT', stdout: '' }) });
+  assert.equal(nf.status, 'warn');
+  assert.equal(nf.id, 'claude_fallback_cli');
+  assert.match(nf.message, /视为未配置备用账号/);
+  assert.equal(checkFallbackCli({ bin: '/x/claude-b', run: run({ ok: true, stdout: 'weird' }) }).status, 'warn');
+  const ok = checkFallbackCli({ bin: '/x/claude-b', run: run({ ok: true, stdout: '2.9.1 (Claude Code)\n' }) });
+  assert.equal(ok.status, 'ok');
+  assert.equal(ok.version, '2.9.1');
 });
 
 test('checkClaudeAuth: 已登录 / 未登录 / 未能确认，邮箱打码', () => {
