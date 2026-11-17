@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { ownerText, OWNER } from './owner-name.js';
 
 /** 三个按钮 / 引用回复短语。「办完了」留给 VR-1。 */
 export const LEDGER_ACTIONS = Object.freeze({ ack: '知道了', snooze1d: '推迟一天', drop: '不做了' });
@@ -184,7 +185,7 @@ export function applyLedgerAction({ tasksDir, journalDir, slug, action, now = ne
     }
   }
   const verb = source === 'reply' ? '回复' : '点了';
-  if (!appendJournal(journalDir, now, `（桥接）光总${verb}『${LEDGER_ACTIONS[action]}』：tasks/${slug}.json`)) {
+  if (!appendJournal(journalDir, now, ownerText`（桥接）${OWNER}${verb}『${LEDGER_ACTIONS[action]}』：tasks/${slug}.json`)) {
     log(`[heartbeat] journal 追加失败（tasks/${slug}.json 的『${LEDGER_ACTIONS[action]}』已${changed.length ? '写回' : '记下'}）`);
   }
   return { ok: true, changed };
@@ -289,11 +290,11 @@ export function appendJournalBlock(journalDir, now, lines) {
 
 /**
  * VR-1 动作的确定性回写（按钮 / 引用回复 / 桥接内部）。只改 status、updated_at 与动作需要的字段：
- * - done：done_evidence 由桥接写 { kind:'owner', ref:'', summary:'光总确认办完（按钮|引用回复）' }（模型写的 kind=owner 不算数，只有这里写的算）
+ * - done：done_evidence 由桥接写 { kind:'owner', ref:'', summary:'<称呼>确认办完（按钮|引用回复）' }（模型写的 kind=owner 不算数，只有这里写的算）
  * - reopen / undo：next_check_at 改成现在加 24 小时（明天再看）；done_evidence 原样保留
  * - accept / vdrop / demote / autodone：只改 status
  * guard(raw)（可选）返回非空字符串＝拒绝（例如核对期间依据被改过）。
- * journal：光总的动作记「（桥接）光总点了『X』」；autodone 记「（桥接）自动验收通过（规则|模型）」；demote 不记（心跳日志里有）。
+ * journal：owner 的动作记「（桥接）<称呼>点了『X』」；autodone 记「（桥接）自动验收通过（规则|模型）」；demote 不记（心跳日志里有）。
  * 返回 { ok, changed, task } 或 { ok:false, reason }（不改任何文件）。
  */
 export function applyVerifyAction({ tasksDir, journalDir, slug, action, now = new Date(), validate, source = 'button', via, guard, log = console.log }) {
@@ -312,7 +313,7 @@ export function applyVerifyAction({ tasksDir, journalDir, slug, action, now = ne
     changed.push('next_check_at');
   }
   if (action === 'done') {
-    raw.done_evidence = { kind: 'owner', ref: '', summary: source === 'reply' ? '光总确认办完（引用回复）' : '光总确认办完（按钮）' };
+    raw.done_evidence = { kind: 'owner', ref: '', summary: source === 'reply' ? ownerText`${OWNER}确认办完（引用回复）` : ownerText`${OWNER}确认办完（按钮）` };
     changed.push('done_evidence');
   }
   raw.updated_at = localMinute(now);
@@ -326,7 +327,7 @@ export function applyVerifyAction({ tasksDir, journalDir, slug, action, now = ne
   }
   let line = null;
   if (action === 'autodone') line = `（桥接）自动验收通过（${via === 'model' ? '模型' : '规则'}）：tasks/${slug}.json`;
-  else if (action !== 'demote') line = `（桥接）光总${source === 'reply' ? '回复' : '点了'}『${VR_ACTIONS[action]}』：tasks/${slug}.json`;
+  else if (action !== 'demote') line = ownerText`（桥接）${OWNER}${source === 'reply' ? '回复' : '点了'}『${VR_ACTIONS[action]}』：tasks/${slug}.json`;
   if (line && !appendJournal(journalDir, now, line)) log(`[heartbeat] journal 追加失败（tasks/${slug}.json 已写回）`);
   return { ok: true, changed, task: v.task };
 }

@@ -37,6 +37,8 @@ const BASE = {
   GUEST_TOOLS: undefined, GUEST_DENIED_TOOLS: undefined, FEISHU_TOOLS: undefined,
   FEISHU_APP_ID: 'cli_test_app', FEISHU_APP_SECRET: 'test-app-secret', FEISHU_DOMAIN: undefined,
   OWNER_TOOL_PROFILE: undefined, OWNER_EXTRA_SKILLS: undefined, TOOL_AUDIT_SUMMARY_AT: undefined,
+  // BRIDGE-PUB-1：strict 拒写的 owner 目录改成配置；这里设回原先写死的那个目录，下面 IAS 的断言保持不变
+  OWNER_STRICT_DENY_WRITE_DIRS: path.join(home, 'code', 'ias-ops'),
 };
 const CASES = {
   ownerChat: { env: {}, call: ['oc_x', true, [], { lane: 'chat', resumeId: 'sess-1' }] },

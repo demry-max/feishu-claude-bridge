@@ -2,6 +2,7 @@
 // 全部用注入的桩：不连飞书、不起 lark-cli、不调真实 claude。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { ownerText, OWNER as O_NAME, YOU as O_YOU } from '../src/owner-name.js'; // BRIDGE-PUB-1：称呼按配置（测试里未设：owner / 你）
 
 const {
   T0, OWNER, TOAST_OK, TOAST_STALE, at, plus, mkEnv, writeTask, readTask, journalOf, CFG, mkRunner, harness,
@@ -218,7 +219,7 @@ describe('测试 2：脚本规则', () => {
     for (const [name, task, reply, finding] of [
       ['PENDING', APPR, approvalReply('PENDING'), /审批 INST-1 还是 PENDING，没有通过/],
       ['ref 对不上', { ...APPR, done_evidence: { ...APPR.done_evidence, ref: 'INST-2' } }, approvalReply('APPROVED'), /对不上/],
-      ['光总本人发的', MSG, messageReply(OWNER), /光总本人发的/],
+      ['光总本人发的', MSG, messageReply(OWNER), new RegExp(ownerText`${O_YOU}本人发的`)],
       ['早于交办', MSG, messageReply('ou_wang', 'oc_c1', early), /发在交办之前/],
       ['lark 失败', APPR, () => ({ ok: false, reason: '超时' }), /查审批没成功（超时）/],
       ['lark 失败（消息）', MSG, () => { throw new Error('boom'); }, /查消息没成功/],
@@ -322,7 +323,7 @@ describe('测试 2：脚本规则', () => {
     assert.equal(readTask(env2, 'msg').status, 'verify');
     assert.equal(h2.sent.length, 1);
     assert.ok(isCard(h2.sent[0]));
-    assert.match(h2.sent[0].text, /光总本人发的/);
+    assert.ok(h2.sent[0].text.includes(ownerText`${O_YOU}本人发的`), h2.sent[0].text);
 
     const env3 = mkEnv(); // 消息不在 watch 的会话里
     writeTask(env3, 'msg', MSG);
@@ -544,7 +545,7 @@ describe('测试 6：验收卡片、引用回复与撤销', () => {
       const h = await cardBeat(env);
       assert.deepEqual(await h.handlers.cardAction(click(h.sent[0].mid, btn(h.sent[0], action))), TOAST_OK);
       assert.deepEqual(readTask(env, 'quote'), want, action);
-      assert.match(journalOf(env), new RegExp(`（桥接）光总点了『${label}』：tasks/quote\\.json`));
+      assert.ok(journalOf(env).includes(ownerText`（桥接）${O_NAME}点了『${label}』：tasks/quote.json`), journalOf(env));
       // 再点同一个：已处理过
       assert.deepEqual(await h.handlers.cardAction(click(h.sent[0].mid, btn(h.sent[0], action))), TOAST_STALE);
     }
@@ -620,7 +621,7 @@ describe('测试 6：验收卡片、引用回复与撤销', () => {
     assert.deepEqual(snap(env, ['appr']), before);
     assert.deepEqual(await h.handlers.cardAction(click(dg.mid, u)), TOAST_OK);
     assert.deepEqual(readTask(env, 'appr'), { ...auto, status: 'open', next_check_at: '2026-11-17T21:35', updated_at: '2026-11-16T21:35' });
-    assert.match(journalOf(env), /（桥接）光总点了『撤销』：tasks\/appr\.json/);
+    assert.ok(journalOf(env).includes(ownerText`（桥接）${O_NAME}点了『撤销』：tasks/appr.json`), journalOf(env));
     assert.deepEqual(await h.handlers.cardAction(click(dg.mid, u)), TOAST_STALE, '撤销只能一次');
     assert.equal(await heartbeatReplyShortcut({ message: quoted(dg.mid, '撤销'), isOwner: true, heartbeat: h.hb }).then((r) => r?.reply), undefined,
       '日结的撤销只认按钮');
@@ -656,7 +657,7 @@ describe('测试 6：验收卡片、引用回复与撤销', () => {
       assert.equal(readTask(env, 'appr').status, 'verify', `tweak=${tweak}：不自动关单`);
       const card = h.sent.find(isCard);
       assert.ok(card, h.sent.map((s) => s.text).join('\n---\n'));
-      assert.match(card.text, /桥接核对：光总之前判过这条没办完，这次请你确认/);
+      assert.ok(card.text.includes(ownerText`桥接核对：${O_YOU}之前判过这条没办完，这次请你确认`), card.text);
       assert.equal(haikuCalls(h.calls).length, 0);
       h.setNow(at(2026, 11, 17, 22, 35));
       assert.deepEqual(await h.handlers.cardAction(click(card.mid, btn(card, 'accept'))), TOAST_OK);
@@ -696,7 +697,7 @@ describe('测试 6：验收卡片、引用回复与撤销', () => {
     await h.hb.beat();
     const c2 = h.sent.filter(isCard)[1];
     assert.ok(c2, h.sent.map((s) => s.text).join('\n---\n'));
-    assert.match(c2.text, /光总之前判过这条没办完/);
+    assert.ok(c2.text.includes(ownerText`${O_YOU}之前判过这条没办完`), c2.text);
     assert.equal(readTask(env, 'appr').status, 'verify', '审批 APPROVED 也不自动关：之前判过没办完');
   });
 

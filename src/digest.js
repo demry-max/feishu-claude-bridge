@@ -3,6 +3,7 @@
 // 这里只放纯函数（解析时间、到下一次的毫秒数、排版）；定时器、发送（deliver）、写 journal 在 heartbeat.js。
 // 本文件不 import heartbeat.js / verifier.js（它们反过来用这里的 plain），避免循环依赖。
 import { circled } from './ledger-actions.js';
+import { ownerText, YOU } from './owner-name.js';
 
 const DAY_MS = 24 * 3600_000;
 const MAX_PER_COLUMN = 5; // 每栏最多列几条，其余「另有 N 条」
@@ -12,9 +13,9 @@ export const DIGEST_WINDOW_MS = 30 * 60_000; // 到点后 30 分钟内还没发�
 export const DIGEST_JOURNAL_HEAD = '## 台账日结（桥接自动）';
 /** 今天办完的方式（history.changes 的 via）。 */
 export const METHOD_LABELS = Object.freeze({
-  rule: '规则验收', model: '模型验收', heartbeat: '心跳轮写的', owner: '光总确认', chat: '会话里改的',
+  rule: '规则验收', model: '模型验收', heartbeat: '心跳轮写的', owner: ownerText`${YOU}确认`, chat: '会话里改的',
 });
-/** 可以从日结「撤销」的办完方式：桥接 / 模型自动判定的（光总自己确认、会话里改的不给撤销）。 */
+/** 可以从日结「撤销」的办完方式：桥接 / 模型自动判定的（owner 自己确认、会话里改的不给撤销）。 */
 export const UNDOABLE_VIA = Object.freeze(['rule', 'model', 'heartbeat']);
 const HINT_BUTTONS = '带圈号的是自动判定办完的；判错了点下面对应的「撤销」，改回 open、明天再看。';
 const HINT_CHAT = '带圈号的是自动判定办完的；判错了在对话里说一声。';

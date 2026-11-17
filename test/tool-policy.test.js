@@ -2,6 +2,7 @@
 // 这里全是纯函数：不读环境变量、不碰文件（回放夹具除外）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { ownerText, OWNER as O_NAME, YOU as O_YOU } from '../src/owner-name.js'; // BRIDGE-PUB-1：称呼按配置（测试里未设：owner / 你）
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -217,7 +218,7 @@ test('detectConfirm：只认 owner 私聊、句首「确认」或 /confirm；其
   assert.deepEqual(detectConfirm('确认。', 'p2p', true), { confirmed: true, prompt: CONFIRM_DEFAULT_PROMPT });
   assert.deepEqual(detectConfirm('/confirm', 'p2p', true), { confirmed: true, prompt: CONFIRM_DEFAULT_PROMPT });
   assert.deepEqual(detectConfirm('/confirm 改成下午三点再发', 'p2p', true), { confirmed: true, prompt: '改成下午三点再发' });
-  assert.equal(CONFIRM_DEFAULT_PROMPT, '（光总已确认上一轮的草稿，请执行）');
+  assert.equal(CONFIRM_DEFAULT_PROMPT, ownerText`（${O_NAME}已确认上一轮的草稿，请执行）`);
   for (const [t, ct, own] of [['确认 发吧', 'group', true], ['确认 发吧', 'topic_group', true], ['确认 发吧', 'p2p', false],
     ['确认一下进度', 'p2p', true], ['我确认', 'p2p', true], ['确认？', 'p2p', true], ['确认?', 'p2p', true],
     ['/confirmed', 'p2p', true], ['好的', 'p2p', true], ['', 'p2p', true]]) {

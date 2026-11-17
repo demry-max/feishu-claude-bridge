@@ -4,7 +4,9 @@
 //   npm run install-service -- --force     同 label 的 plist 已指向别的目录时，仍改成指向本目录（默认拒绝）
 // label 默认 com.<用户名>.feishu-claude-bridge，可用 LAUNCHD_LABEL 覆盖（已有服务的老用户沿用旧 label）。
 // Windows 请用 scripts/windows/install-startup.ps1；Linux 参考 examples/feishu-claude-bridge.service（systemd --user）。
-// plist 里写 ExitTimeOut = SHUTDOWN_GRACE_SEC + 10：launchd 默认约 20 秒就强杀，优雅退出（等进行中的对话收尾）等不完。
+// plist 里写 ExitTimeOut = 优雅等待 + 10：launchd 不写时只等 5 秒就强杀，优雅退出（等进行中的对话收尾）等不完；
+// 但用户级 LaunchAgent 的 ExitTimeOut 实际最多 60 秒（写多了也按 60），所以 SHUTDOWN_GRACE_SEC 超过 50 时
+// 把服务里的 SHUTDOWN_GRACE_SEC 钉成 50（写进 plist 的 EnvironmentVariables，优先于 .env），留 10 秒收尾。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,7 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildPlist, defaultLabel, resolveClaudeDir, plistPath } from '../src/launchd.js';
 import { shutdownGraceSec } from '../src/shutdown.js';
-import { readEnvFile, withExitTimeout, serviceLabelConflict } from './lib/checks.js';
+import { readEnvFile, withExitTimeout, withPlistEnv, launchdShutdownTiming, serviceLabelConflict, LAUNCHD_EXIT_TIMEOUT_CAP } from './lib/checks.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dryRun = process.argv.includes('--dry-run');
@@ -30,7 +32,13 @@ const merged = { ...envValues, ...process.env };
 const label = defaultLabel(merged);
 const claudeDir = resolveClaudeDir(merged.CLAUDE_BIN || 'claude');
 const grace = shutdownGraceSec(envValues, (m) => console.error(m));
-const xml = withExitTimeout(buildPlist({ label, node: process.execPath, root: ROOT, home: os.homedir(), claudeDir }), grace + 10);
+const timing = launchdShutdownTiming(grace);
+let xml = withExitTimeout(buildPlist({ label, node: process.execPath, root: ROOT, home: os.homedir(), claudeDir }), timing.exitTimeout);
+if (timing.clamped) {
+  xml = withPlistEnv(xml, 'SHUTDOWN_GRACE_SEC', String(timing.serviceGrace));
+  console.error(`ℹ️ SHUTDOWN_GRACE_SEC=${grace} 超过 launchd 能等的时间（ExitTimeOut 最多 ${LAUNCHD_EXIT_TIMEOUT_CAP} 秒）：` +
+    `服务里按 ${timing.serviceGrace} 秒优雅等待，ExitTimeOut=${timing.exitTimeout}（留 ${timing.exitTimeout - timing.serviceGrace} 秒收尾）。`);
+}
 
 if (dryRun) {
   process.stdout.write(xml);

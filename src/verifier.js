@@ -8,6 +8,7 @@
 import crypto from 'node:crypto';
 import { fenceUntrusted } from './messages.js';
 import { plain } from './digest.js';
+import { ownerText, OWNER, YOU } from './owner-name.js';
 
 // watch-sources.js 静态导入了 heartbeat.js（parseTime），heartbeat.js 又导入本文件：
 // fillTemplate / apiTimeMs 用缓存的动态 import 取，避免三者成环（本文件不静态依赖 watch-sources.js / heartbeat.js）。
@@ -56,7 +57,7 @@ export function parseVerdict(text) {
   return { verdict: v.verdict, reason: v.reason };
 }
 
-/** 一份依据的指纹（kind + ref + summary）：依据改了要重新验收；光总判过「没办完」的同一份依据不再自动通过。 */
+/** 一份依据的指纹（kind + ref + summary）：依据改了要重新验收；owner 判过「没办完」的同一份依据不再自动通过。 */
 export function evidenceKey(ev) {
   const e = isObj(ev) ? ev : {};
   const s = JSON.stringify([String(e.kind ?? ''), String(e.ref ?? '').trim(), String(e.summary ?? '').trim()]);
@@ -113,7 +114,7 @@ async function safeRun(runner, argv) {
   }
 }
 
-// 审批只有「已通过」算办完；拒绝 / 撤回 / 删除也是终态，但不该自动关单，交给光总决定（BRIDGE-VR-1 R1）
+// 审批只有「已通过」算办完；拒绝 / 撤回 / 删除也是终态，但不该自动关单，交给 owner 决定（BRIDGE-VR-1 R1）
 const APPROVAL_STOPPED = Object.freeze({ REJECTED: '已被拒绝', CANCELED: '已被撤回', DELETED: '已被删除' });
 const MS_TS_RE = /^\d{10,13}$/;
 
@@ -128,14 +129,14 @@ function assignedAt(task) {
 }
 
 /**
- * 脚本规则（只读、确定性）。task 是校验过的台账；runner 是 EV-1 的只读 lark runner；owner 是光总的 open_id。
+ * 脚本规则（只读、确定性）。task 是校验过的台账；runner 是 EV-1 的只读 lark runner；owner 是 owner 的 open_id。
  * 返回 { outcome, finding, raw? }：finding 是桥接自己的话（只含校验过的 ID、状态、时间），raw 是原始返回（进围栏）。
  * - pass 只有两种：
  *   approval：ref 等于 watch.instance_code，approvalGet 查到 APPROVED；
  *   message：messageGet 查到这条 om_，在 watch.chat_id 的会话里，是对方真人发的，发送时间解析得出且不早于交办时间
  *   （created_at 与数字 watch.after 取晚的；两样都没有直接 fail）
  * - fail：approval / message 的其余一切（对不上、没查成、没状态、PENDING 等没走完、拒绝 / 撤回 / 删除、
- *   光总本人 / 机器人 / 系统 / 已撤回、看不出时间、早于交办），以及依据格式不合规（evidence_error）——直接发卡片，不问模型
+ *   owner 本人 / 机器人 / 系统 / 已撤回、看不出时间、早于交办），以及依据格式不合规（evidence_error）——直接发卡片，不问模型
  * - unknown 只有三种：没写 done_evidence、kind=other、模型写的 kind=owner——只有这三种 rule+model 档才问模型
  */
 export async function ruleCheck({ task, runner, owner } = {}) {
@@ -183,9 +184,9 @@ export async function ruleCheck({ task, runner, owner } = {}) {
     if (!m) return fail(`没查到消息 ${ref}`, raw);
     if (typeof w.chat_id !== 'string' || m.chat_id !== w.chat_id) return fail(`消息 ${ref} 不在台账 watch 的会话里`, raw);
     const own = typeof owner === 'string' ? owner : '';
-    if (!own) return fail('桥接还不知道光总是谁，判断不了是不是对方发的', raw);
+    if (!own) return fail(ownerText`桥接还不知道${OWNER}是谁，判断不了是不是对方发的`, raw);
     const s = isObj(m.sender) ? m.sender : {};
-    if ((s.id ?? s.open_id) === own) return fail(`消息 ${ref} 是光总本人发的，不算对方回复`, raw);
+    if ((s.id ?? s.open_id) === own) return fail(ownerText`消息 ${ref} 是${YOU}本人发的，不算对方回复`, raw);
     if (!isOtherHuman(m, own)) return fail(`消息 ${ref} 不是真人发的（机器人 / 系统 / 已撤回）`, raw);
     const sentAt = apiTimeMs(m.create_time);
     if (sentAt === null) return fail(`消息 ${ref} 看不出发送时间，判断不了是不是交办之后的回复`, raw);
@@ -193,7 +194,7 @@ export async function ruleCheck({ task, runner, owner } = {}) {
     return { outcome: 'pass', finding: `消息 ${ref} 是对方交办之后在 watch 的会话里发的` };
   }
 
-  if (ev.kind === 'owner') return { outcome: 'unknown', finding: '依据 kind=owner 不算：光总的确认只认桥接记下的按钮 / 引用回复' };
+  if (ev.kind === 'owner') return { outcome: 'unknown', finding: ownerText`依据 kind=owner 不算：${OWNER}的确认只认桥接记下的按钮 / 引用回复` };
   return { outcome: 'unknown', finding: '依据类型 other：桥接没有可核对的规则' };
 }
 

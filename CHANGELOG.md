@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### 称呼可配置与公开仓库遗留小修
+
+- **新增 `OWNER_NAME`**：桥接发给 owner 的消息、给模型的提示词与日志里提到 owner 时用它（≤20 字，字母 / 数字，中间可夹单个空格、`·`、`.`、`'`、`-`；
+  去掉换行与控制字符后仍不合法的按没设处理并打一行 `[config] ⚠️`）。没设时对 owner 说话用「你」、向模型 / 日志描述用「owner」；
+  源码里不再写死任何人的称呼。设成原先的称呼时，所有消息与提示词与改动前逐字相同（基线夹具钉住）。
+- **新增 `OWNER_STRICT_DENY_WRITE_DIRS`**：strict 档额外拒写的目录改成配置（逗号分隔的绝对路径，默认空），源码里不再写死 owner 个人目录；
+  legacy / audit 的参数不受影响。路径必须是绝对路径，不能是 `/`、家目录、桥接目录或它们的上级，不能与工作区重叠，不合格的逐条忽略并告警。
+- **`haiku` 别名与 `DIAG_MODEL` 默认值**改为 `claude-haiku-5-5`。
+- **`.env` 回写权限**：`/model` 等回写 `.env` 后不再变成 644——临时文件以 0600 新建，rename 后按「原权限 & 0600」收紧（原来更严的不放宽；Windows 不改）。
+- **附件文件名**：进提示词的显示名去掉换行、控制与格式字符；落盘名同样清洗（`/`、`\` 换成 `_`，`.` / `..` / 空名用 file_key 兜底，≤200 字节保留扩展名），
+  「已保存为 ./incoming/…」那一行不会再被文件名里的换行撑出围栏、伪造「第 N 条」之类的标记。
+- **launchd 优雅退出订正**：用户级 LaunchAgent 的 `ExitTimeOut` 实际最多 60 秒、不写时只等 5 秒（此前文档写的「约 20 秒」不对）。
+  `npm run install-service` 改写 `ExitTimeOut = min(SHUTDOWN_GRACE_SEC, 50) + 10`；`SHUTDOWN_GRACE_SEC` 大于 50 时在 plist 环境变量里把它钉成 50 并提示。
+  `npm run doctor` 按 plist 里钉住的值核对。`SHUTDOWN_GRACE_SEC` 代码默认值仍是 120（systemd / 前台没有这个上限）。
+
 ### 备用账号（默认关闭）
 
 - **新增 `CLAUDE_FALLBACK_BIN` / `CLAUDE_FALLBACK_COOLDOWN_MIN`**（`src/account-fallback.js`）：主用账号报额度用完或登录失效时，冷却期内（默认 30 分钟，1–720）所有新起的 claude 都改用备用 bin；
