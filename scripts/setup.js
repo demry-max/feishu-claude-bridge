@@ -8,6 +8,8 @@
 //   --no-network        透传给 doctor，跳过飞书 scope 探测
 //   --set-owner <ou_…>  把 OWNER_OPEN_ID 写进 .env（只接受 ou_ 开头的 open_id）
 //   --log <file>        额外指定一份桥接日志，用来找「owner 未登记时私聊过机器人的人」
+//   --link-lark-cli     让飞书官方 lark-cli 用 .env 里同一个应用（lark-cli config init --app-id … --app-secret-stdin，
+//                       Secret 只走 stdin）；lark-cli 已配置别的应用时要再加 --force 才替换
 //   --root <dir>        对指定目录运行（默认本仓库；测试用）
 //
 // 退出码：0 = 全绿（⚠️ 提醒不算）；2 = 只差需要人做的步骤（🙋）；1 = 有失败项（agent 应该能修）。
@@ -21,6 +23,7 @@ import {
   checkRequiredEnv, checkEnvSanity, validOpenId, findOwnerCandidates, readTail, exitCodeFor,
   renderLine, toJson, scrubSecrets, summarize,
 } from './lib/checks.js';
+import { checkLarkCliApp, linkLarkCli } from './lib/lark-link.js';
 
 const argv = process.argv.slice(2);
 const flag = (f) => argv.includes(f);
@@ -83,6 +86,12 @@ if (owner?.status === 'needs_human') {
   }
 }
 add(required, checkEnvSanity(values));
+
+// 6b) lark-cli 与桥接是不是同一个应用（只跑本地的 lark-cli config show；没装就跳过）
+const larkBin = process.env.LARK_CLI_BIN || values.LARK_CLI_BIN || 'lark-cli';
+add(flag('--link-lark-cli')
+  ? linkLarkCli(values, { bin: larkBin, force: flag('--force') })
+  : checkLarkCliApp(values, { bin: larkBin }));
 
 // 7) doctor（需要依赖；结果按 id 合并，setup 已有的项不重复）
 if (deps.status === 'ok') {

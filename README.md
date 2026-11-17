@@ -92,16 +92,17 @@ npm ci
 npm run setup          # 自检：没有 .env 就从 .env.example 生成，并列出还缺什么（可反复跑）
 ```
 
-**飞书应用**（二选一）
+**飞书应用**：安装过程自动生成，**不用到开发者后台手工创建**
 
-- **新建应用（推荐）**：`npm run register`，用飞书 App 扫码，应用自动创建，凭据与 `OWNER_OPEN_ID` 写入 `.env`。
-  - 结束时会打印一段 scope JSON。到开发者后台「权限管理 → 批量导入」粘贴，然后「版本管理与发布」发布版本。
-  - 注册接口建出来的应用是零权限：不做这步，文档 / 多维表格工具用不了，聊天不受影响。
+- **默认**：`npm run register`，用飞书 App 扫码，应用自动创建，凭据与 `OWNER_OPEN_ID` 写入 `.env`（走飞书官方应用注册接口）。
+  - 结束时会打印一段 scope JSON。到开发者后台打开这个刚生成的应用，「权限管理 → 批量导入」粘贴，然后「版本管理与发布」发布版本。只做一次。
+  - 注册接口建出来的应用没有开通 scope：不做这步，文档 / 多维表格工具用不了，聊天不受影响。
   - 国际版 Lark 先在 `.env` 设 `FEISHU_DOMAIN=lark`。
-- **已有应用**：把 App ID / App Secret 填进 `.env`，再到开发者后台确认四件事：
+- **和 lark-cli 的关系**：lark-cli 的 `lark-cli config init --new`（安装向导里的「配置应用」）走的是同一个注册接口，**每扫一次码就新建一个应用**。所以别两边各扫一次：先让桥接建好应用，再用 `npm run setup -- --link-lark-cli` 把同一个应用交给 lark-cli（Secret 经 stdin 传，不打印）。反过来不行：lark-cli 的 App Secret 存在系统钥匙串里，没有导出命令，setup 只读得到它的 App ID。详见 [AGENTS.md §3](AGENTS.md#3-飞书应用安装过程自动生成)。
+- **例外：沿用已有的应用**：把 App ID / App Secret 填进 `.env`，再到开发者后台检查这个应用（不是新建）：
   1. 已添加「机器人」能力；
   2. 事件订阅用「使用长连接接收事件」，并添加 `im.message.receive_v1`；
-  3. 批量导入 scope（JSON 见 [AGENTS.md §3A](AGENTS.md#3a-已有飞书应用不扫码)）；
+  3. 批量导入 scope（JSON 见 [AGENTS.md §3B](AGENTS.md#3b-沿用已有的应用例外不扫码)）；
   4. 已发布版本。
 
   owner 的登记：先 `npm start >> bridge.log 2>&1`，自己私聊机器人一句；再跑 `npm run setup`，它会从日志里找出你的 open_id；最后 `npm run setup -- --set-owner ou_…`。
@@ -371,7 +372,7 @@ CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EF
 
 **不支持**（租户身份答不了，或根本没做）：审批、日历、任务、通讯录、云盘文件列表、消息历史检索、视频会议、打卡、OKR。
 
-想要这些，接飞书官方 [lark-cli](https://github.com/larksuite/cli)（22 个业务域 200+ 命令，走**用户 OAuth**，凭据在系统钥匙串）：`npx @larksuite/cli@latest install` 登录后，在 `.env` 设 `LARK_CLI=true`。桥接只给 owner 加一条 `Bash(lark-cli:*)`——实测 `lark-cli x && whoami` 这类拼接被挡，`env` / `ps aux` / `curl` 被拒，机器人读不到 `.env` 里的 App Secret；`whoami` / `pwd` 这类 CLI 内置的无害只读命令会放行。访客永远拿不到它。
+想要这些，接飞书官方 [lark-cli](https://github.com/larksuite/cli)（22 个业务域 200+ 命令，走**用户 OAuth**，凭据在系统钥匙串）：`npm install -g @larksuite/cli` 装好命令 → `npm run setup -- --link-lark-cli` 让它用桥接同一个应用 → `lark-cli auth login --recommend` 以 owner 身份登录（要人在浏览器同意）→ 在 `.env` 设 `LARK_CLI=true`（步骤见 [AGENTS.md §3C](AGENTS.md#3c-让-lark-cli-用同一个应用可选只在要用-lark-cli-功能时)）。不要再跑 `lark-cli config init --new`，那会多建一个应用。桥接只给 owner 加一条 `Bash(lark-cli:*)`——实测 `lark-cli x && whoami` 这类拼接被挡，`env` / `ps aux` / `curl` 被拒，机器人读不到 `.env` 里的 App Secret；`whoami` / `pwd` 这类 CLI 内置的无害只读命令会放行。访客永远拿不到它。
 
 ## 🧩 可选的提示词补充
 

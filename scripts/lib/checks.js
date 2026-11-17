@@ -201,7 +201,7 @@ export function checkOptionalBins(values, { run = defaultRun, env = process.env 
     const r = run(bin, ['--version'], { env });
     out.push(r.error
       ? item('lark_cli', 'warn', 'lark-cli', `开了 LARK_CLI / HEARTBEAT_WATCH，但找不到 ${bin}`,
-          '安装官方 lark-cli 并以 owner 身份登录（登录要人在浏览器完成）；不用这些功能就把开关关掉')
+          'npm install -g @larksuite/cli，再 npm run setup -- --link-lark-cli 让它用桥接同一个应用，然后以 owner 身份 lark-cli auth login（要人在浏览器完成，AGENTS.md §3C）；不用这些功能就把开关关掉')
       : item('lark_cli', 'ok', 'lark-cli', '已找到（是否已登录请人确认）'));
   }
   const ff = values.FFMPEG_BIN || 'ffmpeg';

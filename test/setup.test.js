@@ -244,7 +244,8 @@ function makeRoot({ deps = true } = {}) {
 }
 
 function runScript(script, args, { claudeBin, home }) {
-  const env = { PATH: process.env.PATH, HOME: home, USER: 'tester', CLAUDE_BIN: claudeBin };
+  // LARK_CLI_BIN 指向不存在的路径：PATH 里可能有真实 lark-cli，setup 会跑它的 config show
+  const env = { PATH: process.env.PATH, HOME: home, USER: 'tester', CLAUDE_BIN: claudeBin, LARK_CLI_BIN: path.join(home, 'no-lark-cli') };
   return spawnSync(process.execPath, [path.join(REPO, 'scripts', script), ...args], { encoding: 'utf8', env, timeout: 60_000 });
 }
 

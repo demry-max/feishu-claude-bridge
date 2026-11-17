@@ -17,6 +17,9 @@
   没有 TTY 时默认两段式，不再阻塞 10 分钟；`.env` 已有凭据时默认拒绝（避免重复建应用），`--force` 才继续；写凭据前先从 `.env.example` 生成完整 `.env`；
   不打印 App Secret；国际版的后台链接改为 `open.larksuite.com`；`FEISHU_DOMAIN` 从仓库根目录的 `.env` 读，不再依赖当前目录。
 - **`npm run install-service`**：plist 写入 `ExitTimeOut = SHUTDOWN_GRACE_SEC + 10`（launchd 默认约 20 秒强杀，优雅退出等不完）；`LAUNCHD_LABEL` / `CLAUDE_BIN` 也读 `.env`；装完打印核验命令。
+- **飞书应用由安装过程自动生成，不再要求到开发者后台手工建应用**：默认 `npm run register` 扫码（与 lark-cli `config init --new` 同一个注册接口，每扫一次码一个新应用）；
+  新增 `npm run setup -- --link-lark-cli`（`scripts/lib/lark-link.js`）：用 `lark-cli config init --app-id … --app-secret-stdin --brand …` 让 lark-cli 用 `.env` 里同一个应用，Secret 只走 stdin；
+  lark-cli 已配置别的应用时报 🙋、加 `--force` 才替换。`npm run setup` 新增 `lark_cli_app` 一项（只读 `lark-cli config show` 的 appId；没装 lark-cli 不报）。
 - **新增 `examples/feishu-claude-bridge.service`**：Linux systemd 用户服务示例（本仓库不自动安装）。
 - README.md / README.en.md 重写快速开始与功能列表（逐项写默认状态），中英文对齐，去掉内部称呼与内部路径；
   `docs/*-prompt-proposal.md` 去内部化，作为「可选的提示词补充」；旧版从零手写部署手册标注为过时、改指向 AGENTS.md。

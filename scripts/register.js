@@ -80,6 +80,8 @@ function onSuccess(p) {
   console.log('   ' + scopeImportJson(RECOMMENDED_SCOPES));
   console.log('   然后「创建版本」→ 发布。之后 npm run doctor（或 npm start 的启动日志）会告诉你哪些工具已可用。');
   console.log('\n下一步：npm run setup 复查，然后 npm start 启动机器人，到飞书私聊它发「你好」。');
+  // lark-cli 建应用走的是同一个注册接口：再跑 lark-cli config init --new 会多出第二个应用
+  console.log('要用飞书官方 lark-cli 时：npm run setup -- --link-lark-cli 让它用这同一个应用（不要再跑 lark-cli config init --new）。');
   process.exit(0);
 }
 

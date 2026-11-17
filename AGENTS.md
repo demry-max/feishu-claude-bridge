@@ -12,7 +12,7 @@
 1. **不打印、不复述、不提交任何密钥。**
    - 说的是 `.env` 的内容、`FEISHU_APP_SECRET`、`CLAUDE_CODE_OAUTH_TOKEN`、`data/` 下的文件。
    - 不要 `cat .env`。要看哪几项已填，用 `npm run setup`：它只报「齐 / 缺」，不输出值。
-   - 人把 App Secret 发给你时，按 [§3A](#3a-已有飞书应用不扫码) 写进 `.env`，回复里不重复它。
+   - 人把 App Secret 发给你时，按 [§3B](#3b-沿用已有的应用例外不扫码) 写进 `.env`，回复里不重复它。
    - 不要 `git add .env` / `git add -A`。
 2. **不加 `--dangerously-skip-permissions`。**
    - 不给 `ALLOWED_TOOLS` / `NON_OWNER_TOOLS` 加 `Bash`。
@@ -48,6 +48,7 @@
 | `node` / `npm` / `deps` | §2 |
 | `claude_cli` / `claude_model` / `claude_auth` | §2 |
 | `env_file` / `feishu_credentials` | §3 |
+| `lark_cli_app` / `link_lark_cli` | §3C，可选 |
 | `feishu_scopes` | §4 |
 | `owner` / `set_owner` | §5 |
 | `service*` | §7 |
@@ -119,19 +120,72 @@ npm ci
 
 - **命令**：`npm run setup`
 - **成功**：`env_file` ✅，提示「已从 .env.example 生成（权限 600）」或「已存在」。
-- 这时 `feishu_credentials` 是 🙋，接下来二选一：
-  - **人已经有飞书应用**的 App ID / App Secret → §3A。
-  - **新建应用** → §3B（扫码，最省事）。
+- 这时 `feishu_credentials` 是 🙋。接下来按 §3 的表选路，**默认走 §3A**（扫码自动建应用）。
 
-## 3. 飞书应用凭据（二选一）
+## 3. 飞书应用：安装过程自动生成
 
-### 3A. 已有飞书应用（不扫码）
+**不要让人到飞书开发者后台手工「创建应用」。** 应用由扫码注册自动生成，人只需要扫码授权：
+
+- 桥接自带的 `npm run register` 调飞书的应用注册接口（`/oauth/v1/app/registration`，`archetype=PersonalAgent`，见 `scripts/register.js:32-34`、`:124-135`）。扫码同意后，接口直接返回 App ID、App Secret 和扫码人的 open_id，脚本写进 `.env`。
+- 飞书官方 lark-cli 的 `lark-cli config init --new` 走的是**同一个**注册接口，也是扫码自动建应用（lark-cli 1.0.97 二进制里含同一端点与 `PersonalAgent`）。它的安装向导 `npx @larksuite/cli install` 在有终端时会调这一步（`install-wizard.js:298-328`），没终端时跳过（`:374-379`）。
+- **每扫一次码就是一个新应用。** 两边各扫一次，就是两个应用。桥接只认 `.env` 里的 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`；lark-cli 用自己的配置：App ID 在 `lark-cli config show` 里，App Secret 在系统钥匙串里，lark-cli 没有导出 Secret 的命令。
+- 所以能自动化的方向是「桥接 → lark-cli」：先让桥接建好应用，再用 `npm run setup -- --link-lark-cli` 把同一个应用交给 lark-cli（§3C）。反过来，setup 只能读到 lark-cli 应用的 App ID，读不到 Secret。
+
+**人要做的只剩这几件**（其余都由命令完成）：
+
+| `[需要人]` | 为什么命令做不了 | 在哪 |
+|---|---|---|
+| 扫码授权建应用 | 要人用飞书 App 确认 | §3A 第 2 步 |
+| 权限批量导入 + 发布版本（只做一次） | 注册接口建出来的应用没有开通 scope（`scripts/register.js:76-81`），开通和发布只能在开发者后台点 | §3A 第 4 步 |
+| `claude` 登录 | 浏览器登录 Claude 账号 | §2.3 |
+| lark-cli 用户登录（只在要用 lark-cli 功能时） | 用户 OAuth，要人在浏览器同意 | §3C 第 3 步 |
+
+**选路**（`npm run setup` 的 `lark_cli_app` 一项会告诉你 lark-cli 现在的状态）：
+
+| 情况 | 做法 |
+|---|---|
+| 全新安装（默认） | §3A |
+| 本机 lark-cli 已经配置过应用（`lark_cli_app` 报「lark-cli 已配置应用 cli_…」） | 仍走 §3A 给桥接建应用，再 §3C 让 lark-cli 改用同一个。想沿用 lark-cli 那个应用，只能请人把它的 App Secret 填进 `.env`（§3B） |
+| 人手上已经有在用的应用，并明确要沿用 | §3B |
+
+### 3A. 扫码自动建应用（默认，两段式）
+
+1. **命令**：`npm run register -- --no-wait`
+   - **成功**：退出码 `2`，输出一行 `[需要人]` 和一个 `https://…` 链接。设备码存在 `data/register-pending.json`，约 10 分钟内有效。
+   - 国际版 Lark 先在 `.env` 加一行 `FEISHU_DOMAIN=lark`。
+   - **失败**：
+     - 退出码 `1` 且提示「.env 里已有 FEISHU_APP_ID / FEISHU_APP_SECRET」：已经有应用了，走 §3B 的验证，**不要加 `--force`**。`--force` 会在飞书里再建一个应用并覆盖凭据。
+     - 网络错误见 §10。
+2. **`[需要人]` 扫码**
+   - **转告人**（附上链接）：
+     > 请用手机飞书扫这个链接生成的二维码，或直接在手机上打开链接，按提示创建应用并同意授权，完成后告诉我：<链接>
+     >
+     > Please open this link on your phone in the Feishu/Lark app (or scan it as a QR code), create the app and approve, then tell me: <link>
+3. **命令**：`npm run register -- --resume`。最多等 120 秒，可加 `--timeout 300`。
+   - **成功**：退出码 `0`。App ID、App Secret（不打印）、扫码人的 `OWNER_OPEN_ID` 写进 `.env`，并写 `data/owner.json`。owner 因此已登记，§5 不用做。
+   - 退出码 `2`：人还没点完，过一会儿再跑同一条。
+   - 提示链接过期：回到第 1 步。
+4. **`[需要人]` 开通权限并发布**（只做一次）
+   - 注册接口建出来的应用没有开通 scope。聊天可用，但文档 / 多维表格 / 电子表格工具用不了。
+   - 第 3 步的输出末尾有一段 scope JSON 和后台地址。
+   - **转告人**：
+     > 请打开飞书开发者后台里刚扫码生成的应用（不用新建），「权限管理 → 批量导入」粘贴我给你的 JSON，然后「版本管理与发布」创建版本并发布，完成后告诉我。
+     >
+     > Open the app that was just created by the scan in the Feishu developer console (do not create a new one), paste the JSON I give you into Permissions → Batch import, then create and publish a version. Tell me when done.
+   - **验证**：`npm run doctor -- --json`，`feishu_scopes` 为 `ok`。
+   - 人明确不需要文档 / 表格工具时可以跳过这一步。
+- 有 TTY 的人自己在终端跑 `npm run register`（不带参数）时，是老的交互式二维码，原地等待。
+
+### 3B. 沿用已有的应用（例外，不扫码）
+
+只在人明确要沿用手上已有的应用时走这条（包括 lark-cli 已经建好的那个）。
 
 1. **`[需要人]` 填凭据**
    - **转告人**：
      > 请打开项目目录里的 `.env` 文件，把飞书开发者后台「凭证与基础信息」里的 App ID 和 App Secret 分别填到 `FEISHU_APP_ID=` 和 `FEISHU_APP_SECRET=` 后面，保存后告诉我。不用把 Secret 发给我。
      >
      > Please open the `.env` file in the project folder and fill in `FEISHU_APP_ID=` and `FEISHU_APP_SECRET=` with the App ID and App Secret from "Credentials & Basic Info" in the Feishu developer console. Save it and tell me. You don't need to send me the secret.
+   - 沿用的是 lark-cli 的应用时，App ID 就是 `lark_cli_app` 那项列出的 `cli_…`，可以直接告诉人；Secret 仍要人去后台复制。
    - 人坚持把值发给你时，用不回显的方式写入，例如：
 
      ```bash
@@ -141,7 +195,8 @@ npm ci
      命令行参数会进 shell 历史，所以能让人自己填就让人自己填。之后不在对话里重复这个值。
    - 国际版 Lark 另加一行 `FEISHU_DOMAIN=lark`。
    - **验证**：`npm run setup`，`feishu_credentials` ✅。
-2. **`[需要人]` 开发者后台配置**（老应用可能已做过，逐项确认）
+2. **`[需要人]` 开发者后台确认**（不是新建应用，是检查这个已有应用的配置）
+   - 扫码生成的应用（§3A 或 lark-cli 建的）按 `scripts/register.js:76-81` 只差 ③④，和 §3A 第 4 步一样。①② 主要是给早年在后台手工建的应用查的；§6 收不到 `[msg]` 时再查①②（真机未逐项验证扫码应用的默认配置）。
    - **转告人**：
      > 请在飞书开发者后台打开这个应用，确认四件事：
      > ①「应用能力」里已添加「机器人」；
@@ -166,32 +221,34 @@ npm ci
      - `needs_human`：message 里列出还缺的 scope，提醒人补完后**重新发布版本**。
      - `fail`：凭据错，或网络不通（§10）。
    - 长连接与事件订阅脚本查不到，要在 §6 前台验证时确认。
+3. owner 要按 §5 登记（这条路径不会自动登记）。
 
-### 3B. 新建应用（扫码，两段式）
+### 3C. 让 lark-cli 用同一个应用（可选，只在要用 lark-cli 功能时）
 
-1. **命令**：`npm run register -- --no-wait`
-   - **成功**：退出码 `2`，输出一行 `[需要人]` 和一个 `https://…` 链接。设备码存在 `data/register-pending.json`，约 10 分钟内有效。
-   - **失败**：
-     - 退出码 `1` 且提示「.env 里已有 FEISHU_APP_ID / FEISHU_APP_SECRET」：已经有应用了，走 3A 的验证，**不要加 `--force`**。`--force` 会在飞书里再建一个应用并覆盖凭据。
-     - 网络错误见 §10。
-2. **`[需要人]` 扫码**
+桥接本身不需要 lark-cli。只有 §8 里的「外部增量」「lark-cli」功能、或邮件附件下载要用它。它以 owner 的**用户身份**调接口，所以除了应用之外还要人登录一次。
+
+1. **装命令**：`lark-cli --version` 没有输出时，`npm install -g @larksuite/cli`。
+   - 只装命令，不配置应用。**不要**跑 `lark-cli config init --new`，那会再扫码建第二个应用。
+   - 官方安装向导 `npx @larksuite/cli@latest install` 会额外往全局装 AI skills，要先问人。它在有终端时会问「发现已配置应用，继续使用？」，先做完第 2 步再跑、选「是」，就不会新建应用。
+2. **命令**：`npm run setup -- --link-lark-cli`
+   - 它跑 `lark-cli config init --app-id <.env 的 App ID> --app-secret-stdin --brand <feishu|lark>`。Secret 只经 stdin 传，不进命令行参数，也不出现在输出里。
+   - **成功**：`link_lark_cli` ✅，之后 `npm run setup` 的 `lark_cli_app` 是 ✅「与桥接是同一个应用」。
+   - `needs_human`：lark-cli 已经配置了另一个应用。替换后 lark-cli 原来的登录要重做。转告人：
+     > 本机的 lark-cli 现在用的是另一个飞书应用。要不要改成和机器人同一个？改了以后 lark-cli 需要重新登录一次。
+     >
+     > lark-cli on this machine uses a different Feishu app. Switch it to the bot's app? lark-cli will need one new login afterwards.
+
+     人同意后跑 `npm run setup -- --link-lark-cli --force`。人不同意就保持两个应用，也能用。
+   - `fail`：按 message 处理。凭据错时 lark-cli 会报错，先 `npm run doctor` 看 `feishu_scopes`。
+3. **`[需要人]` lark-cli 用户登录**
+   - **命令**：`lark-cli auth login --recommend --no-wait`。它立即返回一个授权链接和 device code，不阻塞。
    - **转告人**（附上链接）：
-     > 请用手机飞书扫这个链接生成的二维码，或直接在手机上打开链接，按提示创建应用并同意授权，完成后告诉我：<链接>
+     > 请在浏览器打开这个链接，用你的飞书账号同意授权，完成后告诉我：<链接>
      >
-     > Please open this link on your phone in the Feishu/Lark app (or scan it as a QR code), create the app and approve, then tell me: <link>
-3. **命令**：`npm run register -- --resume`。最多等 120 秒，可加 `--timeout 300`。
-   - **成功**：退出码 `0`。App ID、App Secret（不打印）、扫码人的 `OWNER_OPEN_ID` 写进 `.env`，并写 `data/owner.json`。
-   - 退出码 `2`：人还没点完，过一会儿再跑同一条。
-   - 提示链接过期：回到第 1 步。
-4. **`[需要人]` 开通权限并发布**
-   - 注册接口建出来的应用**零权限**。聊天可用，但文档 / 多维表格 / 电子表格工具用不了。
-   - 第 3 步的输出末尾有一段 scope JSON 和后台地址。
-   - **转告人**：
-     > 请打开飞书开发者后台里刚创建的应用，「权限管理 → 批量导入」粘贴我给你的 JSON，然后「版本管理与发布」创建版本并发布，完成后告诉我。
-     >
-     > Open the new app in the Feishu developer console, paste the JSON I give you into Permissions → Batch import, then create and publish a version. Tell me when done.
-   - **验证**：`npm run doctor -- --json`，`feishu_scopes` 为 `ok`。
-- 有 TTY 的人自己在终端跑 `npm run register`（不带参数）时，是老的交互式二维码，原地等待。
+     > Please open this link in a browser, approve with your Feishu account, then tell me: <link>
+   - **命令**：`lark-cli auth login --device-code <上一步输出的 device code>`，取回登录结果。
+   - **验证**：`lark-cli auth status`。
+- 依据：lark-cli 1.0.97 的 README（「快速开始（AI Agent）」「认证」两节）与二进制里的帮助字符串 `Initialize configuration (app-id / app-secret-stdin / brand)`、`Brand (lark/feishu)`。本机执行环境不允许运行 lark-cli，`--link-lark-cli` 只用 stub 测过，没有对真实 lark-cli 跑过。
 
 ## 4. 验证 scope（两条路径共用）
 
@@ -205,8 +262,8 @@ npm ci
 
 owner 是唯一能用本机工具和记忆的人，其他人只能联网检索。
 
-- **3B 扫码路径**：已自动登记。setup 的 `owner` 项应是 ✅。
-- **3A 路径**：`owner` 是 🙋。你需要人的 open_id，做法如下：
+- **§3A 扫码路径**：已自动登记。setup 的 `owner` 项应是 ✅。
+- **§3B 沿用已有应用**：`owner` 是 🙋。你需要人的 open_id，做法如下：
   1. 前台启动并把日志写进文件：`npm start >> bridge.log 2>&1`。
      - 这是长驻进程。用你的工具在后台跑，并记下 PID；或请人在另一个终端跑。
   2. **`[需要人]` 私聊机器人**
@@ -289,7 +346,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 引用回复快捷操作 | 关 | `HEARTBEAT_REPLY_SHORTCUTS=true` | 心跳已开 |
 | 表情 / 已读 / 撤回事件 | 收不到也不影响 | — | 后台订阅 `im.message.reaction.created_v1`、`im.message.message_read_v1`、`im.message.recalled_v1` |
 | 未读暂停 | 关 | `HEARTBEAT_UNREAD_PAUSE=N` | 已读事件已订阅 |
-| 外部增量（群回复、审批） | 关 | `HEARTBEAT_WATCH=chat_reply,approval` | 本机装好 lark-cli 并以 owner 身份登录（`[需要人]` 浏览器授权） |
+| 外部增量（群回复、审批） | 关 | `HEARTBEAT_WATCH=chat_reply,approval` | 按 §3C 装好 lark-cli、用桥接同一个应用，并以 owner 身份登录（`[需要人]` 浏览器授权） |
 | 验收 | 关 | `HEARTBEAT_VERIFY=rule` 或 `rule+model` | 心跳已开；`rule+model` 另用 `VERIFY_MODEL`，每日上限 `VERIFY_MAX_PER_DAY` |
 | 升级阶梯 | 关 | `HEARTBEAT_ESCALATE_LADDER=true` | 心跳已开；级数 `ESCALATE_MAX` |
 | 每晚台账日结 | 关 | `HEARTBEAT_DIGEST_AT=21:30` | 心跳已开；时间不能落在免打扰时段 |
@@ -308,6 +365,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 - [ ] `feishu_scopes` ✅，或人明确表示不需要文档 / 表格工具。
 - [ ] 常驻服务在运行（§7 的验证命令），日志里有 `ws client ready`。
 - [ ] 人私聊机器人能收到回复；人发 `/status` 能看到会话信息。
+- [ ] 没有让人到开发者后台新建应用。本机装了 lark-cli 时，`lark_cli_app` ✅，或人明确选择保留两个应用。
 - [ ] `git status` 里没有 `.env`、`data/`。你没有在对话里输出过任何密钥。
 
 ## 10. 常见故障
@@ -321,6 +379,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 需要代理才能上网 | 桥接没有专门的代理配置项：机器要能访问 `open.feishu.cn` / `open.larksuite.com`（含长连接地址）和 Claude 的服务。必须走代理时，可试在启动环境里设 `HTTPS_PROXY`（Node ≥ 22.21 / 24.5 再加 `NODE_USE_ENV_PROXY=1`，让内置 fetch 走代理），**未经验证**，长连接是否走代理取决于飞书 SDK。常驻服务要把这些变量写进 plist / unit 的环境里 |
 | 长连接静默断开 | 桥接在 SDK 放弃重连或巡检到 `failed` 时，约 15 秒后主动退出，交给 launchd / systemd 拉起，连环失败会退避到 15 分钟。Windows 启动项不会自动拉起（§7） |
 | `.env` 改了不生效 | shell 里 export 过同名变量（dotenv 不覆盖已有变量）：doctor 的 `env_shadowed` 会列出来。前台启动前 `unset`；常驻服务不受影响 |
+| 飞书里多出一个应用 | `npm run register` 和 `lark-cli config init --new` 各扫了一次码（每次扫码都建新应用）：保留 `.env` 里那个，`npm run setup -- --link-lark-cli --force` 让 lark-cli 改用它；多余的应用由人在后台停用 |
 | 回复了两遍 | 前台进程和常驻服务同时在跑：停掉一个 |
 | 常驻服务里找不到 claude / ffmpeg | 服务不读 shell 配置：macOS 重跑 `npm run install-service`（会重新取 `which claude`）；doctor 的 `service_claude_path` 会提示 |
 
