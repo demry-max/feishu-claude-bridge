@@ -1230,6 +1230,58 @@ describe('测试 7（BRIDGE-VR-1）：升级阶梯 HEARTBEAT_ESCALATE_LADDER', (
     assert.deepEqual(vr.snap(env2), before2);
   });
 
+  test('同一拍两条一起越过：两条都登第一级（不记 mid，按没读等 48 小时）；之后不再为 escalate_after 调模型；每条最多提醒 ESCALATE_MAX 次，然后进日结「卡住」（R1 M3）', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'quote', ESC);
+    vr.writeTask(env, 'inv', { ...ESC, title: '催发票', notes: '财务说月底前开' });
+    const h = vr.harness(env, { config: LCFG({ HEARTBEAT_DIGEST_AT: '21:30' }) });
+    await h.hb.beat();
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.sent.length, 1, '两条合在一条心跳消息里');
+    assert.ok(!h.sent[0].opts?.actions?.length, '涉及两条：不带按钮');
+    for (const slug of ['inv', 'quote']) {
+      assert.deepEqual(h.readState().tasks[slug]?.esc, { for: '2026-11-16T09:00', level: 1, last_at: vr.T0.toISOString() }, slug);
+    }
+    for (const m of [1, 24, 47]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(h.sent.length, 1, '没有 mid：按没读，满 48 小时才升级');
+    assert.equal(h.calls.length, 1, '登梯后 escalate_after 不再算到期理由：不再调模型');
+    for (const m of [48, 49, 72, 90]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(h.calls.length, 1, '第二级是模板，不调模型');
+    const per = (title) => templates(h).filter((x) => x.text.includes(`『${title}』`)).length;
+    assert.equal(per('跟进报价单'), 1, '第一级心跳消息 + 一次模板＝ESCALATE_MAX（2）次');
+    assert.equal(per('催发票'), 1);
+    assert.equal(templates(h).length, 2);
+    for (const slug of ['inv', 'quote']) assert.equal(h.readState().tasks[slug].esc.level, 2, slug);
+    h.setNow(vr.at(2026, 11, 19, 21, 30));
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    const stuck = h.sent.at(-1).text.split('\n').find((l) => l.startsWith('**卡住**'));
+    assert.ok(stuck && stuck.includes('跟进报价单') && stuck.includes('催发票'), h.sent.at(-1).text);
+  });
+
+  test('免打扰时段里第一次越过、消息进了待发队列：同样登第一级（不记 mid），不再为它调模型（R1 M3）', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'quote', ESC);
+    const h = vr.harness(env, { config: LCFG({ HEARTBEAT_QUIET_HOURS: '22-08' }), now: vr.at(2026, 11, 16, 23, 0) });
+    await h.hb.beat();
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.sent.length, 0, '免打扰：不发');
+    assert.equal(h.readState().pending.length, 1, '进了待发队列');
+    assert.deepEqual(escOf(h), { for: '2026-11-16T09:00', level: 1, last_at: vr.at(2026, 11, 16, 23, 0).toISOString() });
+    for (const d of [vr.at(2026, 11, 17, 1, 0), vr.at(2026, 11, 17, 8, 30)]) {
+      h.setNow(d);
+      await h.hb.beat();
+    }
+    assert.equal(h.calls.length, 1, '登梯后不再为 escalate_after 调模型');
+    assert.equal(h.sent.length, 1, '免打扰结束后补发');
+    assert.equal(escOf(h).level, 1);
+  });
+
   test('第一次越过时模型回 HEARTBEAT_OK：不登梯（照 HB-1B 继续看）', async () => {
     const env = vr.mkEnv();
     vr.writeTask(env, 'quote', ESC);
@@ -1297,7 +1349,7 @@ describe('测试 10（BRIDGE-VR-1）：新开关全关（默认）＝逐字 EV-1
     assert.ok(!h.calls[0][1].includes('tasks/v.json'), 'verify 条目不进心跳提示词');
     assert.equal(h.sent.length, 1);
     assert.deepEqual(h.sent[0].opts.actions, ledgerButtons('quote', vr.btn(h.sent[0], 'ack').n));
-    assert.equal(Object.keys(h.readState().tasks.quote).filter((k) => ['esc', 'owner_confirmed_at', 'rejected'].includes(k)).length, 0);
+    assert.equal(Object.keys(h.readState().tasks.quote).filter((k) => ['esc', 'owner_confirmed_at', 'rejected', 'rejected_at'].includes(k)).length, 0);
     assert.ok(!h.logs.some((l) => /verify|验收|日结|阶梯/.test(l)), h.logs.join('\n'));
   });
 

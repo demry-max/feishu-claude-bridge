@@ -298,6 +298,29 @@ describe('验收工具档 toolProfile=verifier（BRIDGE-VR-1 测试 5）', () =>
       assert.deepEqual(a.args, b.args);
       assert.equal(a.cwd, b.cwd);
     }));
+
+  // 只用一次性目录（os.tmpdir() 下新建），绝不把仓库 / workspace 交给 cleanup：防护被改坏时也只删到这些临时目录
+  test('cleanup 只删自己建的、os.tmpdir() 正下方的 feishu-verifier- 目录：cwd 被改到别处时不删（R1 L3）', () =>
+    withEnv(WIDE, (m) => {
+      const fs = process.getBuiltinModule('node:fs');
+      const r = vr(m);
+      const own = r.cwd;
+      const other = fs.mkdtempSync(path.join(os.tmpdir(), 'vr-l3-'));
+      const nested = fs.mkdtempSync(path.join(other, 'feishu-verifier-')); // 名字像，但不在 os.tmpdir() 正下方
+      try {
+        for (const dir of [nested, other]) {
+          r.cwd = dir;
+          r.cleanup();
+          assert.ok(fs.existsSync(dir), `cwd 被改成 ${dir}：cleanup 不得删`);
+        }
+        r.cwd = own;
+        r.cleanup();
+        assert.ok(!fs.existsSync(own), '自己建的临时目录照常删');
+      } finally {
+        fs.rmSync(other, { recursive: true, force: true });
+        fs.rmSync(own, { recursive: true, force: true });
+      }
+    }));
 });
 
 describe('验收工具档：调用方没给模型或给了非法模型名时兜底 claude-haiku-5-5（BRIDGE-VR-1 测试 5 补）', () => {

@@ -193,30 +193,39 @@ workspace/
 
 - **验收**（`HEARTBEAT_VERIFY=rule|rule+model`）：台账多一个状态 `verify`（等验收）和一个可选字段
   `done_evidence: { "kind": "approval|message|owner|other", "ref": "…", "summary": "≤200 字" }`
-  （`approval` 的 ref 是审批实例码，`message` 的 ref 是 `om_…`，`owner` / `other` 不填 ref）。
+  （`approval` 的 ref 是审批实例码，`message` 的 ref 是 `om_…`，`owner` / `other` 不填 ref；`owner` 只由桥接写）。
+  依据格式不合规时台账照常有效（不会因此逃出验收）：桥接不取这份依据、记下原因，核对时直接发卡片。
   心跳一拍里被写成 `done` 的台账，桥接在这一拍结束时改成 `verify`——模型说办完了不算数；owner 对话里、桥接自己写的 `done` 照旧。
   之后每拍最多核对 3 条待验收：
-  1. **脚本规则**（只读，只用 EV-1 已有的 lark-cli 模板）：`approval` 要 ref 等于台账 `watch.instance_code`，且审批已是终态
-     （APPROVED / REJECTED / CANCELED / DELETED）；`message` 要那条消息在台账 `watch.chat_id` 的会话里、是对方真人发的
-     （不是 owner 本人、机器人、系统消息或已撤回）。通过 → 桥接写 `done`。`owner` 一律不算（owner 的确认只认按钮 / 引用回复），`other` 没有规则。
-  2. **规则没通过**：`rule` 档直接发验收卡片；`rule+model` 档再问一次 `VERIFY_MODEL`，只认一行严格 JSON
+  1. **脚本规则**（只读，只用 EV-1 已有的 lark-cli 模板），结果分三种：
+     - **通过**（桥接写 `done`）只有两种：`approval` 的 ref 等于台账 `watch.instance_code` 且审批状态是 `APPROVED`（已通过）；
+       `message` 那条消息在台账 `watch.chat_id` 的会话里、是对方真人发的（不是 owner 本人、机器人、系统消息或已撤回），
+       而且发在交办之后——发送时间（10 位按秒、13 位按毫秒）不早于台账 `created_at` 与数字 `watch.after` 中晚的那个；两样都没有就判不了，算不通过。
+     - **不通过**：`approval` / `message` 的其余情况，包括审批被拒绝 / 撤回 / 删除（REJECTED / CANCELED / DELETED，卡片写明状态请 owner 决定）、
+       还没通过、ref 对不上、消息是 owner 本人发的或早于交办、lark 查询失败，以及依据格式不合规。直接发验收卡片，**不问模型**（模型推翻不了）。
+     - **核对不了**：没写依据、`kind=other`、模型写的 `kind=owner`（owner 的确认只认按钮 / 引用回复）。
+  2. **核对不了的**：`rule` 档直接发验收卡片；`rule+model` 档再问一次 `VERIFY_MODEL`，只认一行严格 JSON
      `{"verdict":"pass|fail|unsure","reason":"≤80 字"}`：`pass` → 写 `done`；`fail` / `unsure` / 没按格式 / 调用失败 → 发验收卡片。
-     审核用 verifier 档：没有任何工具，不加载 settings 来源与 MCP，cwd 是每次新建的系统临时目录（不是 `workspace/`），不续会话。
+     审核用 verifier 档：没有任何工具，不加载 settings 来源与 MCP，cwd 是每次新建的系统临时目录（不是 `workspace/`；用完只删这个 `feishu-verifier-` 目录），不续会话。
      每日最多 `VERIFY_MAX_PER_DAY` 次，用满后直接发卡片。
   3. **验收卡片**「🔍 待你验收」：助理写的标题 / 进展 / 依据在不可信围栏里，桥接的核对结论在围栏外。
      按钮（`HEARTBEAT_BUTTONS=true`）［✅ 验收］［↩ 没办完］［🗑 不做了］，或引用回复「验收」「没办完」「不做了」（`HEARTBEAT_REPLY_SHORTCUTS=true`）。
-     「没办完」改回 `open`、`next_check_at` 推到明天，同一份依据以后不再自动通过（依据改了重新核对）。
+     「没办完」（以及日结里的［撤销］）改回 `open`、`next_check_at` 推到明天，并按台账记下「判过没办完」：之后这条再被写成 `done`，
+     不论依据改没改，一律发卡片请 owner 确认（不核对、不问模型）；owner 点［验收］或［办完了］后清掉。
      同一份依据只发一张卡片；卡片不进待发队列，免打扰 / 未读暂停 / 本拍发满时下一拍再试。
-- **升级阶梯**（`HEARTBEAT_ESCALATE_LADDER=true`）：`escalate_after` 第一次越过那拍的心跳消息算第 1 级；之后按固定模板再提醒（不调模型）：
+- **升级阶梯**（`HEARTBEAT_ESCALATE_LADDER=true`）：`escalate_after` 第一次越过那拍的心跳消息算第 1 级（同一拍几条一起越过、消息进了待发队列、
+  或 24 小时内发过同样的，这几条也都登第 1 级；这时不记消息 ID，下一级按没读等满 48 小时；阶梯按钮只给只涉及一条的消息）；之后按固定模板再提醒（不调模型）：
   上一级读了满 24 小时、或没读满 48 小时才升一级（没读不叠发），owner 点过「知道了」就不再升；最多 `ESCALATE_MAX` 级，之后只进日结「卡住」。
   模板消息带［知道了］［推迟一天］［不做了］［办完了］，引用回复也多认「办完了」；`escalate_after` 改了就从第 1 级重新来。
 - **每晚日结**（`HEARTBEAT_DIGEST_AT=HH:MM`）：到点私聊 owner 一份五栏日结——今天办完（注明规则验收 / 模型验收 / 心跳轮写的 / 光总确认 / 会话里改的）、
   今天放弃、待你验收、卡住、明天到期。每栏最多列 5 条，整条消息不超过 15 行；**五栏都空不发**。
+  「今天办完」「今天放弃」从上一份日结的时刻（发出、进待发队列、重复不发、五栏全空都算）往后数，第一次从当天 0 点起：
+  日结发完之后才关的单、哪天没发日结那天关的单，都进下一份（带撤销）。
   只读台账与桥接自己记的状态变化（`data/heartbeat-state.json` 的 `history`），不读 journal、不调模型。
   自动判定办完的（规则 / 模型 / 心跳轮写的）带圈号，按钮开着时附［撤销①］…（改回 `open`、明天再看；撤销只认按钮）；发出后在当天 journal 记一段。
   一天只发一次（重启不重发）；到点后 30 分钟内没发出去（心跳正忙、进程刚起）就不补发。
 - `/heartbeat status` 多三行：验收（档位、待验收条数、今日模型审核次数）、升级阶梯（级数、升级中的条数）、日结时间。
-- 状态文件新增顶层键 `verify` / `history` / `verify_runs` 与 `tasks.<slug>.esc`，缺了按空处理，不升版本号。
+- 状态文件新增顶层键 `verify` / `history`（含 `digest_at`）/ `verify_runs` 与 `tasks.<slug>.esc` / `tasks.<slug>.rejected_at`，缺了按空处理，不升版本号。
 - 心跳轮怎么写 `done_evidence` 的提示词约定见 [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md)（建议稿，过审后并入 `workspace/CLAUDE.md`）。
 
 ### 优雅退出（SIGTERM / SIGINT）

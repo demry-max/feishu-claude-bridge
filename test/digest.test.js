@@ -228,6 +228,67 @@ describe('测试 8：日结内容', () => {
     assert.match(journalOf(env), /（桥接）光总点了『撤销』：tasks\/a\.json/);
     assert.deepEqual(await h.handlers.cardAction(click(dg.mid, u)), TOAST_STALE);
   });
+
+  // R1 H4：「今天办完 / 今天放弃」按上次日结的时刻（history.digest_at）往后数，不按自然日——日结发完之后、或者哪天没发出去，
+  // 那段时间里自动关的单都进下一次日结（带撤销），不会漏掉
+  const HOLD = (due) => ({ title: '占位', status: 'open', next_check_at: '2026-11-25T09:00', created_at: '2026-11-10T09:00', due_at: due });
+
+  test('日结发完之后（21:45）规则自动关的单：次日日结列进「今天办完」并带撤销按钮（R1 H4）', async () => {
+    const env = mkEnv();
+    writeTask(env, 'hold', HOLD('2026-11-17T10:00')); // 让 21:30 这次有内容可发（明天到期）
+    const h = harness(env, { now: NIGHT, config: DCFG({ HEARTBEAT_VERIFY: 'rule', HEARTBEAT_BUTTONS: 'true' }), verifyRunner: approved });
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    assert.equal(h.readState().history.digest_at, NIGHT.toISOString());
+    assert.ok(!h.sent.at(-1).text.includes('报销审批'));
+    writeTask(env, 'appr', APPR);
+    h.setNow(at(2026, 11, 16, 21, 45));
+    await h.hb.beat();
+    assert.equal(readTask(env, 'appr').status, 'done');
+    h.setNow(at(2026, 11, 17, 21, 30));
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    const dg = h.sent.at(-1);
+    assert.ok(dg.text.includes('**今天办完**（1）：①报销审批（规则验收）'), dg.text);
+    const u = btn(dg, 'undo', 'appr');
+    assert.deepEqual(dg.opts.actions, undoButtons(['appr'], u.n));
+    assert.equal(h.readState().history.digest_at, at(2026, 11, 17, 21, 30).toISOString());
+    h.setNow(at(2026, 11, 17, 21, 35));
+    assert.deepEqual(await h.handlers.cardAction(click(dg.mid, u)), TOAST_OK);
+    assert.equal(readTask(env, 'appr').status, 'open');
+    // 再下一次日结：撤销之后没有新的变化，不再重复列
+    writeTask(env, 'hold', HOLD('2026-11-19T10:00'));
+    h.setNow(at(2026, 11, 18, 21, 30));
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    assert.ok(!h.sent.at(-1).text.includes('今天办完'), h.sent.at(-1).text);
+  });
+
+  test('哪天日结没发出去（那天桥接没开）：那天自动关的单进下一次日结（R1 H4）', async () => {
+    const env = mkEnv();
+    writeTask(env, 'hold', HOLD('2026-11-16T12:00'));
+    const h = harness(env, { now: at(2026, 11, 15, 21, 30), config: DCFG({ HEARTBEAT_VERIFY: 'rule', HEARTBEAT_BUTTONS: 'true' }), verifyRunner: approved });
+    assert.equal((await h.hb.digestNow()).action, 'sent'); // 11-15 的日结照常发
+    writeTask(env, 'appr', APPR);
+    h.setNow(T0); // 11-16 10:00 规则自动关单；11-16 晚上没发日结
+    await h.hb.beat();
+    assert.equal(readTask(env, 'appr').status, 'done');
+    h.setNow(at(2026, 11, 17, 21, 30));
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    const dg = h.sent.at(-1);
+    assert.ok(dg.text.includes('**今天办完**（1）：①报销审批（规则验收）'), dg.text);
+    assert.deepEqual(dg.opts.actions, undoButtons(['appr'], btn(dg, 'undo', 'appr').n));
+  });
+
+  test('五栏全空那次也记下日结时刻：之前的变化不再挪到下一次（R1 H4）', async () => {
+    const env = mkEnv();
+    writeTask(env, 'appr', APPR);
+    const h = harness(env, { config: DCFG({ HEARTBEAT_VERIFY: 'rule', HEARTBEAT_BUTTONS: 'true' }), verifyRunner: approved });
+    await h.hb.beat(); // 10:00 自动关单
+    h.setNow(NIGHT);
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    h.setNow(at(2026, 11, 17, 21, 30));
+    assert.equal((await h.hb.digestNow()).action, 'empty');
+    assert.equal(h.readState().history.digest_at, at(2026, 11, 17, 21, 30).toISOString());
+    assert.equal(h.readState().history.digest_day, '2026-11-16', '空的那次不记 digest_day');
+  });
 });
 
 describe('测试 8：日结定时器（不补发、重启不重发）', () => {

@@ -3,7 +3,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
-const { createShutdown, shutdownGraceSec, DRAINING_REPLY } = await import('../src/shutdown.js');
+const { createShutdown, shutdownGraceSec, DRAINING_REPLY, replyIfDraining } = await import('../src/shutdown.js');
 
 function rig({ graceSec = 120, busy = 0, onDrain } = {}) {
   const r = { busy, clock: 0, timers: [], exits: [], logs: [], drains: 0 };
@@ -129,5 +129,30 @@ describe('优雅退出：SIGTERM / SIGINT', () => {
 
   test('退出期间新消息的回复文案', () => {
     assert.equal(DRAINING_REPLY, '正在重启，请稍后重发');
+  });
+
+  test('replyIfDraining：收到信号之后来的消息回「正在重启，请稍后重发」并返回 true（调用方不再往下处理）；回复失败只记日志（R1 M5b）', async () => {
+    const r = rig({ busy: 1 });
+    r.sd.handle('SIGTERM');
+    const replies = [];
+    const logs = [];
+    const log = (m) => logs.push(m);
+    assert.equal(await replyIfDraining({ shutdown: r.sd, reply: async (mid, text) => { replies.push([mid, text]); }, messageId: 'om_1', log }), true);
+    assert.deepEqual(replies, [['om_1', '正在重启，请稍后重发']]);
+    assert.equal(logs.length, 0);
+    assert.equal(await replyIfDraining({ shutdown: r.sd, reply: async () => { throw new Error('网络断了'); }, messageId: 'om_2', log }), true,
+      '回复失败也返回 true：消息照样不进对话');
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /正在重启，请稍后重发/);
+    assert.match(logs[0], /网络断了/);
+  });
+
+  test('replyIfDraining：没在退出 → 不回复、返回 false（消息照常处理）（R1 M5b）', async () => {
+    const r = rig();
+    const replies = [];
+    const reply = async (mid, text) => { replies.push([mid, text]); };
+    assert.equal(await replyIfDraining({ shutdown: r.sd, reply, messageId: 'om_1', log: () => {} }), false);
+    assert.equal(await replyIfDraining({ shutdown: undefined, reply, messageId: 'om_2', log: () => {} }), false, '没有 shutdown 对象也当没在退出');
+    assert.deepEqual(replies, []);
   });
 });

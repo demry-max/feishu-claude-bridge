@@ -5,6 +5,20 @@
 
 export const DRAINING_REPLY = '正在重启，请稍后重发';
 
+/**
+ * 新消息进来时调（index.js handleMessage）：退出流程中就回 DRAINING_REPLY 并返回 true（调用方不再处理这条）；
+ * 回复失败只记日志，照样返回 true（退出中不接新活）。不在退出流程中返回 false、不回复。
+ */
+export async function replyIfDraining({ shutdown, reply, messageId, log = console.error } = {}) {
+  if (!shutdown?.isDraining?.()) return false;
+  try {
+    await reply(messageId, DRAINING_REPLY);
+  } catch (e) {
+    try { log(`[shutdown] 回复「${DRAINING_REPLY}」失败：${e?.message ?? e}`); } catch { /* 日志也坏了：不管 */ }
+  }
+  return true;
+}
+
 const DEFAULT_GRACE_SEC = 120;
 const MAX_GRACE_SEC = 3600;
 const EXIT_CODES = Object.freeze({ SIGTERM: 143, SIGINT: 130 });

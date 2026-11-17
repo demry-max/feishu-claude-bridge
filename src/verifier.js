@@ -1,6 +1,6 @@
 // 验收（BRIDGE-VR-1）：心跳轮里写的 done 先降级为 verify，桥接按脚本规则核对 done_evidence；
-// 规则不通过时（HEARTBEAT_VERIFY=rule+model）交给小模型（默认 claude-haiku-5-5，零工具的 verifier 档）审核；
-// 规则 / 模型都没通过就发验收卡片请光总验收。
+// 规则核对不出结论（unknown：没写依据 / kind=other / 模型写的 kind=owner）且 HEARTBEAT_VERIFY=rule+model 时，
+// 才交给小模型（默认 claude-haiku-5-5，零工具的 verifier 档）审核；规则判 fail 的直接发验收卡片，模型推翻不了。
 //
 // 这里只放纯函数和只读核对（lark-cli 只走 EV-1 已有的 approvalGet / messageGet 模板）；
 // 台账回写、状态、配额、发送都在 heartbeat.js。所有助理写的文字（title / notes / summary）与
@@ -10,7 +10,7 @@ import { fenceUntrusted } from './messages.js';
 import { plain } from './digest.js';
 
 // watch-sources.js 静态导入了 heartbeat.js（parseTime），heartbeat.js 又导入本文件：
-// fillTemplate 用缓存的动态 import 取，避免三者成环（本文件不静态依赖 watch-sources.js / heartbeat.js）。
+// fillTemplate / apiTimeMs 用缓存的动态 import 取，避免三者成环（本文件不静态依赖 watch-sources.js / heartbeat.js）。
 let watchMod = null;
 const loadWatch = () => (watchMod ??= import('./watch-sources.js'));
 
@@ -22,8 +22,6 @@ export const VERDICTS = Object.freeze(['pass', 'fail', 'unsure']);
 
 const MAX_REASON = 80; // 模型理由最多几个字（超了整条按 unsure）
 const MAX_RAW = 2000; // 拉回来的原始返回最多给模型看多少字
-// 审批走到终态才算「办完」：通过 / 拒绝 / 撤回 / 删除（拒绝也是结果）；PENDING 等一律不算
-const TERMINAL_APPROVAL = new Set(['APPROVED', 'REJECTED', 'CANCELED', 'DELETED']);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -115,59 +113,88 @@ async function safeRun(runner, argv) {
   }
 }
 
+// 审批只有「已通过」算办完；拒绝 / 撤回 / 删除也是终态，但不该自动关单，交给光总决定（BRIDGE-VR-1 R1）
+const APPROVAL_STOPPED = Object.freeze({ REJECTED: '已被拒绝', CANCELED: '已被撤回', DELETED: '已被删除' });
+const MS_TS_RE = /^\d{10,13}$/;
+
+/** 交办时间：台账 created_at 与数字形式的 watch.after（≤10 位按秒）取晚的；两样都没有返回 null。 */
+function assignedAt(task) {
+  const c = task?.times?.created_at;
+  const created = Number.isFinite(c) ? c : null;
+  const a = task?.watch?.after;
+  const after = typeof a === 'string' && MS_TS_RE.test(a) ? (a.length <= 10 ? Number(a) * 1000 : Number(a)) : null;
+  if (created === null && after === null) return null;
+  return Math.max(created ?? -Infinity, after ?? -Infinity);
+}
+
 /**
  * 脚本规则（只读、确定性）。task 是校验过的台账；runner 是 EV-1 的只读 lark runner；owner 是光总的 open_id。
- * - approval：ref 必须等于 watch.instance_code，approvalGet 查到终态才通过
- * - message：messageGet 查到这条 om_，在 watch.chat_id 的会话里，且不是光总本人（也不是机器人 / 系统 / 已撤回）发的
- * - owner：模型写的一律不算（光总的确认只认桥接记下的按钮 / 引用回复，那条路径直接写 done、不经验收）
- * - other：没有可核对的规则
- * 返回 { pass, finding, raw? }：finding 是桥接自己的话（只含校验过的 ID 与状态），raw 是给模型看的原始返回（进围栏）。
+ * 返回 { outcome, finding, raw? }：finding 是桥接自己的话（只含校验过的 ID、状态、时间），raw 是原始返回（进围栏）。
+ * - pass 只有两种：
+ *   approval：ref 等于 watch.instance_code，approvalGet 查到 APPROVED；
+ *   message：messageGet 查到这条 om_，在 watch.chat_id 的会话里，是对方真人发的，发送时间解析得出且不早于交办时间
+ *   （created_at 与数字 watch.after 取晚的；两样都没有直接 fail）
+ * - fail：approval / message 的其余一切（对不上、没查成、没状态、PENDING 等没走完、拒绝 / 撤回 / 删除、
+ *   光总本人 / 机器人 / 系统 / 已撤回、看不出时间、早于交办），以及依据格式不合规（evidence_error）——直接发卡片，不问模型
+ * - unknown 只有三种：没写 done_evidence、kind=other、模型写的 kind=owner——只有这三种 rule+model 档才问模型
  */
 export async function ruleCheck({ task, runner, owner } = {}) {
+  const fail = (finding, raw) => (raw ? { outcome: 'fail', finding, raw } : { outcome: 'fail', finding });
+  if (typeof task?.evidence_error === 'string' && task.evidence_error) {
+    return fail(`依据格式不合规（${task.evidence_error.slice(0, 60)}）`);
+  }
   const ev = isObj(task?.done_evidence) ? task.done_evidence : null;
-  if (!ev) return { pass: false, finding: '台账没写 done_evidence（办完的依据）' };
+  if (!ev) return { outcome: 'unknown', finding: '台账没写 done_evidence（办完的依据）' };
   const ref = String(ev.ref ?? '').trim();
   const w = isObj(task.watch) ? task.watch : {};
 
   if (ev.kind === 'approval') {
-    if (w.type !== 'approval') return { pass: false, finding: '依据是审批，但台账 watch 不是审批' };
-    if (!ref || ref !== w.instance_code) return { pass: false, finding: '依据的审批实例码和台账 watch.instance_code 对不上' };
+    if (w.type !== 'approval') return fail('依据是审批，但台账 watch 不是审批');
+    if (!ref || ref !== w.instance_code) return fail('依据的审批实例码和台账 watch.instance_code 对不上');
     const { fillTemplate } = await loadWatch();
     const argv = fillTemplate('approvalGet', { params: JSON.stringify({ instance_code: ref }) });
-    if (!argv) return { pass: false, finding: '审批实例码不合规，没去查' };
-    if (typeof runner !== 'function') return { pass: false, finding: '桥接没有可用的 lark-cli，没去查审批' };
+    if (!argv) return fail('审批实例码不合规，没去查');
+    if (typeof runner !== 'function') return fail('桥接没有可用的 lark-cli，没去查审批');
     const r = await safeRun(runner, argv);
-    if (!r.ok) return { pass: false, finding: `查审批没成功（${cleanReason(r.reason)}）` };
+    if (!r.ok) return fail(`查审批没成功（${cleanReason(r.reason)}）`);
     const o = parseJson(r.stdout);
     const inst = o && [o, o.data, o.data?.instance, o.instance].find((x) => isObj(x) && typeof x.status === 'string');
-    if (!inst) return { pass: false, finding: '查到的审批没有状态字段', raw: clipRaw(r.stdout) };
+    if (!inst) return fail('查到的审批没有状态字段', clipRaw(r.stdout));
     const status = String(inst.status).replace(/[^A-Z_]/g, '').slice(0, 20) || 'UNKNOWN';
-    if (TERMINAL_APPROVAL.has(status)) return { pass: true, finding: `审批 ${ref} 已是 ${status}` };
-    return { pass: false, finding: `审批 ${ref} 还是 ${status}，不是终态`, raw: clipRaw(r.stdout) };
+    if (status === 'APPROVED') return { outcome: 'pass', finding: `审批 ${ref} 已通过（APPROVED）` };
+    if (Object.hasOwn(APPROVAL_STOPPED, status)) {
+      return fail(`审批 ${ref} ${APPROVAL_STOPPED[status]}（${status}），不自动关单，请你决定`, clipRaw(r.stdout));
+    }
+    return fail(`审批 ${ref} 还是 ${status}，没有通过`, clipRaw(r.stdout));
   }
 
   if (ev.kind === 'message') {
-    if (w.type !== 'chat_reply') return { pass: false, finding: '依据是消息，但台账 watch 不是会话回复' };
-    const { fillTemplate } = await loadWatch();
+    if (w.type !== 'chat_reply') return fail('依据是消息，但台账 watch 不是会话回复');
+    const start = assignedAt(task);
+    if (start === null) return fail('台账没有 created_at，判断不了是不是交办之后的回复');
+    const { fillTemplate, apiTimeMs } = await loadWatch();
     const argv = fillTemplate('messageGet', { message_id: ref });
-    if (!argv) return { pass: false, finding: '依据的消息 ID 不合规，没去查' };
-    if (typeof runner !== 'function') return { pass: false, finding: '桥接没有可用的 lark-cli，没去查消息' };
+    if (!argv) return fail('依据的消息 ID 不合规，没去查');
+    if (typeof runner !== 'function') return fail('桥接没有可用的 lark-cli，没去查消息');
     const r = await safeRun(runner, argv);
-    if (!r.ok) return { pass: false, finding: `查消息没成功（${cleanReason(r.reason)}）` };
+    if (!r.ok) return fail(`查消息没成功（${cleanReason(r.reason)}）`);
     const raw = clipRaw(r.stdout);
     const m = messagesOf(parseJson(r.stdout)).find((x) => isObj(x) && x.message_id === ref);
-    if (!m) return { pass: false, finding: `没查到消息 ${ref}`, raw };
-    if (typeof w.chat_id !== 'string' || m.chat_id !== w.chat_id) return { pass: false, finding: `消息 ${ref} 不在台账 watch 的会话里`, raw };
+    if (!m) return fail(`没查到消息 ${ref}`, raw);
+    if (typeof w.chat_id !== 'string' || m.chat_id !== w.chat_id) return fail(`消息 ${ref} 不在台账 watch 的会话里`, raw);
     const own = typeof owner === 'string' ? owner : '';
-    if (!own) return { pass: false, finding: '桥接还不知道光总是谁，判断不了是不是对方发的', raw };
+    if (!own) return fail('桥接还不知道光总是谁，判断不了是不是对方发的', raw);
     const s = isObj(m.sender) ? m.sender : {};
-    if ((s.id ?? s.open_id) === own) return { pass: false, finding: `消息 ${ref} 是光总本人发的，不算对方回复`, raw };
-    if (!isOtherHuman(m, own)) return { pass: false, finding: `消息 ${ref} 不是真人发的（机器人 / 系统 / 已撤回）`, raw };
-    return { pass: true, finding: `消息 ${ref} 是对方在 watch 的会话里发的` };
+    if ((s.id ?? s.open_id) === own) return fail(`消息 ${ref} 是光总本人发的，不算对方回复`, raw);
+    if (!isOtherHuman(m, own)) return fail(`消息 ${ref} 不是真人发的（机器人 / 系统 / 已撤回）`, raw);
+    const sentAt = apiTimeMs(m.create_time);
+    if (sentAt === null) return fail(`消息 ${ref} 看不出发送时间，判断不了是不是交办之后的回复`, raw);
+    if (sentAt < start) return fail(`消息 ${ref} 发在交办之前（${fmtNow(sentAt)}，交办 ${fmtNow(start)}），不算这次的回复`, raw);
+    return { outcome: 'pass', finding: `消息 ${ref} 是对方交办之后在 watch 的会话里发的` };
   }
 
-  if (ev.kind === 'owner') return { pass: false, finding: '依据 kind=owner 不算：光总的确认只认桥接记下的按钮 / 引用回复' };
-  return { pass: false, finding: '依据类型 other：桥接没有可核对的规则' };
+  if (ev.kind === 'owner') return { outcome: 'unknown', finding: '依据 kind=owner 不算：光总的确认只认桥接记下的按钮 / 引用回复' };
+  return { outcome: 'unknown', finding: '依据类型 other：桥接没有可核对的规则' };
 }
 
 const fmtNow = (ms) => {

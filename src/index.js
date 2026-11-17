@@ -8,7 +8,7 @@ import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
 import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY } from './heartbeat.js';
 import { VERIFY_KEY } from './verifier.js';
-import { createShutdown, shutdownGraceSec, DRAINING_REPLY } from './shutdown.js';
+import { createShutdown, shutdownGraceSec, replyIfDraining } from './shutdown.js';
 import { createEventHandlers, heartbeatReplyShortcut, sendCardWithFallback } from './events.js'; import { createWatchSources, createLarkRunner } from './watch-sources.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
@@ -240,10 +240,7 @@ async function handleMessage(data) {
     return;
   }
   // 优雅退出中（BRIDGE-VR-1）：不再接新消息，回一句让对方稍后重发
-  if (shutdown.isDraining()) {
-    await reply(message.message_id, DRAINING_REPLY);
-    return;
-  }
+  if (await replyIfDraining({ shutdown, reply, messageId: message.message_id, log: console.error })) return;
 
   // ---- owner：首个私聊者自动认领，owner 享有本机工具，其他人仅联网工具 ----
   let owner = OWNER_OPEN_ID || loadOwner();

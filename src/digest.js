@@ -93,27 +93,33 @@ const bySlugTime = (a, b) => (a.ms - b.ms) || (a.slug < b.slug ? -1 : a.slug > b
  * @param {Array} o.changes    history.changes：[{ at, slug, from, to, via }]（桥接自己记的状态变化）
  * @param {object} o.taskState 心跳状态里的 tasks（升级阶梯的 esc）
  * @param {Date} o.now
+ * @param {number|null} [o.since] 上一份日结发出（或排队 / 判重 / 判空）的时间（毫秒）：「今天办完 / 今天放弃」只算
+ *   since 之后（不含）到 now（含）的变化——日结发完之后的自动关单、没发日结那天的，都进下一份；
+ *   没给、不是数字或晚于 now：从今天 0 点（含）算起
  * @param {boolean} o.ladder   升级阶梯开：卡住＝已提醒满 escalateMax 级的；关：卡住＝过了 escalate_after 还在跟进的
  * @param {number} o.escalateMax
  * @param {boolean} o.buttons  撤销提示说「点按钮」还是「在对话里说」
  * @returns {{ empty: boolean, title: string, body: string, undo: string[], journal: string[] }}
  *   undo：带圈号（可撤销）的 slug，按圈号顺序；journal：写进当天 journal 的一段（标题行 + 每栏一行）
  */
-export function buildDigest({ tasks = [], changes = [], taskState = {}, now, ladder = false, escalateMax = 2, buttons = false }) {
+export function buildDigest({ tasks = [], changes = [], taskState = {}, now, since = null, ladder = false, escalateMax = 2, buttons = false }) {
   const nowMs = toMs(now);
   const nowD = new Date(nowMs);
-  const today = localDay(nowD);
+  const midnight = new Date(nowMs);
+  midnight.setHours(0, 0, 0, 0);
+  const sinceMs = typeof since === 'number' && Number.isFinite(since) && since <= nowMs ? since : null;
+  const inWindow = (ms) => ms <= nowMs && (sinceMs === null ? ms >= midnight.getTime() : ms > sinceMs);
   const tmr = new Date(nowMs);
   tmr.setDate(tmr.getDate() + 1);
   const tomorrow = localDay(tmr);
   const bySlug = new Map(tasks.map((t) => [t.slug, t]));
 
-  // 今天每条台账最后一次状态变化；还停在那个状态才算「今天办完 / 今天放弃」
+  // 上一份日结之后每条台账最后一次状态变化；还停在那个状态才算「今天办完 / 今天放弃」
   const last = new Map();
   for (const c of Array.isArray(changes) ? changes : []) {
     if (!c || typeof c.slug !== 'string' || typeof c.to !== 'string') continue;
     const ms = Date.parse(c.at);
-    if (!Number.isFinite(ms) || ms > nowMs || localDay(new Date(ms)) !== today) continue;
+    if (!Number.isFinite(ms) || !inWindow(ms)) continue;
     const prev = last.get(c.slug);
     if (!prev || ms >= prev.ms) last.set(c.slug, { ...c, ms });
   }
