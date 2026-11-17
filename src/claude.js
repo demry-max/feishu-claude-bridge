@@ -8,6 +8,7 @@ import { loadSessions, saveSessions } from './store.js';
 import { ensureOwnerWorkspace } from './workspace.js';
 import { patchEnvFile } from './env-file.js';
 import { routeTurn, DEFAULT_EXEC_TRIGGERS } from './lanes.js';
+import { spawnBinFor, runWithAccount, skipErrorSession, accountStatusLine } from './account-fallback.js'; // BRIDGE-ACCT-1 备用账号（未配置时零变化）
 export { routeTurn, DEFAULT_EXEC_TRIGGERS };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -390,7 +391,7 @@ export function sessionInfo(chatId, isOwner = false) {
     `- 思考深度: ${CLAUDE_EFFORT || '（CLI 默认）'}`,
     `- 上下文: ${(contextSize.get(chatId) ?? 0).toLocaleString()} tokens${CONTEXT_NUDGE_TOKENS > 0 ? ` / 固化提醒阈值 ${CONTEXT_NUDGE_TOKENS.toLocaleString()}` : ''}`,
     `- 允许工具: ${tools || '（无）'}`,
-  ].join('\n');
+  ].join('\n') + accountStatusLine(); // BRIDGE-ACCT-1：配置了备用账号时多一行当前账号，未配置为空串
 }
 
 // Claude 被禁止自写 .claude 目录，agent 沉淀的技能先落 workspace/skills，
@@ -1212,7 +1213,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, args, {
+    const child = spawn(spawnBinFor(CLAUDE_BIN, opts), args, { // BRIDGE-ACCT-1：选 bin 只在这一处
       cwd,
       env: process.env,
     });
@@ -1224,6 +1225,8 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
     let finalErr = null;
     let timedOut = null;
     let producedOutput = false; // 是否已产生过输出/副作用——决定断连后能否安全重放
+    // BRIDGE-ACCT-1：比 producedOutput 窄——出错的 result 事件本身不算，只认调过工具或已发出进度消息
+    let acted = false;
     let lastActivity = Date.now();
     const startedAt = Date.now();
     // 深度推理档静默期天然更长，空闲阈值相应放宽，避免把「在想」误判成「卡死」
@@ -1272,8 +1275,10 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
           .map((b) => b.text)
           .join('\n')
           .trim();
+        if ((d.message?.content ?? []).some((b) => b?.type === 'tool_use')) acted = true;
         if (!text) return;
         if (pending && onProgress) {
+          acted = true;
           Promise.resolve(onProgress(pending)).catch((e) =>
             console.error('[progress]', e?.message ?? e)
           );
@@ -1288,7 +1293,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         // （且永远收不到固化提醒）；/new 期间跑完的任务也不该把刚删掉的会话写回来。
         const ephemeral = ephemeralChat;
         const revoked = (resetGeneration.get(chatId) ?? 0) !== startedGeneration;
-        if (d.session_id && !ephemeral && !revoked) {
+        if (d.session_id && !ephemeral && !revoked && !skipErrorSession(d, acted)) {
           sessions[chatId] = d.session_id;
           saveSessions(sessions);
         } else if (revoked) {
@@ -1296,6 +1301,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         }
         if (d.is_error) {
           finalErr = new Error(String(d.result ?? 'unknown error').slice(0, 500));
+          if (Array.isArray(d.errors)) finalErr.cliErrors = d.errors.join('\n'); // BRIDGE-ACCT-1 分类用
         } else {
           finalText = String(d.result ?? pending ?? '');
         }
@@ -1328,6 +1334,8 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       // 标记「本次是否已经动过手」——重试层据此决定能否安全重放
       const mark = (err) => {
         err.producedOutput = producedOutput;
+        err.acted = acted; // BRIDGE-ACCT-1
+        err.cliStderr = stderr;
         return err;
       };
       if (finalErr) return reject(mark(finalErr));
@@ -1395,7 +1403,8 @@ const sleepAbortable = (chatId, ms) =>
 export async function runClaude(chatId, prompt, isOwner = false, extraTools = [], onProgress = null, opts = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
-      return await runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, opts);
+      // BRIDGE-ACCT-1：账号层重试包在网络重试之内（不 sleep、不占名额）；未配置备用时直接调用
+      return await runWithAccount((o) => runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, o), opts);
     } catch (e) {
       const msg = String(e?.message ?? e);
       if (e?.producedOutput && !e?.cancelled && RETRYABLE.test(msg)) {

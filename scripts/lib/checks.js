@@ -93,6 +93,20 @@ export function checkClaudeCli({ bin = 'claude', run = defaultRun, env = process
   return { ...item('claude_cli', 'ok', `claude CLI ${version}`), version };
 }
 
+/**
+ * 备用账号的 claude（CLAUDE_FALLBACK_BIN，可选）：存在且能跑 --version。
+ * 不可用时只是 warn——桥接启动自检会把它视为未配置备用，主用照常工作。
+ */
+export function checkFallbackCli({ bin, run = defaultRun, env = process.env } = {}) {
+  const r = run(bin, ['--version'], { env });
+  const version = r.ok ? (r.stdout.match(/(\d+\.\d+\.\d+)/) ?? [])[1] ?? null : null;
+  if (!version) {
+    return item('claude_fallback_cli', 'warn', '备用 claude CLI', `找不到或无法运行 ${bin}${r.error ? `（${r.error}）` : ''}；启动时会视为未配置备用账号`,
+      '把 .env 里的 CLAUDE_FALLBACK_BIN 改成能运行的绝对路径（`<路径> --version` 应输出版本号），不用备用账号就删掉这一行');
+  }
+  return { ...item('claude_fallback_cli', 'ok', `备用 claude CLI ${version}`, bin), version };
+}
+
 /** 邮箱只露首字母和域名，避免整串进对话记录 */
 export function maskEmail(email) {
   const m = String(email ?? '').match(/^(.)[^@]*(@.+)$/);

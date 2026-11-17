@@ -60,6 +60,7 @@ Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-
 | 📨 Messaging while busy (owner DM: queue, merge, carry on) | off | `OWNER_MESSAGE_QUEUE=true` | [Messaging while busy](#-messaging-while-busy-queue-merge-carry-on-off-by-default) |
 | 🧩 lark-cli (calendar, approvals, tasks, message search, …) | off | `LARK_CLI=true` | [What the Feishu tools can do](#-what-the-feishu-tools-can-and-cannot-do) |
 | 🔎 Read-only business-system queries (bms / ias) | off | `BMS_TOOL_ENABLED=1` (read-only keys in the local Keychain, macOS only) | [Read-only business-system queries](#read-only-business-system-queries-bms_tool_enabled-off-by-default) |
+| 🔁 Fallback account (switch automatically when the primary is out of quota / logged out) | off | `CLAUDE_FALLBACK_BIN=<path to the fallback claude>` | [Fallback account](#-fallback-account-off-by-default) |
 
 ## Quick Start
 
@@ -423,6 +424,20 @@ Group chats, guests, non-owners, scheduled jobs and the heartbeat are not affect
 - **Status**: in the owner's DM `/status` shows an extra line with the number of queued messages (only when the switch is on).
 - **Restart**: the queue lives in memory only and is not persisted; on graceful shutdown, messages that haven't had their turn each get "restarting, please resend" instead of being silently dropped (exceptions: no grace period, second signal, forced kill, crash — see "Graceful shutdown").
 - Queued text is treated as the owner's own input, as usual; quoted / forwarded third-party content stays inside the untrusted fence; the merged prompt is passed to claude over stdin as before, never on the command line.
+
+## 🔁 Fallback account (off by default)
+
+When the primary Claude account hits its weekly or 5-hour limit, or its login expires, the bridge switches to a fallback account's claude, tries the primary again after a cooldown, and switches back once it works.
+
+- `CLAUDE_FALLBACK_BIN`: the claude executable for the fallback account (typically a wrapper script that exports the fallback account's token and then runs `exec claude "$@"`). Unset = feature off; behaviour is exactly as without it.
+- `CLAUDE_FALLBACK_COOLDOWN_MIN`: minutes before retrying the primary, default 30, range 1–720; an invalid value falls back to 30 with one `[config] ⚠️` line at startup.
+- Scope: during the cooldown every new claude process uses the fallback: DMs, the execution lane, groups, guests, scheduled tasks, heartbeat, verification and self-diagnosis.
+- The current turn: if it has not called a tool or sent a progress message yet, it is rerun on the fallback right away and you only see the normal reply. A turn that already acted is not replayed; the reply says the bridge switched accounts and asks you to send again or say "continue". Turns stopped by `/cancel`, `/new` or a restart never trigger a switch.
+- After the cooldown the next turn tries the primary first: success switches back (log only); failure starts another cooldown and that turn lands on the fallback automatically. If the fallback is unavailable too (or its claude fails to start), that turn does not bounce between accounts and reports the error as usual; the next turn tries the primary first.
+- On entering fallback mode the owner gets one DM ("primary account out of quota (or logged out), switched to the fallback, will retry the primary in about N minutes"), once per continuous fallback period; during the heartbeat quiet hours (`HEARTBEAT_QUIET_HOURS`) it is held until they end, and dropped if the bridge is back on the primary by then. The switch state lives in memory only: after a restart the bridge starts on the primary, and if the primary is still unavailable you get one more DM. `/status` gains a line showing the current account (primary / fallback and when the primary is retried).
+- At startup the bridge runs `--version` on the fallback claude; on failure it only warns and treats the fallback as not configured. `npm run doctor` checks it too.
+- **Point both executables at the same CLI config directory** (same `~/.claude`, different tokens) so `--resume` keeps the same conversation after a switch. If they do not share it, whichever side you switch to (either direction) cannot find the session; the bridge automatically retries once without `--resume`, so both sides start a new conversation and earlier context has to come from memory files.
+- Logs (no message content, no raw errors): `[account] 主用不可用(quota|auth)，切到备用，冷却 N 分钟`, `冷却到期，试主用`, `回到主用`, `备用也不可用(quota|auth)`, `备用启动失败，回到主用路径`; `[account-notice] 免打扰时段，切换通知延后到时段结束`, `切换通知发送失败`.
 
 ## 🚦 Two models: chat/planning vs execution
 
