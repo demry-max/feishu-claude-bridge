@@ -59,6 +59,7 @@ Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-
 | 🩺 No-tool profile for scheduled-task self-diagnosis | on with audit / strict; legacy unchanged | `OWNER_TOOL_PROFILE` | same |
 | 📨 Messaging while busy (owner DM: queue, merge, carry on) | off | `OWNER_MESSAGE_QUEUE=true` | [Messaging while busy](#-messaging-while-busy-queue-merge-carry-on-off-by-default) |
 | 🧩 lark-cli (calendar, approvals, tasks, message search, …) | off | `LARK_CLI=true` | [What the Feishu tools can do](#-what-the-feishu-tools-can-and-cannot-do) |
+| 🔎 Read-only business-system queries (bms / ias) | off | `BMS_TOOL_ENABLED=1` (read-only keys in the local Keychain, macOS only) | [Read-only business-system queries](#read-only-business-system-queries-bms_tool_enabled-off-by-default) |
 
 ## Quick Start
 
@@ -150,7 +151,7 @@ important security property of the project:
 Third-party content (forwarded logs, card JSON, file names, titles) is wrapped in an untrusted-data
 fence declaring it is not instructions; outbound replies are redacted before sending.
 
-**Heartbeat turns** (when `HEARTBEAT_ENABLED=true`) use a fixed tool profile that is narrower than the owner's normal sessions and cannot be widened by env: `--setting-sources ''` + `--strict-mcp-config`, built-in tools limited to Read/Grep/Glob/Edit/Write, writes limited to `tasks/` and `memory/journal/`; no Bash, lark-cli, web or Feishu tools, and no access to `schedules/`. Ledger titles/notes go into the untrusted fence; outward actions are only drafted and confirmed with the owner by DM.
+**Heartbeat turns** (when `HEARTBEAT_ENABLED=true`) use a fixed tool profile that is narrower than the owner's normal sessions and cannot be widened by env: `--setting-sources ''` + `--strict-mcp-config`, built-in tools limited to Read/Grep/Glob/Edit/Write, writes limited to `tasks/` and `memory/journal/`; no Bash, lark-cli, web or Feishu tools (exception: with `BMS_TOOL_ENABLED=1` a read-only business-system query tool is attached, see [Read-only business-system queries](#read-only-business-system-queries-bms_tool_enabled-off-by-default)), and no access to `schedules/`. Ledger titles/notes go into the untrusted fence; outward actions are only drafted and confirmed with the owner by DM.
 
 ### Owner tool profiles (`OWNER_TOOL_PROFILE`, default `legacy`)
 
@@ -195,6 +196,51 @@ Before strict, skills and file writes still had a few escalation routes around t
 - inline shell (file writes inside `bash -c`, `eval`, `$(…)`) is only parsed best-effort; blocking still needs a real-machine smoke test;
 - what the CLI actually does when the hook times out (5 s on the CLI side) still needs a real-machine smoke test;
 - user-level skill symlinks whose target is under `~/.claude/skills` itself (rather than `~/.agents/skills`) are not copied for now, pending confirmation.
+
+### Read-only business-system queries (`BMS_TOOL_ENABLED`, off by default)
+
+When on, the owner gets one more MCP tool, `mcp__biz__biz_get`, for read-only queries against two internal business systems:
+
+- `bms`: the business management system (tickets, accounts, leads, contracts, collections, payment requests, commissions, dashboard).
+- `ias`: the finance and accounting system (dashboard, reports, receivables and payables, party ledgers, bank transactions).
+
+Hosts, path prefixes and Keychain entry names are hard-coded in `src/biz-targets.js`. No environment variable can change them.
+
+| Has the tool | Does not |
+|---|---|
+| owner DMs, scheduled jobs whose results go to the owner's DM (including strict's read-only jobs), heartbeat | group chats (even the owner's turns there), scheduled jobs whose results go to a group or another chat, scheduled jobs whose destination can't be determined, guests, sched-diag self-diagnosis, verification, handoff |
+
+- **Scheduled jobs depend on the destination**: the bridge keeps the owner's DM chat ID in memory only (it learns it once the owner sends a DM). A scheduled job gets the tool only when its `chat_id` equals that ID; after a restart, and until the owner sends a DM, no scheduled job has it.
+- **Switch**: `BMS_TOOL_ENABLED=1` in `.env`, exactly `1`, then restart. It works under all three tool profiles. When off, every turn's arguments are byte-for-byte the same as without the feature.
+- **GET only**, and redirects are not followed.
+  - The path is normalized before its prefix is checked. `..`, `//`, `\`, `@`, `%`-encoding and full URLs are rejected.
+  - Key management, login / auth, export, file download and voucher paths are rejected too.
+  - The query is structured key–value pairs, never a raw query string. Paging `limit` is clamped to a cap (100 for bms, 200 for ias).
+- **Limits**:
+  - Each request times out after 15 s. Responses over 1 MB are dropped. Results over 40,000 characters are truncated before the model sees them.
+  - At most 30 calls per turn and 20 per minute.
+  - The tool is disabled entirely when `NODE_TLS_REJECT_UNAUTHORIZED=0` is set on the machine.
+- **The key never passes through the model**: each system has one read-only key in the local Keychain (macOS only).
+  - The MCP server reads it into memory on each call with `/usr/bin/security find-generic-password … -w`.
+  - It is never put in environment variables, command-line arguments, the temporary MCP config, logs, the audit log or error text.
+  - If an entry is missing, only that system is unavailable. The tool replies (in Chinese) that the system is not configured because the Keychain has no usable <entry> (account <account>), asks the owner to add it, and includes a command template for adding it.
+- **`.env` deny-read**: turns that have the tool also get `--disallowedTools Read(<repo absolute path>/.env),Read(<repo absolute path>/.env.*)`, and `Bash(security:*)` and `Bash(/usr/bin/security:*)` are denied as well.
+- **Child-process environment**: the MCP server starts through `/usr/bin/env -u …`, which drops `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS` and `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (lower-case too).
+- **Results** are wrapped whole in the untrusted-data fence, which states they are data, not instructions.
+- **Audit** (audit / strict): only the tool name, the target, GET and the category of the first path segment (`other` outside the allowlist) are recorded. Full paths and queries are not.
+- **Skill**: the bridge syncs `docs/skills/biz-readonly/` (an endpoint cheat sheet) into `workspace/.claude/skills/` as a reserved skill.
+  - It never writes to `workspace/skills/`.
+  - If `workspace/skills/` has a skill with the same name, the bridge's copy is the one synced into `.claude/skills/` (the original is left alone).
+- **Self-check**: `npm run -s biz-check` (both systems) or `npm run -s biz-check -- bms` (one).
+  - Each system prints one masked line: for bms, the HTTP status, the role and a masked email; for ias, the HTTP status, the key's scopes and its masked name. The key, request headers and raw responses are never printed.
+  - If an entry is missing it prints the command template. The owner runs it in a terminal on this machine: there is no value after `-w`, so it prompts for one.
+  - Exit code: `0` when all pass, `1` otherwise.
+
+**Known limitations**:
+
+- Like the Feishu MCP, the MCP server process inherits the claude CLI's other environment variables.
+- Calling security through `env security`, `xcrun security`, or a python / node (or other interpreter) child process is not covered by the deny rules. Don't put bare Bash or interpreter prefixes in the allow rules.
+- Keychain reads only work on macOS. On other systems the key can't be read, so the tool only returns the missing-key message.
 
 ## 🗂️ Agent Workspace (OpenClaw / Hermes-style three-layer memory & skills)
 
