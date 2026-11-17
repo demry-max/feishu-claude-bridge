@@ -374,6 +374,18 @@ export function resetSession(chatId) {
   memoryFlushed.delete(chatId);
 }
 
+// 每日新会话要知道「换掉的是哪个 id」，失败回退 / `/session back` 要把旧 id 写回去。
+// 写回不动代际计数：写回只发生在没有在跑的时候（回退是在那一轮已结束后，back 先判 isRunning）。
+export function getSessionId(chatId) {
+  return sessions[chatId] ?? null;
+}
+export function restoreSession(chatId, sid) {
+  if (typeof sid !== 'string' || !sid) return false;
+  sessions[chatId] = sid;
+  saveSessions(sessions);
+  return true;
+}
+
 export function sessionInfo(chatId, isOwner = false) {
   const sid = sessions[chatId];
   const tools = isOwner ? ALLOWED_TOOLS : NON_OWNER_TOOLS;
@@ -701,6 +713,53 @@ function buildHeartbeatArgs(opts = {}) {
   return { args, cwd: WORKSPACE_DIR, model, effort, lane: 'chat', cleanup: () => {} };
 }
 
+// ---- 交接工具档（每日新会话，toolProfile: 'handoff'）----
+// 每日换新会话前，桥接在凌晨唤起一轮「交接」：续旧会话（--resume 调用方给的 id），把没办完的事落台账、
+// 新事实写记忆、过程写当日 journal，最后只吐一段摘要。没人盯着、回答不发给任何人，
+// 所以和心跳一样固定写死，不受 OWNER_TOOL_PROFILE / ALLOWED_TOOLS / LARK_CLI / FEISHU_TOOLS / extraTools 影响：
+//   --allowedTools  Read 限工作区；写只预批 memory/ 与 tasks/（对话档本来就能写的两处）
+//   --tools         内置白名单 Read/Grep/Glob/Edit/Write：没有 Bash、联网、飞书、Task、Skill……
+//   --disallowedTools 心跳黑名单 + 再点名一遍 Bash/联网/飞书与 schedules/skills/outbox/CLAUDE.md/.claude；
+//                   不列 tasks/ 与 memory/（这两处正是交接要写的）
+// 没有 resumeId 直接抛错：交接一个不存在的会话没有意义，也不能退化成开新会话乱写记忆。
+const HANDOFF_TOOLS = ['Read', 'Grep', 'Glob', 'Edit', 'Write'];
+const HANDOFF_ALLOWED = ['Read(./**)', 'Edit(./memory/**)', 'Edit(./tasks/**)'];
+const HANDOFF_DENY = [...new Set([
+  ...HEARTBEAT_DENY,
+  'Bash', 'WebFetch', 'WebSearch', 'mcp__feishu',
+  'Edit(./schedules/**)', 'Edit(./skills/**)', 'Edit(./outbox/**)', 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)',
+])];
+
+function handoffSystemPrompt(model, effort) {
+  return [
+    '# 当前运行配置（由桥接注入，权威来源）',
+    `- 模型：${model || '（未指定，走 claude CLI 默认）'}`,
+    `- 思考深度 effort：${effort}`,
+    '- 本轮是**交接**：桥接在凌晨换新会话前唤起，不是用户发来的消息；你的回答不会发给任何人。',
+    '- 可用工具：Read/Grep/Glob（仅工作区内）；写入只限 `./memory/` 与 `./tasks/`。',
+    '  没有 Bash、联网、飞书工具，也不能改定时任务、技能和 CLAUDE.md；本轮不回传文件、不发消息。',
+    '- 只做两件事：把该留的内容写进 memory/ 与 tasks/，然后输出交接摘要。',
+  ].join('\n');
+}
+
+function buildHandoffArgs(opts = {}) {
+  const resumeId = typeof opts.resumeId === 'string' ? opts.resumeId.trim() : '';
+  if (!resumeId) throw new Error('交接档必须带 resumeId（不交接空会话）');
+  const model = CLAUDE_MODEL;
+  const effort = 'low';
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--resume', resumeId];
+  args.push('--allowedTools', HANDOFF_ALLOWED.join(','));
+  args.push('--setting-sources', '');
+  args.push('--strict-mcp-config');
+  args.push('--tools', HANDOFF_TOOLS.join(','));
+  args.push('--disallowedTools', HANDOFF_DENY.join(','));
+  args.push('--settings', JSON.stringify({ autoMemoryEnabled: false }));
+  if (model) args.push('--model', model);
+  args.push('--effort', effort);
+  args.push('--append-system-prompt', handoffSystemPrompt(model, effort));
+  return { args, cwd: WORKSPACE_DIR, model, effort, lane: 'chat', cleanup: () => {} };
+}
+
 // 验收档（BRIDGE-VR-1）：一个工具都没有、不加载任何 settings/MCP、永不续会话；
 // cwd 每次新建在系统临时目录（不是 workspace/，也不在仓库内），cleanup 删掉
 function buildVerifierArgs(opts = {}) {
@@ -812,9 +871,9 @@ const STRICT_CHAT_BASE = ['Read', 'Grep', 'Glob', 'WebSearch', 'Edit(./memory/**
 const STRICT_SCHED_BASE = ['Edit(./memory/**)', 'Edit(./outbox/**)'];
 const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 
-/** 本次调用落在哪个工具档：'chat' | 'sched' | null（legacy、非 owner、心跳、sched-diag 都是 null）。 */
+/** 本次调用落在哪个工具档：'chat' | 'sched' | null（legacy、非 owner、心跳、交接、sched-diag 都是 null）。 */
 function ownerToolKind(chatId, isOwner, opts = {}) {
-  if (!isOwner || OWNER_TOOL_PROFILE === 'legacy' || opts?.toolProfile === 'heartbeat') return null;
+  if (!isOwner || OWNER_TOOL_PROFILE === 'legacy' || opts?.toolProfile === 'heartbeat' || opts?.toolProfile === 'handoff') return null;
   const id = String(chatId);
   if (id.startsWith('sched-diag:')) return null;
   return opts?.toolProfile === 'sched' || id.startsWith('sched:') ? 'sched' : 'chat';
@@ -1100,6 +1159,7 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
     return BIZ_ON ? withBizHeartbeat(buildHeartbeatArgs(opts), { deny: BIZ_ENV_DENY }) : buildHeartbeatArgs(opts);
   }
   if (isOwner && opts.toolProfile === 'verifier') return buildVerifierArgs(opts); // BRIDGE-VR-1 验收档：零工具；非 owner 当没带
+  if (isOwner && opts.toolProfile === 'handoff') return buildHandoffArgs(opts); // 每日新会话的交接档：固定工具面；非 owner 当没带
   // BRIDGE-PERM-2：audit/strict 下 sched-diag 走无工具自诊断档（legacy 仍走下面基线路径，argv 不变）
   if (!opts[PROFILE_BASE] && isOwner && OWNER_TOOL_PROFILE !== 'legacy'
       && typeof chatId === 'string' && chatId.startsWith('sched-diag:')) return buildSchedDiagArgs(opts);
@@ -1299,7 +1359,8 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         // （且永远收不到固化提醒）；/new 期间跑完的任务也不该把刚删掉的会话写回来。
         const ephemeral = ephemeralChat;
         const revoked = (resetGeneration.get(chatId) ?? 0) !== startedGeneration;
-        if (d.session_id && !ephemeral && !revoked && !skipErrorSession(d, acted)) {
+        // 每日新会话的交接轮（persistSession:false）续的是别人的会话，结果 id 不写回自己的运行键
+        if (d.session_id && !ephemeral && !revoked && !skipErrorSession(d, acted) && opts.persistSession !== false) {
           sessions[chatId] = d.session_id;
           saveSessions(sessions);
         } else if (revoked) {
@@ -1320,7 +1381,9 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       cleanup(); // 凭据临时文件
       clearInterval(timer);
       running.delete(chatId);
-      reject(new Error(`claude CLI 启动失败: ${e.message}`));
+      const err = new Error(`claude CLI 启动失败: ${e.message}`);
+      err.producedOutput = false; // 进程没起来，什么都没做
+      reject(err);
     });
     // CLI 启动后立刻退出（损坏的 --resume 会话、盘不可读）时写 stdin 会抛 EPIPE，
     // 无监听器会直接冒泡成 uncaughtException 打死整个桥接进程
@@ -1334,9 +1397,14 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       if (child.__cancelled) {
         const err = new Error('CANCELLED');
         err.cancelled = true;
+        err.producedOutput = producedOutput; // 取消前是否已动过手（每日新会话据此决定能否退回旧会话）
         return reject(err);
       }
-      if (timedOut) return reject(new Error(`claude CLI 超时（${timedOut}）`));
+      if (timedOut) {
+        const err = new Error(`claude CLI 超时（${timedOut}）`);
+        err.producedOutput = producedOutput;
+        return reject(err);
+      }
       // 标记「本次是否已经动过手」——重试层据此决定能否安全重放
       const mark = (err) => {
         err.producedOutput = producedOutput;

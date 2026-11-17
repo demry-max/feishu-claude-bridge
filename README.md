@@ -58,6 +58,7 @@
 | 🚧 写文件落点闸、技能 frontmatter 白名单、`.claude` 外来文件隔离 | 随 audit / strict 开启；legacy 不变 | `OWNER_TOOL_PROFILE` | [strict 补洞](#strict-补洞只在-audit--strict-生效legacy-逐字不变) |
 | 🩺 定时任务自诊断无工具档 | 随 audit / strict 开启；legacy 不变 | `OWNER_TOOL_PROFILE` | 同上 |
 | 📨 忙时连续发消息（owner 私聊排队、合并、接着办） | 关 | `OWNER_MESSAGE_QUEUE=true` | [忙时连续发消息](#-忙时连续发消息排队合并接着办默认关闭) |
+| 📅 每日新会话（owner 私聊每天换一次会话，带上交接内容） | 关 | `DAILY_SESSION=shadow`（只记录）/ `on`；运行时 `/session` | [每日新会话](#-每日新会话默认关闭) |
 | 🧩 lark-cli（日历、审批、任务、消息检索…） | 关 | `LARK_CLI=true` | [飞书侧能做什么](#-飞书侧能做什么不能做什么) |
 | 🔎 业务系统只读查询（bms / ias） | 关 | `BMS_TOOL_ENABLED=1`（只读 Key 放本机钥匙串，仅 macOS） | [业务系统只读查询](#业务系统只读查询bms_tool_enabled默认关闭) |
 | 🔁 备用账号（主用额度用完 / 登录失效时自动切换） | 关 | `CLAUDE_FALLBACK_BIN=<备用 claude 路径>` | [备用账号](#-备用账号默认关闭) |
@@ -426,6 +427,36 @@ workspace/
 - **重启**：队列只在内存里，不落盘；优雅退出时还没轮到的消息逐条回「助理正在重启，这条没处理，请稍后重发」，不会悄悄丢掉（例外：不等、二次信号、强杀、崩溃，见「优雅退出」）。
 - 排队的文字和平时一样按 owner 本人的输入对待，引用 / 转发的第三方内容照旧装在不可信围栏里；合并后的提示词照旧经 stdin 交给 claude，不进命令行。
 
+### 📅 每日新会话（默认关闭）
+
+owner 私聊一直 `--resume` 同一条会话，越聊越长、每条都慢。打开 `DAILY_SESSION` 后，**只在 owner 私聊里**：每天凌晨先做一次「交接」，早上第一条消息起换一个新会话，开头带上昨天的交接内容。
+群聊、访客、定时任务、心跳、验收、日结完全不受影响；不设或设成 `off` 时与以前逐字相同（不建 `data/daily-session/`、不记原话、不挂定时器、`/status` 不多一行）。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DAILY_SESSION` | `off` | `off`（照旧）/ `shadow`（只记原话、只打「该切 / 推迟」日志，不换会话、不交接）/ `on`（真换）。不认识的值打日志并按 `off` |
+| `DAILY_SESSION_AT` | `04:00` | 换新时刻（本地时间）：这个时刻之后的第一条 owner 私聊消息换新会话 |
+| `DAILY_SESSION_HANDOFF_AT` | `03:30` | 预交接时刻；留空＝不预交接（只带原话）；必须早于 `DAILY_SESSION_AT`，否则按留空 |
+| `DAILY_SESSION_ROUNDS` | `10` | 新会话带上一会话最后几轮原话（0–30） |
+| `DAILY_SESSION_KEEP_DAYS` | `14` | 旧会话保留几天可以 `/session back`（1–28） |
+
+- **预交接**：到 `DAILY_SESSION_HANDOFF_AT` 时，如果 owner 已经闲了 ≥60 分钟、上次交接以来有新的对话、没暂停、没在跑，就续旧会话跑一轮交接：
+  把没办完的事落进 `tasks/`、新事实写进 `memory/`、过程追加当天 journal，最后输出一段 ≤600 字的「昨天聊到哪」摘要。交接轮的工具面是固定的：
+  只能读工作区、只能写 `memory/` 与 `tasks/`，没有 Bash、联网和飞书工具，不受 `OWNER_TOOL_PROFILE` / `ALLOWED_TOOLS` / `LARK_CLI` 影响；回答不发给任何人，硬超时 5 分钟。
+  交接排在 owner 会话同一条队列里，和对话不会并发；这期间发来的消息排在它后面，不会收到「上一个任务还在跑」。
+- **换新**：`DAILY_SESSION_AT` 之后的第一条消息换新会话，消息前面附「接续材料」：开头说明（旧会话里的草稿全部失效，要执行必须重新出稿、等确认）、交接摘要、最近两份 journal（各取末尾 6000 字）、
+  最后 N 轮原话（摘要与 journal、原话都放在不可信围栏里），总长不超过 2 万字。新会话第一条回复末尾附一行「（今天起是新会话；昨夜交接：更新了 N 个记忆 / 台账文件：…；`/session back` 可退回）」，列出交接改了哪几个文件（最多 5 个）。
+  换新那一轮结束后如果还没拿到新会话 id（断连、被杀），下一条消息会重新带上接续材料。
+- **哪些消息先不换**：「确认」（会让旧草稿在新会话里被执行）、排队后出队的一条、带「确认」的合并轮，这几种永远不在当轮换，留到下一条；
+  裸 `/do`、`/redirect` 推迟，连续推迟到第 3 条强制换。第一次打开开关时已有的会话先接管、不换，下一次过 `DAILY_SESSION_AT` 再换。
+- **失败回退**：新会话第一轮确定还没动过手就失败（进程没起来，或在任何输出之前就超时 / 取消 / 退出），自动退回原会话，回复里说明「今天换新会话没成功，已退回原会话；重发这条即可」；
+  已经有输出（可能已调过工具）或说不清是否动过手的都不退回，也不叫你重发。
+- **命令**（只在 owner 私聊；群里不回复）：`/session` 看状态；`/session back` 退回上一个会话并暂停每日切换；`/session auto` 恢复；`/session rotate` 立刻交接，下一条消息换新。
+  `/new` 语义不变（不交接、不带接续材料），开关非 `off` 时被清掉的会话也记进可退回列表。
+- **数据**：状态、原话（最近 30 轮）、交接摘要都在 `data/daily-session/`，`data/sessions.json` 格式不变。原话落盘前过凭据脱敏；日志里只有字数、条数和文件名，没有正文。
+- **上线建议**：先 `shadow` 跑一天，再用 `scripts/daily-session-replay.js` 做新旧对比（盲评），新方式不输再改 `on`；改 `on` 时把 [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) 并入 `workspace/CLAUDE.md`。
+- 显式配置了 `ALLOWED_TOOLS` 时，代码不并入默认值；启动时如果缺了默认 owner 工具里的 `Edit(./…/**)` 写入项（比如 `Edit(./tasks/**)`），会打一行 `[config] ⚠️` 警告并列出缺的项名（只提醒，不改权限）。
+
 ## 🔁 备用账号（默认关闭）
 
 主用 Claude 账号的周额度 / 5 小时额度用完，或登录失效时，桥接自动改用备用账号的 claude，过一段时间再试主用，主用恢复就换回来。
@@ -472,7 +503,7 @@ CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EF
 
 ## 🧩 可选的提示词补充
 
-`workspace/CLAUDE.md` 是 owner 的提示词模板，仓库默认不改它。下面四份是配合可选功能的提示词补充，按需并入 `workspace/CLAUDE.md`。不并入功能照样工作，模型只是不知道相应的约定：
+`workspace/CLAUDE.md` 是 owner 的提示词模板，仓库默认不改它。下面五份是配合可选功能的提示词补充，按需并入 `workspace/CLAUDE.md`。不并入功能照样工作，模型只是不知道相应的约定：
 
 | 文档 | 内容 | 前提 |
 |---|---|---|
@@ -480,6 +511,7 @@ CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EF
 | [`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md) | `watch` 怎么填、外部原文怎么转述、心跳消息上的操作 | 先并入上一份 |
 | [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md) | `verify` 状态与 `done_evidence` 的写法、升级阶梯、日结 | 先并入上两份 |
 | [`docs/owner-tools-prompt-proposal.md`](docs/owner-tools-prompt-proposal.md) | 工具描述修正、audit / strict 工具档下的用法 | 切换工具档时 |
+| [`docs/ds-prompt-proposal.md`](docs/ds-prompt-proposal.md) | 每日新会话：接续材料怎么读、草稿失效、交接轮（仓库里的 `workspace/CLAUDE.md` 未改） | 把 `DAILY_SESSION` 改成 `on` 时 |
 
 ## 架构 Architecture
 

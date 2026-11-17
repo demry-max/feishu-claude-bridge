@@ -276,8 +276,8 @@ test('11 开关开：心跳与 FEISHU_TOOLS=false 时另写只含 biz 的临时 
 
 test('11 交接（handoff）、未知 toolProfile、带 chatType 的验收档：开关开也什么都不加（未知档默认不给）', async () => {
   const calls = {
-    handoff: ['oc_x', true, [], { lane: 'chat', toolProfile: 'handoff', chatType: 'p2p' }],
-    handoffSched: ['sched:daily.json', true, [], { toolProfile: 'handoff' }],
+    handoff: ['oc_x', true, [], { lane: 'chat', toolProfile: 'handoff', chatType: 'p2p', resumeId: 'sess-handoff' }],
+    handoffSched: ['sched:daily.json', true, [], { toolProfile: 'handoff', resumeId: 'sess-handoff' }],
     unknownProfile: ['oc_x', true, [], { lane: 'chat', toolProfile: 'bogus', chatType: 'p2p' }],
     verifierP2p: ['verify:task-1', true, [], { toolProfile: 'verifier', chatType: 'p2p' }],
   };
