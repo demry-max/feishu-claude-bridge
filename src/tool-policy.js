@@ -662,7 +662,8 @@ function collectTargets(src, depth, acc) {
     unitTargets(u.words, u.dyns, depth, acc);
     for (let k = t0; k < acc.targets.length; k++) {
       const t = acc.targets[k];
-      if (t.via === 'implicit' && !('chain' in t)) t.chain = chain ? chain.slice() : null;
+      // R2：本段自己新增了 cd（env -C / --chdir / 嵌套 sh -c 里的 cd）就不按链判，退回全部 base（更严）
+      if (t.via === 'implicit' && !('chain' in t)) t.chain = (chain && acc.cds.length === c0) ? chain.slice() : null;
     }
     const plainCd = (u.words[0] === 'cd' || u.words[0] === 'pushd') && acc.cds.length === c0 + 1 && !acc.unknown && !unknown0;
     if (chain && u.sep === '&&' && plainCd) chain.push(acc.cds[c0].target);

@@ -4,6 +4,8 @@
 //   R1-3 frontmatter 白名单重建：CLI 可见的 frontmatter 只含 name/description/version/metadata，否则整个技能不拷；
 //   R1-4 修法 A：白名单 lark-* 顶层软链按 realpath 解引用（只认两个允许根的直接子目录）；
 //   R1-5 .claude 本身是软链 / 文件：只挪链接本身，不跟随，.claude 重建为真目录。
+//   R2（协调者裁定）：允许根只认 ~/.agents/skills 一个（删去被跳过的 R1-4b，PERM-1 测12 不动）；补 R2-1 重建失败 fail closed、
+//   R2-2 tab 打头的行不当续行、R2-3 软链目标在工作区里不拷、R2-5 链到 ~/.claude/skills 根下不拷。
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -233,6 +235,7 @@ function seedHomeA(home) {
   fs.symlinkSync('../../.agents/skills/lark-a', path.join(claude, 'lark-a')); // 1 直接子目录 → 拷
   skill(path.join(claude, 'lark-target'), 'lark-target');
   fs.symlinkSync('lark-target', path.join(claude, 'lark-b')); // 2 链到 .claude/skills 根下另一个真目录 → 拷
+  // ↑ R2 协调者裁定：允许根只认 ~/.agents/skills，lark-b 实际判不拷（测PERM2-R2-5；与 PERM-1 测12 一致）
   skill(path.join(home, 'evil', 'lark-c'), 'lark-c');
   fs.symlinkSync('../../evil/lark-c', path.join(claude, 'lark-c')); // 3 逃出两个根 → 拒
   fs.symlinkSync('../../.agents/skills', path.join(claude, 'lark-d')); // 4 链到根本身 → 拒
@@ -273,17 +276,6 @@ test('测PERM2-R1-4 修法 A：直接子目录 / 两跳 / 普通目录拷；逃�
   assert.deepEqual(second.result.copied.sort(), ['lark-a', 'lark-f', 'lark-r']);
   const dangling = [...first.errs, ...second.errs].filter((l) => l.includes('lark-g'));
   assert.equal(dangling.length, 1, '悬空链接只警告一次');
-});
-
-test('测PERM2-R1-4b 修法 A：链到 .claude/skills 根下另一个真目录 → 拷', {
-  skip: '停卡项：与 test/owner-profiles.test.js 测12（lark-link → lark-real 断言不拷）冲突，见 DELIVERY R1 Open questions',
-}, async () => {
-  const home = path.join(TMP, 'home-a');
-  seedHomeA(home);
-  const m = await load({ OWNER_TOOL_PROFILE: 'audit' });
-  const dest = fs.mkdtempSync(path.join(TMP, 'dest-b-'));
-  const { result } = await capturing(() => m.syncExtraSkills({ home, workspace: P.ws, list: 'lark-b', dest }));
-  assert.deepEqual(result, ['lark-b']);
 });
 
 test('测PERM2-R1-4c 修法 A：允许根本身是软链（.agents/skills -> real-skills）照样能拷', async () => {
@@ -364,4 +356,88 @@ test('测PERM2-R1-5b 隔离目录 / 暂存目录存在但不是真目录：stric
       }
     }
   }
+});
+
+// ---------- R2 ----------
+// R2-1：重建自身的 fail closed（X14）。.claude-staging 是真目录（sweep 的真目录检查照样通过），但 0o500 不可写 →
+// rebuildSkillsTree 的 mkdirSync(暂存) 报 EACCES。换上新树之前就失败，旧树里带 allowed-tools 的 old 还在，strict 必须不启动 CLI。
+test('测PERM2-R2-1 重建失败：.claude-staging 是 0o500 真目录 → strict 抛「启动失败…重建」且不启动 CLI；audit 记「重建 .claude/skills 失败」照常跑', async (t) => {
+  if (process.getuid?.() === 0) { t.skip('root 不受目录权限限制，造不出 EACCES'); return; }
+  const marker = path.join(TMP, 'r2-1-cli-started');
+  const fakeMark = path.join(TMP, 'fake-claude-mark.sh'); // 假 CLI：先写标记文件，再照旧吐固定事件流
+  fs.writeFileSync(fakeMark, '#!/bin/sh\n: > "$FAKE_MARKER"\ncat > /dev/null\ncat "$FAKE_STREAM"\n', { mode: 0o755 });
+  const staging = path.join(P.ws, '.claude-staging');
+  try {
+    for (const profile of ['strict', 'audit']) {
+      resetRound();
+      fs.rmSync(marker, { force: true });
+      put(path.join(SDIR(), 'old', 'SKILL.md'), '---\nname: old\nallowed-tools: Bash(*)\n---\nold\n');
+      fs.mkdirSync(staging);
+      fs.chmodSync(staging, 0o500);
+      assert.throws(() => fs.mkdirSync(path.join(staging, 'probe')), { code: 'EACCES' }, `${profile}：前提——暂存目录不可写`);
+      const m = await load({ OWNER_TOOL_PROFILE: profile, OWNER_EXTRA_SKILLS: '', CLAUDE_BIN: fakeMark, FAKE_MARKER: marker });
+      const res = await capturing(async () => {
+        try { return await m.runClaude('oc_x', 'hi', true, [], null, { lane: 'chat' }); } catch (e) { return e; }
+      });
+      if (profile === 'strict') {
+        assert.ok(res.result instanceof Error, `strict：抛错（实得 ${String(res.result).slice(0, 80)}）`);
+        assert.match(res.result.message, /启动失败/, 'strict：错误含「启动失败」');
+        assert.match(res.result.message, /重建/, 'strict：错误含「重建」');
+        assert.match(res.result.message, /EACCES/, 'strict：失败点是暂存目录不可写');
+        assert.doesNotMatch(res.result.message, /无法隔离/, 'strict：sweep 的真目录检查已通过，失败在重建');
+        assert.ok(!lst(marker), 'strict：假 CLI 没有被启动');
+      } else {
+        assert.equal(res.result, 'ok', 'audit：正常返回');
+        assert.ok(res.errs.some((l) => l.includes('重建 .claude/skills 失败')), 'audit：日志里有「重建 .claude/skills 失败」');
+        assert.ok(!res.errs.some((l) => l.includes('无法隔离')), 'audit：sweep 的真目录检查已通过');
+        assert.ok(lst(marker), 'audit：假 CLI 照常启动（对照：标记文件机制有效）');
+      }
+      fs.chmodSync(staging, 0o700);
+    }
+  } finally {
+    if (lst(staging)) fs.chmodSync(staging, 0o700);
+    process.env.CLAUDE_BIN = FAKE;
+    delete process.env.FAKE_MARKER;
+  }
+});
+
+// R2-2：tab 打头的行不是续行（X4），丢到下一个白名单键为止
+test('测PERM2-R2-2 frontmatter 白名单：tab 打头的 allowed-tools 行不当续行，copySkillTree strip 后不含 allowed-tools', async () => {
+  const m = await load({ OWNER_TOOL_PROFILE: 'strict' });
+  const dir = fs.mkdtempSync(path.join(TMP, 'tab-'));
+  put(path.join(dir, 'src', 'SKILL.md'), '---\nname: x\n\tallowed-tools: Bash(*)\n---\nbody\n');
+  m.copySkillTree(path.join(dir, 'src'), path.join(dir, 'out'), { strip: true });
+  const out = fs.readFileSync(path.join(dir, 'out', 'SKILL.md'), 'utf8');
+  assert.ok(!out.includes('allowed-tools'), `输出里不含 allowed-tools（实得 ${JSON.stringify(out)}）`);
+  assert.ok(out.startsWith('---\nname: x\n'), 'name 保留');
+  assert.ok(out.endsWith('\n---\nbody\n'), '正文不变');
+});
+
+// R2-3：软链目标在允许根里、但同时就是工作区（X5）→ 不拷
+test('测PERM2-R2-3 修法 A：workspace 在 ~/.agents/skills/ws-in-root，lark-x 软链指向它 → 返回 []、dest 下没有 lark-x', async () => {
+  const home = path.join(TMP, 'home-ws');
+  fs.rmSync(home, { recursive: true, force: true });
+  const workspace = path.join(home, '.agents', 'skills', 'ws-in-root');
+  put(path.join(workspace, 'SKILL.md'), '---\nname: ws\n---\n# ws\n');
+  fs.mkdirSync(path.join(home, '.claude', 'skills'), { recursive: true });
+  fs.symlinkSync('../../.agents/skills/ws-in-root', path.join(home, '.claude', 'skills', 'lark-x'));
+  assert.equal(fs.realpathSync(path.join(home, '.claude', 'skills', 'lark-x')), workspace, '前提：软链解引用后正是工作区（允许根的直接子目录）');
+  const m = await load({ OWNER_TOOL_PROFILE: 'strict' });
+  const dest = fs.mkdtempSync(path.join(TMP, 'dest-ws-'));
+  const { result, errs } = await capturing(() => m.syncExtraSkills({ home, workspace, list: 'lark-x', dest }));
+  assert.deepEqual(result, [], '软链目标在工作区里：不拷');
+  assert.ok(!lst(path.join(dest, 'lark-x')), 'dest 下没有 lark-x');
+  assert.ok(errs.some((l) => l.includes('lark-x')), '拒绝要记日志');
+});
+
+// R2-5：协调者裁定——用户级技能软链只认 ~/.agents/skills 一个允许根，链到 ~/.claude/skills 根下另一个真目录的不拷
+test('测PERM2-R2-5 修法 A（协调者裁定）：lark-b -> ~/.claude/skills/lark-target 不拷', async () => {
+  const home = path.join(TMP, 'home-a');
+  seedHomeA(home);
+  const m = await load({ OWNER_TOOL_PROFILE: 'audit' });
+  const dest = fs.mkdtempSync(path.join(TMP, 'dest-r2-5-'));
+  const { result, errs } = await capturing(() => m.syncExtraSkills({ home, workspace: P.ws, list: 'lark-b', dest }));
+  assert.deepEqual(result, [], '只认 ~/.agents/skills：lark-b 不拷');
+  assert.ok(!lst(path.join(dest, 'lark-b')), 'dest 下没有 lark-b');
+  assert.ok(errs.some((l) => l.includes('lark-b')), '拒绝要记日志');
 });

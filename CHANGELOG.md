@@ -112,6 +112,7 @@
   - 新增导出 `usesEqAsPrefix`：`lark-cli --as=user …` 在审计判定里一律 deny（`classifyCommand` / strict argv 不变）。
   - sched-diag（audit / strict）任务名单行化、限 80 字。
   - 测试：新增 `test/skills-sync-perm2.test.js`，`test/tool-policy-output.test.js` / `test/owner-profiles-perm2.test.js` 补 `测PERM2-R1-*`。
+- **R2 返工**：隐式落点所在那一段自己用 `env -C` / `--chdir` / 嵌套 `sh -c` 的 `cd` 改了目录时不按 `cd` 链判、退回全部 base；用户级技能软链只认 `~/.agents/skills`（协调者裁定，删去被跳过的 R1-4b）；补测 `测PERM2-R2-1..5`。
 
 ## [2.3.0] - 2026-09-14
 

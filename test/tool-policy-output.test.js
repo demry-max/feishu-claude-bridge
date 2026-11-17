@@ -299,3 +299,23 @@ test('测PERM2-R1-8 --as=user 前置：judge 判 deny（audit/strict、chat/sche
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// ---------- R2：隐式落点所在那一段自己改了目录（env -C / --chdir / 嵌套 sh -c 里的 cd）→ 不按 cd 链判，退回全部 base ----------
+test('测PERM2-R2-4 隐式落点：本段用 env -C / --chdir / 嵌套 sh -c 的 cd 改了目录就拒；纯 cd 链进 outbox 照旧放行', () => {
+  const OUTBOX = { ...PURE, cwd: '/ws/outbox/oc_1' };
+  for (const [label, cmd, opts] of [
+    ['cd 链 + env -C ../..', 'cd outbox/oc_1 && env -C ../.. lark-cli drive +download --file-token t', PURE],
+    ['cwd 在 outbox + env --chdir=../..', 'env --chdir=../.. lark-cli drive +download --file-token t', OUTBOX],
+    ['cwd 在 outbox + env -C ../..（资源下载）', 'env -C ../.. lark-cli im +messages-resources-download --message-id m --file-key f', OUTBOX],
+    ['cd 链 + 嵌套 sh -c 里的 cd ../..', "cd outbox/oc_1 && sh -c 'cd ../.. && lark-cli drive +download --file-token t'", PURE],
+  ]) {
+    const r = run(cmd, opts);
+    const got = r.deny.map((d) => `${d.reason}:${d.target}`).join('/');
+    assert.equal(r.ok, false, `应拒绝：${label}`);
+    assert.ok(r.deny.some((d) => d.target === '.'), `${label}：拒的是隐式落点 . 本身（实得 ${got}）`);
+  }
+  const keep = run('cd outbox/oc_1 && lark-cli drive +download --file-token t');
+  assert.equal(keep.ok, true, `纯 cd 链进 outbox 仍放行（实得 ${keep.deny.map((d) => d.reason).join('/')}）`);
+  // 对照：不带 -C / --chdir 的 env 前缀不新增 cd，cwd 已在 outbox 时照旧放行
+  assert.equal(run('env FOO=1 lark-cli drive +download --file-token t', OUTBOX).ok, true, 'env 只设变量不改目录：放行');
+});
