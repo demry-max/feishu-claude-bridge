@@ -71,7 +71,7 @@ owner 对话与定时任务能用什么，由仓库里的策略表 `src/tool-pol
 strict 档：
 - **对话**：读类 lark-cli 直接用。发消息（`im +messages-send` / `+messages-reply`）、导入云文档（`drive +import`）、建日程（`calendar +create`）直接执行，回复末尾附一行「— 本轮以你名义：…」回执（目标 ID 只显示末 4 位；**回执只在和 owner 的私聊里附，群聊不附**，BRIDGE-PERM-2）。回邮件、审批操作、撤回消息、建群改群、增删群成员先起草；owner 私聊里以「确认」或 `/confirm` 开头的那一轮才放行，只管这一轮，群聊里不生效。
 - **定时任务**：只读，没有例外开关。lark-cli 只放行读类子命令，飞书 MCP 只有 6 个读工具，文件只能写 `memory/`、`outbox/`；任务文件里的任何字段都不参与权限判定。
-- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `~/code/ias-ops`；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路已由 BRIDGE-PERM-2 封堵（剥提权键、隔离外来文件、落盘落点闸，见下）。
+- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `~/code/ias-ops`；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路由 BRIDGE-PERM-2 收窄（frontmatter 白名单重建、`.claude/skills` 整树重建、隔离外来文件、lark-cli 落点闸；覆盖范围与已知缺口见下）。
 - lark-cli 的全局参数写在子命令后面（`--as user|bot` 写在前面也认）。
 
 audit 与 strict 共有：
@@ -84,13 +84,23 @@ audit 与 strict 共有：
 
 #### BRIDGE-PERM-2（strict 补洞，只在 audit / strict 生效，legacy 逐字不变）
 
-strict 开启前，技能与写文件还有几条能绕开白名单的提权路，本卡逐条封堵：
+strict 开启前，技能与写文件还有几条能绕开白名单的提权路，本卡（含 R1 返工）逐条收窄：
 
-- **技能不能给自己提权**：同步技能时剥掉 `SKILL.md` frontmatter 顶层的 `allowed-tools` / `hooks`（含引号、下划线变体）等键，正文一字不动；技能树里的符号链接整棵跳过；用户级 `lark-*` 技能同样剥。
-- **`.claude` 外来文件隔离**：工作区 `.claude/` 下除桥接同步的真目录 `skills/` 外，`settings*.json` / `hooks/` / `commands/` / `agents/` / `CLAUDE.md` 等启动时移进 `.claude-quarantine/`（带时间戳、不加载也不删）。strict 下连隔离都失败就 fail closed（抛「启动失败」、不重试、本轮不跑）；audit 兜底继续并记日志。
-- **写文件落点闸**：`lark-cli` 读类命令带 `--output` / `-o` / `>` / `>>` / `| tee` 时，落点只能在 `outbox/` 或系统临时目录；写 `.claude/`、`CLAUDE.md`、`schedules/`、`skills/`、`tasks/`、`.mcp.json` 一律拒（audit 记「将会拒绝」），`../` 与软链逃逸按物理路径判。内联 PreToolUse 钩子 `src/hooks/output-guard.js` 一律 fail closed。
+- **技能不能给自己提权**：`SKILL.md` frontmatter 按白名单重建——只留顶格、无引号的 `name` / `description` / `version` / `metadata` 及其空格缩进续行，其余键（`allowed-tools`、`hooks`、`model`、`shell`、引号键、flow 写法、`?` 显式键…）一律丢，正文一字不动；开头分隔行带空白（`--- `）、或与 CLI 的 frontmatter 截取不一致时，整个技能不拷并记日志；无 frontmatter（含前导空行）原样拷。技能树里的符号链接整棵跳过。用户级 `lark-*` 技能同样过白名单；它在 `~/.claude/skills` 下若是顶层符号链接，按 realpath 解引用，但只认 `~/.agents/skills` 的直接子目录（逃逸、链到根本身、更深层级、悬空都拒，悬空只警告一次）。
+- **`.claude/skills` 整树重建**：每轮在 `workspace/.claude-staging/<pid>-<序号>-<随机>/` 从零拷出本轮预期集合（`workspace/skills/` 下的真目录 + 白名单 `lark-*`），目的地一律新建（`wx` / `COPYFILE_EXCL`，不跟随软链写穿），再整体换上；旧树里预期集合之外的存量技能 / 软链移进 `.claude-quarantine/skills-<名>.<时间戳>`，其余删掉。strict 下任一步失败抛「启动失败」，audit 记日志继续。
+- **`.claude` 外来文件隔离**：工作区 `.claude/` 下除桥接同步的真目录 `skills/` 外，`settings*.json` / `hooks/` / `commands/` / `agents/` / `CLAUDE.md` 等启动时移进 `.claude-quarantine/`（带时间戳、不加载也不删）；`.claude` 本身是软链或文件时只挪链接本身（不跟随），再建真目录。`.claude-quarantine` / `.claude-staging` 存在却不是真目录算隔离失败。strict 下隔离失败抛「启动失败」（不重试、本轮不跑）；audit 兜底继续并记日志。
+- **写文件落点闸**：`lark-cli` 读类命令带 `--output` / `-o` / `>` / `>>` / `| tee` 时，落点只能在 `outbox/` 或系统临时目录；写 `.claude/`、`CLAUDE.md`、`schedules/`、`skills/`、`tasks/`、`.mcp.json` 一律拒（audit 记「将会拒绝」），`../` 与软链逃逸按物理路径判。`drive +download`、`im +messages-resource(s)-download` 不带 `--output` / `-o` 时按「写当前目录」判、`--download-resources` 按写 `./lark-im-resources/` 判：只有会话 cwd 已在 outbox 里，或命令以 `cd outbox/<轮> && …` 这种确定生效的 `&&` 链开头才放行，下载请显式写 `--output ./outbox/<本轮目录>/文件名`。内联 PreToolUse 钩子 `src/hooks/output-guard.js` 在缺 workspace / 坏输入 / 判定异常 / 判定模块加载失败 / 未捕获异常 / 读 stdin 超时时都 `exit 2` 挡下，不输出 allow。
+- **`--as=` 前置写法**：`lark-cli --as=user …` 不会命中 strict 生成的 `--as user` / `--as bot` 规则，审计判定（audit 预演 / strict 对账）也一律记 deny。
 - **排查诊断（sched-diag）无工具**：`--setting-sources ''` + `--strict-mcp-config` + `--tools ''`，`job.prompt` 与报错进不可信围栏。
 - **群聊不附回执**：以 owner 名义的回执只在私聊附，群聊不附（群里的写动作仍记审计）。
+- **sched-diag 任务名**：audit / strict 下任务名压成单行、限 80 字，不能借换行伪造新段落。
+
+**未覆盖 / 待验证**（不要当成已封堵）：
+
+- 系统临时目录（`/tmp`、`$TMPDIR`）整体放行，落点闸不细分其中路径；
+- 内联 shell（`bash -c`、`eval`、`$(…)` 里的写文件）只做了尽力解析，阻断效果待真机 smoke；
+- 钩子超时（CLI 侧 5 秒）时 CLI 的实际放行 / 拒绝行为待真机 smoke；
+- 用户级技能软链目标在 `~/.claude/skills` 根下（而非 `~/.agents/skills`）时暂不拷，待协调者裁定。
 
 ## 🗂️ Agent 工作区（OpenClaw / Hermes 式三层记忆与技能）
 

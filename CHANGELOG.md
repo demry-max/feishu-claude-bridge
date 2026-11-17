@@ -99,6 +99,19 @@
 - 测试：新增 `test/owner-profiles-perm2.test.js`（legacy 全矩阵回归、同步树、隔离 + 剥键、fail-closed、Q1-B、sched-diag）、
   `test/tool-policy-output.test.js`（落点闸纯函数 / 真实软链逃逸 / 审计 judge 闸 / 钩子子进程 / 词法分类对基线逐字回归）与两个夹具；
   既有 `test/owner-profiles.test.js`、`test/tool-audit.test.js` 各补测。
+- **R1 返工（审查 §9）**：
+  - `.claude/skills` 改为整树重建（`.claude-staging/<pid>-<序号>-<8 位随机 hex>/` 暂存后整体换上），存量外来技能 / 软链进
+    `.claude-quarantine/skills-<名>.<时间戳>`；拷贝目的地一律 `wx` / `COPYFILE_EXCL` 新建，不再跟随软链写穿。
+  - `SKILL.md` frontmatter 从「黑名单剥键」改为「白名单重建」（只留 `name` / `description` / `version` / `metadata`）；开头分隔行带空白、
+    或与 CLI 截取不一致时整个技能不拷。
+  - 用户级 `lark-*` 顶层软链按 realpath 解引用，只认 `~/.agents/skills` 的直接子目录（`~/.claude/skills` 根暂不认，见停卡项）。
+  - `.claude` 本身是软链 / 文件时只挪链接本身；`.claude-quarantine` / `.claude-staging` 不是真目录算隔离失败。
+  - 落点闸新增隐式落点：`drive +download`、`im +messages-resource(s)-download` 不带输出参数按写当前目录判，`--download-resources`
+    按写 `./lark-im-resources/` 判；钩子拒绝文案提示显式写 `--output`。
+  - 钩子只静态 import `node:*`，判定模块动态加载，加载失败 / 未捕获异常都 `exit 2`。
+  - 新增导出 `usesEqAsPrefix`：`lark-cli --as=user …` 在审计判定里一律 deny（`classifyCommand` / strict argv 不变）。
+  - sched-diag（audit / strict）任务名单行化、限 80 字。
+  - 测试：新增 `test/skills-sync-perm2.test.js`，`test/tool-policy-output.test.js` / `test/owner-profiles-perm2.test.js` 补 `测PERM2-R1-*`。
 
 ## [2.3.0] - 2026-09-14
 

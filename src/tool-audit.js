@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { classifyCommand, classifySegments, auditName, safeToolName, STRICT_TOOLS, FEISHU_MCP_READ, checkOutputTargets } from './tool-policy.js';
+import { classifyCommand, classifySegments, auditName, safeToolName, STRICT_TOOLS, FEISHU_MCP_READ, checkOutputTargets, usesEqAsPrefix } from './tool-policy.js';
 import { fenceUntrusted } from './messages.js';
 
 const MAX_AUDIT_BYTES = 5 * 1024 * 1024;
@@ -47,6 +47,8 @@ function judge(use, kind, profile, confirm, workspace = null) {
     if (kind === 'sched') decision = c.profileAllowed.sched ? 'allow' : 'deny';
     else if (c.class === 'confirm') decision = profile === 'strict' && confirm === true ? 'allow' : 'confirm';
     else decision = c.decision;
+    // R1：`lark-cli --as=user …` 前置等号写法——strict 的规则只有 `--as user` / `--as bot` 前缀，CLI 侧不会命中，审计也判 deny
+    if (usesEqAsPrefix(command)) decision = 'deny';
     // 输出路径提权闸：strict 真拒（PreToolUse 钩子落地），audit 记「将拒绝」。已判 deny 的不必再过。
     if (workspace && decision !== 'deny' && !checkOutputTargets(command, guardOptions(workspace)).ok) decision = 'deny';
     if (c.lark) return { tool: 'Bash', domain: nameOrNull(c.domain), cmd: nameOrNull(c.cmd), method: nameOrNull(c.method), decision };

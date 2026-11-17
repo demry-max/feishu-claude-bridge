@@ -174,3 +174,128 @@ test('测PERM2-out9 分类回归：classifySegments/classifyCommand 对基线语
   assert.deepEqual(driftSeg, [], 'classifySegments 漂移的用例下标');
   assert.deepEqual(driftCmd, [], 'classifyCommand 漂移的用例下标');
 });
+
+// ---------- R1：隐式落点（下载类不带 --output 时落在 cwd；--download-resources 落 ./lark-im-resources/） ----------
+test('测PERM2-R1-6 隐式落点：不带 --output 的下载 / --download-resources 在工作区根拒；cd 进 outbox 或显式 --output 放行', () => {
+  for (const cmd of [
+    'lark-cli drive +download --file-token t',
+    'lark-cli im +messages-resources-download --message-id m --file-key k --type file',
+    'lark-cli im +messages-resource-download --message-id m --file-key k',
+    'lark-cli --as user drive +download --file-token t',
+    'lark-cli im +chat-messages-list --chat-id oc_1 --download-resources',
+    'lark-cli im +messages-mget --message-ids m --download-resources',
+    'cd outbox/oc_1; lark-cli drive +download --file-token t', // cd 失败时仍落在工作区根：不认
+    'cd outbox/oc_1 || true && lark-cli drive +download --file-token t',
+    'echo x && lark-cli drive +download --file-token t',
+    'cd outbox/oc_1 && cd ../.. && lark-cli drive +download --file-token t',
+  ]) {
+    const r = run(cmd);
+    assert.equal(r.ok, false, `应拒绝：${cmd.slice(0, 40)}`);
+    assert.ok(r.deny.some((d) => d.reason === 'not-outbox'), `原因 not-outbox（实得 ${r.deny.map((d) => d.reason).join('/')}）`);
+  }
+  assert.ok(outputTargets('lark-cli drive +download --file-token t').targets.some((t) => t.via === 'implicit' && t.target === '.'), '隐式落点 . 入列');
+  assert.ok(outputTargets('lark-cli im +chat-messages-list --download-resources').targets.some((t) => t.target === './lark-im-resources/'), '--download-resources 落点入列');
+  for (const cmd of [
+    'cd outbox/oc_1 && lark-cli drive +download --file-token t',
+    'lark-cli drive +download --file-token t --output ./outbox/oc_1/a',
+    'lark-cli drive +download --file-token t -o outbox/oc_1/a',
+    'lark-cli im +messages-resources-download --message-id m --file-key k --output ./outbox/oc_1/f',
+    'cd outbox && cd oc_1 && lark-cli im +chat-messages-list --chat-id oc_1 --download-resources',
+  ]) {
+    const r = run(cmd);
+    assert.equal(r.ok, true, `应放行：${cmd.slice(0, 40)}（实得 ${r.deny.map((d) => d.reason).join('/')}）`);
+  }
+  // 会话 cwd 已在本轮 outbox 里：不带 --output 也放行；cwd 在工作区根则拒
+  assert.equal(run('lark-cli drive +download --file-token t', { ...PURE, cwd: '/ws/outbox/oc_1' }).ok, true, 'cwd 在 outbox 放行');
+  assert.equal(run('lark-cli drive +download --file-token t', { ...PURE, cwd: '/ws' }).ok, false, 'cwd 在工作区根拒');
+  // 不带 cwd 时按工作区根算
+  assert.equal(run('lark-cli drive +download --file-token t', { ...PURE, cwd: null }).ok, false);
+  // 非下载类不加隐式落点
+  assert.equal(run('lark-cli im +chat-list').ok, true, '普通 read 命令不受影响');
+});
+
+test('测PERM2-R1-6b 隐式落点：真实目录树里 outbox/<轮> 是软链指回工作区根也拒', () => {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-impl-')));
+  const ws = path.join(tmp, 'ws');
+  fs.mkdirSync(path.join(ws, 'outbox', 'oc_1'), { recursive: true });
+  fs.symlinkSync(ws, path.join(ws, 'outbox', 'up'));
+  const opts = {
+    cwd: ws, workspace: ws, tmpDirs: [os.tmpdir(), '/tmp'],
+    realpath: fs.realpathSync, readlink: (p) => { try { return fs.readlinkSync(p); } catch { return null; } },
+    home: os.homedir(), vars: {},
+  };
+  try {
+    assert.equal(checkOutputTargets('cd outbox/oc_1 && lark-cli drive +download --file-token t', opts).ok, true);
+    assert.equal(checkOutputTargets('cd outbox/up && lark-cli drive +download --file-token t', opts).ok, false, '软链回根拒');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('测PERM2-R1-6c 钩子拒绝文案：提示下载显式写 --output ./outbox/<本轮目录>/文件名', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-guard3-'));
+  try {
+    const r = runGuard([ws], JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'lark-cli drive +download --file-token t' }, cwd: ws }));
+    assert.equal(r.status, 0);
+    const j = JSON.parse(r.stdout);
+    assert.equal(j.hookSpecificOutput.permissionDecision, 'deny');
+    assert.ok(j.hookSpecificOutput.permissionDecisionReason.includes('--output ./outbox/<本轮目录>/文件名'));
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+// ---------- R1：钩子模块加载失败 / 未捕获异常也 exit 2（不能 exit 1 fail open） ----------
+test('测PERM2-R1-7 output-guard 钩子：拷到没有 ../tool-policy.js 的目录里跑，模块加载失败也 exit 2', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-guard4-'));
+  const ws = path.join(dir, 'ws');
+  fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+  fs.mkdirSync(ws);
+  fs.copyFileSync(GUARD, path.join(dir, 'hooks', 'output-guard.js'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"type":"module"}\n');
+  try {
+    const r = spawnSync(process.execPath, [path.join(dir, 'hooks', 'output-guard.js'), ws], {
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'lark-cli im +chat-list > .claude/x' }, cwd: ws }), encoding: 'utf8',
+    });
+    assert.equal(r.status, 2, `模块加载失败 exit 2（实得 ${r.status}）`);
+    assert.ok(!/allow/.test(r.stdout), '不输出 allow');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- R1：--as= 前置写法在审计判定里判 deny（strict 的规则只生成 --as user / --as bot 前缀） ----------
+test('测PERM2-R1-8 --as=user 前置：judge 判 deny（audit/strict、chat/sched），classifyCommand 的 class 不变', async () => {
+  const { usesEqAsPrefix } = await import('../src/tool-policy.js');
+  assert.equal(usesEqAsPrefix('lark-cli --as=user im +chat-list'), true);
+  assert.equal(usesEqAsPrefix('echo 1 && lark-cli --as=bot im +chat-list'), true);
+  assert.equal(usesEqAsPrefix('lark-cli --as user im +chat-list'), false);
+  assert.equal(usesEqAsPrefix('lark-cli im +chat-list --as=user'), false, '只看子命令前的前置位');
+  assert.equal(usesEqAsPrefix('echo --as=user'), false);
+  const eq = 'lark-cli --as=user im +chat-list';
+  assert.equal(classifyCommand(eq).class, classifyCommand('lark-cli --as user im +chat-list').class, 'class 不变');
+  assert.equal(classifyCommand(eq).class, 'read');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'perm2-eqas-'));
+  const ws = path.join(tmp, 'ws');
+  fs.mkdirSync(ws, { recursive: true });
+  const decisionFor = (profile, kind, command, workspace) => {
+    const file = path.join(tmp, `audit-${profile}-${kind}-${workspace ? 'ws' : 'nows'}.jsonl`);
+    fs.rmSync(file, { force: true });
+    const rec = createToolRecorder({ kind, profile, confirm: false, workspace, file, log: { error() {} } });
+    rec.assistant({ message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command } }] } });
+    rec.flush();
+    return JSON.parse(fs.readFileSync(file, 'utf8').trim().split('\n')[0]).decision;
+  };
+  try {
+    for (const profile of ['audit', 'strict']) {
+      for (const kind of ['chat', 'sched']) {
+        for (const workspace of [ws, null]) {
+          assert.equal(decisionFor(profile, kind, eq, workspace), 'deny', `${profile}/${kind}/${workspace ? 'ws' : 'nows'}：--as= 前置判 deny`);
+          assert.equal(decisionFor(profile, kind, 'lark-cli --as user im +chat-list', workspace), 'allow', `${profile}/${kind}：--as user 照旧 allow`);
+        }
+      }
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

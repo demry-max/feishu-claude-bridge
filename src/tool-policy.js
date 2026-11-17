@@ -115,7 +115,7 @@ function readBacktick(src, i) {
 function lex(src) {
   const segs = [];
   const subs = [];
-  const units = []; // BRIDGE-PERM-2：与 segs 平行，另记每词是否含展开（dyns）与每个重定向目标（redirs）；不影响 segs/subs
+  const units = []; // BRIDGE-PERM-2：与 segs 平行，另记每词是否含展开（dyns）、每个重定向目标（redirs）与收尾分隔符（sep，R1）；不影响 segs/subs
   let words = [];
   let dyns = [];
   let redirs = [];
@@ -139,11 +139,11 @@ function lex(src) {
     cur = null;
     curDyn = false;
   };
-  const endSeg = () => {
+  const endSeg = (sep = 'end') => {
     push();
     if (pendingOp) { redirs.push({ op: pendingOp, target: null, dyn: true }); pendingOp = null; }
     if (words.length) segs.push(words);
-    if (words.length || redirs.length) units.push({ words, dyns, redirs });
+    if (words.length || redirs.length) units.push({ words, dyns, redirs, sep });
     words = [];
     dyns = [];
     redirs = [];
@@ -169,7 +169,7 @@ function lex(src) {
     }
     if (c === ' ' || c === '\t' || c === '\r') { push(); continue; }
     if (c === '\n') {
-      endSeg();
+      endSeg('\n');
       // 跳过 heredoc 正文：它是数据不是命令
       while (heredocs.length) {
         const delim = heredocs.shift();
@@ -221,10 +221,10 @@ function lex(src) {
       i = j - 1;
       continue;
     }
-    if (c === '(' || c === ')') { endSeg(); continue; }
-    if (c === ';') { endSeg(); continue; }
-    if (c === '|') { endSeg(); if (n === '|' || n === '&') i++; continue; }
-    if (c === '&' && n === '&') { endSeg(); i++; continue; }
+    if (c === '(' || c === ')') { endSeg(c); continue; }
+    if (c === ';') { endSeg(';'); continue; }
+    if (c === '|') { endSeg(n === '|' || n === '&' ? c + n : c); if (n === '|' || n === '&') i++; continue; }
+    if (c === '&' && n === '&') { endSeg('&&'); i++; continue; }
     if (c === '&' && n === '>') {
       push();
       i++;
@@ -234,7 +234,7 @@ function lex(src) {
       skipNext = true;
       continue;
     }
-    if (c === '&') { endSeg(); continue; }
+    if (c === '&') { endSeg('&'); continue; }
     if (c === '>' || c === '<') {
       // 重定向：可带 fd 前缀（2>）、>> >| >& <& << <<- <<<
       if (cur !== null && /^\d+$/.test(cur)) { cur = null; curDyn = false; } else push();
@@ -387,6 +387,14 @@ export function classifyCommand(cmdline) {
   return { program, lark, domain, cmd, method, class: top.class, decision: DECISION[top.class], profileAllowed };
 }
 
+/**
+ * BRIDGE-PERM-2 R1：有没有 lark-cli 段把 --as= 写在子命令前（`lark-cli --as=user im …`）。
+ * strict 的 --allowedTools 只生成 `--as user` / `--as bot` 前缀，等号写法 CLI 侧不会命中；审计判定也必须判 deny，避免误记 allow。
+ */
+export function usesEqAsPrefix(cmd) {
+  return classifySegments(cmd).some((s) => s.lark && s.program === 'lark-cli' && /^--as=/.test(s.tokens[1] ?? ''));
+}
+
 // ---------------- BRIDGE-PERM-2：lark 写文件落点（--output/-o/重定向/tee/cd）的提取与判定 ----------------
 // strict/audit 下 read 级 lark 子命令带 --output/-o、重定向（> >> >| &> >& <>）、| tee 写文件时，落点必须在
 // workspace/outbox 或系统临时目录；.claude/、CLAUDE.md、schedules/、skills/、tasks/、.mcp.json 一律不可写。
@@ -516,7 +524,10 @@ function checkOneTarget(t, bases, hasLark, wsList, tmpList, realOf, home, vars) 
   return worst ? { target: raw, reason: worst } : null;
 }
 
+// R1：这几个下载子命令不带 --output / -o 时写进当前目录；--download-resources 写进 ./lark-im-resources/
+const IMPLICIT_DOWNLOAD = new Set(['drive +download', 'im +messages-resources-download', 'im +messages-resource-download']);
 function larkTargets(rest, restDyn, acc) {
+  const before = acc.targets.length;
   for (let k = 0; k < rest.length; k++) {
     const w = rest[k];
     if (w === '--') break;
@@ -534,6 +545,16 @@ function larkTargets(rest, restDyn, acc) {
       if (val !== '') acc.targets.push({ target: val, dyn: restDyn[k], via: '-o' });
       else { acc.targets.push({ target: rest[k + 1] === undefined ? '' : rest[k + 1], dyn: restDyn[k + 1] || false, via: '-o' }); k++; }
     }
+  }
+  // 子命令前缀与 classifyLark 同口径：剥掉一个 --as user|bot / --as=user|bot
+  let i = 0;
+  if (rest[0] === '--as' && (rest[1] === 'user' || rest[1] === 'bot')) i = 2;
+  else if (rest[0] === '--as=user' || rest[0] === '--as=bot') i = 1;
+  if (acc.targets.length === before && IMPLICIT_DOWNLOAD.has(`${rest[i]} ${rest[i + 1]}`)) {
+    acc.targets.push({ target: '.', dyn: false, via: 'implicit' });
+  }
+  if (rest.some((w) => w === '--download-resources' || w.startsWith('--download-resources='))) {
+    acc.targets.push({ target: './lark-im-resources/', dyn: false, via: 'implicit' });
   }
 }
 
@@ -631,9 +652,21 @@ function unitTargets(words, dyns, depth, acc) {
 function collectTargets(src, depth, acc) {
   if (depth > MAX_DEPTH) { acc.unknown = true; return; }
   const { subs, units } = lex(String(src == null ? '' : src));
+  // R1：隐式落点（当前目录）只认顶层一串「cd X && cd Y && 下载」里确定会生效的 cd；任何别的分隔符 / 非 cd 段都断链（按全部 base 判）
+  let chain = depth === 0 ? [] : null;
   for (const u of units) {
+    const t0 = acc.targets.length;
+    const c0 = acc.cds.length;
+    const unknown0 = acc.unknown;
     for (const r of u.redirs) acc.targets.push({ target: r.target, dyn: r.dyn, via: r.op });
     unitTargets(u.words, u.dyns, depth, acc);
+    for (let k = t0; k < acc.targets.length; k++) {
+      const t = acc.targets[k];
+      if (t.via === 'implicit' && !('chain' in t)) t.chain = chain ? chain.slice() : null;
+    }
+    const plainCd = (u.words[0] === 'cd' || u.words[0] === 'pushd') && acc.cds.length === c0 + 1 && !acc.unknown && !unknown0;
+    if (chain && u.sep === '&&' && plainCd) chain.push(acc.cds[c0].target);
+    else chain = null;
   }
   for (const s of subs) collectTargets(s, depth + 1, acc);
 }
@@ -688,8 +721,19 @@ export function checkOutputTargets(cmdline, opts = {}) {
     }
   }
 
+  // 隐式落点有确定的 cd 链：只按链走到的那个目录判（不再拿 workspace 根等全部 base 兜底）；链里有 ~ 就退回全部 base
+  const chainBase = (chain) => {
+    if (!Array.isArray(chain)) return null;
+    let b = cwdAbs ?? ws;
+    for (const c of chain) {
+      if (typeof c !== 'string' || c === '' || c.startsWith('~')) return null;
+      b = path.posix.isAbsolute(c) ? c : b + '/' + c; // 不用 resolve：保留 .. 交给 physResolve 物理回退
+    }
+    return b;
+  };
   for (const t of info.targets) {
-    const r = checkOneTarget(t, bases, hasLark, wsList, tmpList, realOf, home, vars);
+    const cb = t.via === 'implicit' ? chainBase(t.chain) : null;
+    const r = checkOneTarget(t, cb ? [cb] : bases, hasLark, wsList, tmpList, realOf, home, vars);
     if (r) deny.push(r);
   }
 
