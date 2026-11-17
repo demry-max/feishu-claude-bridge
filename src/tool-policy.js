@@ -8,6 +8,7 @@
 
 import path from 'node:path';
 import { ownerText, OWNER } from './owner-name.js';
+import { BIZ_TOOL } from './biz-targets.js';
 
 export const STRICT_TOOLS = Object.freeze(['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash', 'WebSearch', 'ToolSearch', 'Skill']);
 export const FEISHU_MCP_READ = Object.freeze(['doc_read', 'sheet_read', 'bitable_tables', 'bitable_fields', 'bitable_records', 'mail_attachment_download']);
@@ -758,8 +759,8 @@ export function auditName(token) {
   return s;
 }
 
-const MCP_KNOWN = new Set([...FEISHU_MCP_READ, ...FEISHU_MCP_WRITE].map((t) => `mcp__feishu__${t}`));
-/** 工具名：内置工具形如 Read/WebFetch；MCP 只认飞书的 10 个；其余 <其他>。 */
+const MCP_KNOWN = new Set([...[...FEISHU_MCP_READ, ...FEISHU_MCP_WRITE].map((t) => `mcp__feishu__${t}`), BIZ_TOOL]);
+/** 工具名：内置工具形如 Read/WebFetch；MCP 只认飞书的 10 个与 biz_get（BRIDGE-BMS-1）；其余 <其他>。 */
 export function safeToolName(name) {
   if (typeof name !== 'string') return OTHER;
   if (MCP_KNOWN.has(name)) return name;

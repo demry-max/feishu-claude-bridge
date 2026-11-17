@@ -12,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkNode, checkNpm, checkEnvFile } from '../src/doctor.js';
 import {
-  item, defaultRun, checkDeps, checkClaudeCli, checkClaudeAuth, checkRequiredEnv, checkEnvSanity,
+  item, defaultRun, checkDeps, checkClaudeCli, checkFallbackCli, checkClaudeAuth, checkRequiredEnv, checkEnvSanity,
   checkShadowed, checkOptionalBins, checkService, findOwnerCandidates, readTail, ownerLogFiles, ownerHint,
   readEnvFile, renderLine, toJson, scrubSecrets, exitCodeFor,
 } from './lib/checks.js';
@@ -80,6 +80,10 @@ if (cliItem.status !== 'fail') {
     add(item('claude_exec_model', ce.problem ? 'fail' : 'ok', `执行模型 ${cfg.execModel}`, ce.problem ?? `聊天/规划=${cfg.model || 'CLI 默认'}`));
   }
 }
+
+// 4b) 备用账号的 claude（可选）：配置了才查
+const fallbackBin = String(process.env.CLAUDE_FALLBACK_BIN ?? '').trim();
+if (fallbackBin) add(checkFallbackCli({ bin: fallbackBin }));
 
 // 5) .env
 const env = checkEnvFile(ROOT);

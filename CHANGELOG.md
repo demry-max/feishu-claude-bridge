@@ -19,6 +19,15 @@
   `npm run install-service` 改写 `ExitTimeOut = min(SHUTDOWN_GRACE_SEC, 50) + 10`；`SHUTDOWN_GRACE_SEC` 大于 50 时在 plist 环境变量里把它钉成 50 并提示。
   `npm run doctor` 按 plist 里钉住的值核对。`SHUTDOWN_GRACE_SEC` 代码默认值仍是 120（systemd / 前台没有这个上限）。
 
+### 备用账号（默认关闭）
+
+- **新增 `CLAUDE_FALLBACK_BIN` / `CLAUDE_FALLBACK_COOLDOWN_MIN`**（`src/account-fallback.js`）：主用账号报额度用完或登录失效时，冷却期内（默认 30 分钟，1–720）所有新起的 claude 都改用备用 bin；
+  冷却到期下一轮先试主用，成功即换回，仍不可用再冷却且这一轮自动落到备用；备用也不可用（或备用 bin 起不来）时本轮不来回切、照常报错，并清掉冷却、下一轮先试主用。不设 `CLAUDE_FALLBACK_BIN` 时行为不变。
+- 本轮还没调过工具、也没发过进度消息时，立即在备用上重跑这一轮（不等待、不占网络重试名额）；已动过手的不重放，提示「已切到备用账号，请再发一次，或说“继续”」。取消的轮不切换。
+- 配置了备用时，主用或备用报会话不存在都只对这一次不带 `--resume` 再试（两个 bin 不共用 CLI 配置目录时两边都会自动开新会话）；没动过手的出错结果里的 session_id 不再写回会话表，动过手的照常回写。
+- 进入备用时私信 owner 一条固定文案（不含原始报错），一次连续备用期只发一次，落在心跳免打扰时段（`HEARTBEAT_QUIET_HOURS`）时延后到时段结束、那之前已回到主用就不发；状态只在内存，重启后从主用起，主用仍不可用会再收到一条通知；`/status` 多一行当前账号；启动自检对备用 bin 跑 `--version`，失败视为未配置；`npm run doctor` 新增 `claude_fallback_cli`。
+- 日志闭集：`[account] 主用不可用(quota|auth)，切到备用，冷却 N 分钟` / `冷却到期，试主用` / `回到主用` / `备用也不可用(quota|auth)` / `备用启动失败，回到主用路径`；`[account-notice] 免打扰时段，切换通知延后到时段结束` / `切换通知发送失败`。
+
 ### 安装与文档（让没见过仓库的 AI agent 只凭链接装到可用）
 
 - **新增 `AGENTS.md`**：给 AI agent 的安装手册——每步「命令 / 预期 / 失败怎么办」，`[需要人]` 步骤附中英双语转告话术与核验命令；
@@ -212,6 +221,42 @@
   - strict 档下单独排队的「确认」出队时不放行确认级操作（排队期间上一轮可能已出新草稿），原样交给模型并提示 owner 看完最新回复再单独回「确认」；
   - 附件下载慢时出队先等更早到、还没接收完的消息（最多 30 秒，`ARRIVAL_HOLD_MS`），合并仍按到达顺序；下载失败照旧告知、不拖住后面的；到点先办已排好的，迟到的进下一轮；
   - 文档写明优雅退出的例外：`SHUTDOWN_GRACE_SEC=0`、二次信号、SIGKILL、崩溃、launchd 提前强杀时排队消息直接丢、不回「请重发」。
+
+### 业务系统只读查询（bms / ias）
+
+> owner 的私聊、发往 owner 私聊的定时任务和心跳可以只读查询两个内部业务系统。新开关 `BMS_TOOL_ENABLED` 默认关，关着时所有轮次的参数与以前逐字相同。
+
+- **新工具 `mcp__biz__biz_get`**（`BMS_TOOL_ENABLED=1`，只认恰好 `1`；三个工具档下都生效）。
+  - 由桥接自带的 stdio MCP 服务 `src/mcp-biz.js` 提供。参数是 `target`（`bms` 业务管理系统 / `ias` 财务会计系统）、`path`、`query`。
+  - 主机、路径前缀、钥匙串条目名是 `src/biz-targets.js` 里的常量，没有环境变量能改。
+- **只读与防注入**：
+  - 只发 GET，`redirect: 'manual'`：3xx 一律报错，不跟随。
+  - 路径先归一化再核对 `/api/v1` 前缀。拒绝 `..`、`//`、`\`、`@`、`%` 编码、完整 URL，以及密钥 / 认证 / 导出 / 下载 / 凭证类路径。
+  - query 结构化：怪键、超过 30 个参数拒绝；分页 `limit` 截回上限（bms 100、ias 200）。
+  - 15 秒超时，响应 1 MB 上限，结果 40000 字截断；每轮 30 次、每分钟 20 次；`NODE_TLS_REJECT_UNAUTHORIZED=0` 时停用。
+  - 返回内容整段进不可信围栏。
+- **Key 只在本机钥匙串**：
+  - MCP 服务每次调用用 `/usr/bin/security find-generic-password … -w` 读进内存（5 秒超时，仅 macOS）。
+  - 不进环境变量、命令行参数、临时 MCP 配置、日志、审计或报错文本。响应里出现的 Key 也会被打码。
+  - 缺条目时只有那个系统不可用，回固定提示和写入命令模板。
+- **谁有这个工具**：
+  - 有：owner 私聊（legacy / audit / strict 对话）、结果发往 owner 私聊的定时任务（含 strict 的只读定时任务）、心跳。
+  - 定时任务看目的地：`src/index.js` 只在内存里记 owner 私聊的会话 ID，任务的 `chat_id` 恰好等于它才有；发往群或其他会话、桥接重启后 owner 还没私聊过时都没有。
+  - 心跳另挂一份只含这个工具的临时 MCP 配置，轮次结束删除；系统提示多一行说明。
+  - 没有：群聊（含 owner 在群里）、发往群或目的地判断不出的定时任务、访客、sched-diag、验收、交接。
+  - 有这个工具的轮次另加 `Read(<仓库>/.env)`、`Read(<仓库>/.env.*)` 拒读，并拒绝 `Bash(security:*)`、`Bash(/usr/bin/security:*)`。免询问白名单里没有任何 `Bash(security…)`。
+  - MCP 服务经 `/usr/bin/env -u …` 启动，去掉 `NODE_OPTIONS`、`NODE_EXTRA_CA_CERTS` 和各种 `*_PROXY`（含小写）。
+- **审计**：audit / strict 下这个工具记为放行，只记工具名、target、GET 和路径第一段的大类。
+- **技能**：开关开时，桥接把 `docs/skills/biz-readonly/`（端点速查）作为保留技能同步进 `workspace/.claude/skills/`。
+  - legacy 直拷，audit / strict 过 frontmatter 白名单重建。
+  - 不写 `workspace/skills/`。
+- **自检**：`npm run -s biz-check`（`bms-check` 只查 bms），每个系统一行打码结论，退出码 0 / 1。
+- **新增文件**：`src/biz-targets.js`、`src/mcp-biz.js`、`src/biz-wiring.js`、`scripts/biz-check.js`、`docs/skills/biz-readonly/SKILL.md`。
+  - `src/claude.js` 只加接线。`src/tool-audit.js`、`src/tool-policy.js` 认这个工具名。`src/index.js` 只加记 owner 私聊会话 ID、给定时任务带目的地的几行。
+- **测试**：
+  - 新增 `test/biz-targets.test.js`、`test/mcp-biz.test.js`、`test/biz-profiles.test.js`、`test/biz-check.test.js`。
+  - `test/biz-profiles.test.js` 在开关关时，把三档的 17 个用例与改动前生成的夹具逐字比对。
+  - 既有测试一条未改。
 
 ## [2.3.0] - 2026-09-14
 

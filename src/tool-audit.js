@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { classifyCommand, classifySegments, auditName, safeToolName, STRICT_TOOLS, FEISHU_MCP_READ, checkOutputTargets, usesEqAsPrefix } from './tool-policy.js';
 import { fenceUntrusted } from './messages.js';
+import { BIZ_TOOL, bizAuditFields } from './biz-targets.js';
 
 const MAX_AUDIT_BYTES = 5 * 1024 * 1024;
 const nameOrNull = (v) => (v == null ? null : auditName(v));
@@ -40,6 +41,11 @@ function guardOptions(workspace) {
  */
 function judge(use, kind, profile, confirm, workspace = null) {
   const name = use?.name;
+  // BRIDGE-BMS-1：biz_get 只读 GET，对话与定时都放行；只记 target、路径类别、方法，不记 path / query 的值
+  if (name === BIZ_TOOL) {
+    const f = bizAuditFields(use?.input);
+    return { tool: BIZ_TOOL, domain: nameOrNull(f.domain), cmd: nameOrNull(f.cmd), method: nameOrNull(f.method), decision: 'allow' };
+  }
   if (name === 'Bash') {
     const command = typeof use?.input?.command === 'string' ? use.input.command : '';
     const c = classifyCommand(command);

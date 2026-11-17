@@ -8,6 +8,7 @@ import { loadSessions, saveSessions } from './store.js';
 import { ensureOwnerWorkspace } from './workspace.js';
 import { patchEnvFile } from './env-file.js';
 import { routeTurn, DEFAULT_EXEC_TRIGGERS } from './lanes.js';
+import { spawnBinFor, runWithAccount, skipErrorSession, accountStatusLine } from './account-fallback.js'; // BRIDGE-ACCT-1 备用账号（未配置时零变化）
 export { routeTurn, DEFAULT_EXEC_TRIGGERS };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -390,7 +391,7 @@ export function sessionInfo(chatId, isOwner = false) {
     `- 思考深度: ${CLAUDE_EFFORT || '（CLI 默认）'}`,
     `- 上下文: ${(contextSize.get(chatId) ?? 0).toLocaleString()} tokens${CONTEXT_NUDGE_TOKENS > 0 ? ` / 固化提醒阈值 ${CONTEXT_NUDGE_TOKENS.toLocaleString()}` : ''}`,
     `- 允许工具: ${tools || '（无）'}`,
-  ].join('\n');
+  ].join('\n') + accountStatusLine(); // BRIDGE-ACCT-1：配置了备用账号时多一行当前账号，未配置为空串
 }
 
 // Claude 被禁止自写 .claude 目录，agent 沉淀的技能先落 workspace/skills，
@@ -546,6 +547,10 @@ function rebuildSkillsTree() {
     }
     for (const name of syncExtraSkillNames(OWNER_EXTRA_SKILLS)) expected.add(name);
     syncExtraSkills({ dest: staging }); // 用户级 lark-* 技能（内部逐个兜错，同样过白名单重建）
+    if (BIZ_ON) { // BRIDGE-BMS-1：biz-readonly 由桥接提供（同名的工作区技能被替换），同样过白名单重建
+      expected.add(BIZ_SKILL);
+      installBizSkill(staging, copySkillTree, { strip: true });
+    }
     const destSt = fs.lstatSync(dest, { throwIfNoEntry: false });
     if (destSt) {
       if (!isRealDir(destSt)) throw new Error('.claude/skills 不是真目录');
@@ -574,6 +579,7 @@ function syncSkills() {
     } catch (e) {
       console.error('[skills-sync]', e?.message ?? e);
     }
+    if (BIZ_ON) installBizSkill(dest, copySkillTree, { strip: false }); // BRIDGE-BMS-1：开关开时装 biz-readonly（不进 workspace/skills/）
     return; // legacy：与基线逐字一致，不隔离、不剥 frontmatter、不同步用户级技能
   }
   // audit/strict：先隔离 .claude 下的非桥接文件，再整树重建 .claude/skills
@@ -734,7 +740,7 @@ function buildVerifierArgs(opts = {}) {
 // 心跳（toolProfile:'heartbeat'）、访客、sched-diag: 自诊断三档都不进本段。
 // import 写在这里而不是文件头：本卡只在这一段新增代码；ESM 的 import/export 声明会被提升，位置不影响加载顺序。
 import { larkRules, larkClassRules, STRICT_TOOLS, FEISHU_MCP_READ, FEISHU_MCP_WRITE } from './tool-policy.js';
-import { createToolRecorder } from './tool-audit.js';
+import { createToolRecorder, createToolTurn as createToolTurnBase } from './tool-audit.js';
 import { fenceUntrusted } from './messages.js'; // BRIDGE-PERM-2：sched-diag 把任务指令/报错围栏起来
 import { DATA_DIR } from './store.js';
 import { ownerText, OWNER } from './owner-name.js';
@@ -744,7 +750,43 @@ const OWNER_STRICT_DENY_WRITE = extraWriteDenyRules(parseExtraWriteDirs(process.
   home: os.homedir(), bridgeRoot: path.resolve(__dirname, '..'), workspaces: [WORKSPACE_DIR, GUEST_WORKSPACE_DIR],
 }));
 export { detectConfirm } from './tool-policy.js';
-export { createToolTurn, startToolAuditSummary } from './tool-audit.js';
+export { startToolAuditSummary } from './tool-audit.js';
+
+// ---------------- BRIDGE-BMS-1：业务系统只读查询工具 biz_get（默认关闭） ----------------
+// 只有 BMS_TOOL_ENABLED=1 才开（模块加载时读一次）。开时 owner 私聊、发往 owner 私聊的定时任务（含 strict 只读定时）、心跳挂上
+// mcp__biz__biz_get，并给这些档加 .env 拒读（Read(//<仓库>/.env)、Read(//<仓库>/.env.*)）与 security 拒绝；群里的 owner 轮次、
+// 发往群或目的地未知的定时任务、访客、sched-diag、验收一律不给。关时所有档的 argv 与基线逐字一致。主机、钥匙串条目、请求逻辑在 biz-targets.js / mcp-biz.js。
+import { BIZ_SERVER, BIZ_TOOL, BIZ_SKILL } from './biz-targets.js';
+import { bizMcpServer, envDenyRules, writeBizOnlyMcpConfig, installBizSkill, withBizHeartbeat, schedToOwnerDm } from './biz-wiring.js';
+const BIZ_ON = process.env.BMS_TOOL_ENABLED === '1';
+const BIZ_ENV_DENY = BIZ_ON ? envDenyRules(path.resolve(__dirname, '..')) : []; // .env 拒读 + 拒绝 Bash 直接调用 security
+const BIZ_GRANT = Symbol('biz-grant'); // buildOwnerProfileArgs 把判定结果交给递归的基线构造（定时档的 opts 只剩 model/effort）
+
+/** 这一轮挂不挂 biz_get。owner 私聊靠 opts.chatType 认出来（由下面的 createToolTurn 包装带进来）。 */
+function bizGranted(chatId, isOwner, opts = {}) {
+  if (!BIZ_ON || isOwner !== true) return false;
+  if (typeof opts?.[BIZ_GRANT] === 'boolean') return opts[BIZ_GRANT];
+  const id = String(chatId);
+  const tp = opts?.toolProfile;
+  if (id.startsWith('sched-diag:')) return false;
+  if (tp === 'heartbeat') return true;
+  if (tp === 'sched') return schedToOwnerDm(opts); // 定时：只有结果发往 owner 私聊时才给（index.js 带 schedDest）
+  if (tp != null) return false; // 验收（verifier）、交接（handoff）等其余档一律不给
+  if (id.startsWith('sched:')) return schedToOwnerDm(opts);
+  return opts?.chatType === 'p2p';
+}
+
+/** tool-audit 的 createToolTurn 外加一层：开关开、owner 轮次时把 chatType 带进 runClaude 的 opts；其余原样返回。 */
+export function createToolTurn(o = {}) {
+  const t = createToolTurnBase(o);
+  if (!BIZ_ON || o?.isOwner !== true) return t;
+  const run = t.runClaude;
+  return {
+    ...t,
+    runClaude: (chatId, p, owner, extra, onProgress, opts) =>
+      run(chatId, p, owner, extra, onProgress, { ...(opts ?? {}), chatType: o.chatType }),
+  };
+}
 
 export const OWNER_TOOL_PROFILE = (() => {
   const v = (process.env.OWNER_TOOL_PROFILE ?? '').trim();
@@ -846,9 +888,11 @@ function buildOwnerProfileArgs(chatId, extraTools, opts) {
   const strict = OWNER_TOOL_PROFILE === 'strict';
   const confirm = strict && !sched && opts.confirm === true;
   const extra = sched ? [] : extraTools;
+  const biz = bizGranted(chatId, true, opts); // BRIDGE-BMS-1：私聊与定时（含 strict 只读定时）给，群里不给
   const base = buildClaudeArgs(chatId, true, extra, {
     ...(sched ? { model: opts.model, effort: opts.effort } : opts),
     [PROFILE_BASE]: true,
+    [BIZ_GRANT]: biz,
   });
   const mcp = FEISHU_TOOLS ? 'mcp__feishu' : '';
   let allowed;
@@ -856,6 +900,7 @@ function buildOwnerProfileArgs(chatId, extraTools, opts) {
   else if (sched) allowed = [...STRICT_SCHED_BASE, ...larkRules('sched'), ...(FEISHU_TOOLS ? FEISHU_MCP_READ.map((t) => `mcp__feishu__${t}`) : [])];
   else allowed = [...STRICT_CHAT_BASE, ...larkRules('chat', { confirm }), ...extra, mcp];
   allowed = [...new Set(allowed.map((s) => String(s).trim()).filter(Boolean))];
+  if (biz && !allowed.includes(BIZ_TOOL)) allowed.push(BIZ_TOOL); // 显式配了 ALLOWED_TOOLS 也照样有
 
   const args = ['-p', '--output-format', 'stream-json', '--verbose'];
   if (base.args[4] === '--resume') args.push('--resume', base.args[5]);
@@ -865,8 +910,8 @@ function buildOwnerProfileArgs(chatId, extraTools, opts) {
   args.push('--strict-mcp-config');
   if (strict) {
     args.push('--tools', STRICT_TOOLS.join(','));
-    args.push('--disallowedTools', ownerDenyList(sched).join(','));
-  }
+    args.push('--disallowedTools', [...ownerDenyList(sched), ...(biz ? BIZ_ENV_DENY : [])].join(','));
+  } else if (biz) args.push('--disallowedTools', BIZ_ENV_DENY.join(',')); // BRIDGE-BMS-1：audit 本无拒绝表，只加 .env 拒读
   args.push('--settings', ownerHookSettings(strict));
   if (base.model) args.push('--model', base.model);
   if (base.effort) args.push('--effort', base.effort);
@@ -1050,13 +1095,17 @@ function auditStream(rl, chatId, isOwner, opts, phase, d) {
  */
 export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts = {}) {
   // 心跳档只对 owner 生效（心跳本就只以 owner 身份跑）；非 owner 带这个档时当没带
-  if (isOwner && opts.toolProfile === 'heartbeat') return buildHeartbeatArgs(opts);
+  if (isOwner && opts.toolProfile === 'heartbeat') {
+    // BRIDGE-BMS-1：开关开时在心跳档结果上做加法（工具名、.env 拒读、一行提示、只含 biz 的 MCP）；关时原样
+    return BIZ_ON ? withBizHeartbeat(buildHeartbeatArgs(opts), { deny: BIZ_ENV_DENY }) : buildHeartbeatArgs(opts);
+  }
   if (isOwner && opts.toolProfile === 'verifier') return buildVerifierArgs(opts); // BRIDGE-VR-1 验收档：零工具；非 owner 当没带
   // BRIDGE-PERM-2：audit/strict 下 sched-diag 走无工具自诊断档（legacy 仍走下面基线路径，argv 不变）
   if (!opts[PROFILE_BASE] && isOwner && OWNER_TOOL_PROFILE !== 'legacy'
       && typeof chatId === 'string' && chatId.startsWith('sched-diag:')) return buildSchedDiagArgs(opts);
   if (!opts[PROFILE_BASE] && ownerToolKind(chatId, isOwner, opts)) return buildOwnerProfileArgs(chatId, extraTools, opts); // BRIDGE-PERM-1 audit/strict
   const cwd = workspaceFor(isOwner);
+  const biz = bizGranted(chatId, isOwner, opts); // BRIDGE-BMS-1：这一轮挂不挂 biz_get（纯函数；放这里，不贴着会话 / --resume 那几行）
   // 车道：调用方显式给 lane；没给时定时任务默认执行车道（它们是「跑一个任务」，不是聊天），
   // 自诊断（sched-diag）由调用方显式指定 DIAG_MODEL，本就不走车道。
   // 没配执行模型时车道概念不存在——退回单模型，且不在提示词里谎称有分工。
@@ -1080,10 +1129,13 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
     isOwner ? LARK_CLI_TOOLS : '',
     ...extraTools,
     isOwner && FEISHU_TOOLS ? 'mcp__feishu' : '',
+    biz ? BIZ_TOOL : '',
   ]
     .filter(Boolean)
     .join(',');
   if (tools) args.push('--allowedTools', tools);
+  // BRIDGE-BMS-1：legacy 档挂 biz_get 时加 .env 拒读（audit/strict 由 buildOwnerProfileArgs 加）
+  if (biz && !opts[PROFILE_BASE]) args.push('--disallowedTools', BIZ_ENV_DENY.join(','));
   if (!isOwner) {
     // 关键：--allowedTools 不是沙箱，它只是「免询问」白名单，是加法项。
     // 用户级 ~/.claude/settings.json 里的 permissions.allow（本机含 Bash(lark-cli *)）
@@ -1137,6 +1189,7 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
             ...(opts[PROFILE_BASE] ? { FEISHU_MCP_FENCE: '1' } : {}), // BRIDGE-PERM-1：audit/strict 下读工具结果加围栏
           },
         },
+        ...(biz ? { [BIZ_SERVER]: bizMcpServer() } : {}), // BRIDGE-BMS-1：env 为空，Key 由子进程自己从钥匙串读
       },
     });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-mcp-'));
@@ -1146,6 +1199,10 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
     cleanup = () => {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 已删 */ }
     };
+  } else if (biz) { // BRIDGE-BMS-1：FEISHU_TOOLS=false 时也挂（只含 biz 的临时 mcp.json）
+    const m = writeBizOnlyMcpConfig();
+    args.push('--mcp-config', m.file);
+    cleanup = m.cleanup;
   }
   return { args, cwd, model, effort, lane, cleanup };
 }
@@ -1162,7 +1219,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, args, {
+    const child = spawn(spawnBinFor(CLAUDE_BIN, opts), args, { // BRIDGE-ACCT-1：选 bin 只在这一处
       cwd,
       env: process.env,
     });
@@ -1174,6 +1231,8 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
     let finalErr = null;
     let timedOut = null;
     let producedOutput = false; // 是否已产生过输出/副作用——决定断连后能否安全重放
+    // BRIDGE-ACCT-1：比 producedOutput 窄——出错的 result 事件本身不算，只认调过工具或已发出进度消息
+    let acted = false;
     let lastActivity = Date.now();
     const startedAt = Date.now();
     // 深度推理档静默期天然更长，空闲阈值相应放宽，避免把「在想」误判成「卡死」
@@ -1222,8 +1281,10 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
           .map((b) => b.text)
           .join('\n')
           .trim();
+        if ((d.message?.content ?? []).some((b) => b?.type === 'tool_use')) acted = true;
         if (!text) return;
         if (pending && onProgress) {
+          acted = true;
           Promise.resolve(onProgress(pending)).catch((e) =>
             console.error('[progress]', e?.message ?? e)
           );
@@ -1238,7 +1299,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         // （且永远收不到固化提醒）；/new 期间跑完的任务也不该把刚删掉的会话写回来。
         const ephemeral = ephemeralChat;
         const revoked = (resetGeneration.get(chatId) ?? 0) !== startedGeneration;
-        if (d.session_id && !ephemeral && !revoked) {
+        if (d.session_id && !ephemeral && !revoked && !skipErrorSession(d, acted)) {
           sessions[chatId] = d.session_id;
           saveSessions(sessions);
         } else if (revoked) {
@@ -1246,6 +1307,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         }
         if (d.is_error) {
           finalErr = new Error(String(d.result ?? 'unknown error').slice(0, 500));
+          if (Array.isArray(d.errors)) finalErr.cliErrors = d.errors.join('\n'); // BRIDGE-ACCT-1 分类用
         } else {
           finalText = String(d.result ?? pending ?? '');
         }
@@ -1278,6 +1340,8 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       // 标记「本次是否已经动过手」——重试层据此决定能否安全重放
       const mark = (err) => {
         err.producedOutput = producedOutput;
+        err.acted = acted; // BRIDGE-ACCT-1
+        err.cliStderr = stderr;
         return err;
       };
       if (finalErr) return reject(mark(finalErr));
@@ -1345,7 +1409,8 @@ const sleepAbortable = (chatId, ms) =>
 export async function runClaude(chatId, prompt, isOwner = false, extraTools = [], onProgress = null, opts = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
-      return await runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, opts);
+      // BRIDGE-ACCT-1：账号层重试包在网络重试之内（不 sleep、不占名额）；未配置备用时直接调用
+      return await runWithAccount((o) => runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, o), opts);
     } catch (e) {
       const msg = String(e?.message ?? e);
       if (e?.producedOutput && !e?.cancelled && RETRYABLE.test(msg)) {

@@ -55,6 +55,7 @@
 | `owner` / `set_owner` | §5 |
 | `service*` | §7 |
 | `lark_cli` / `ffmpeg` | §8，可选 |
+| `claude_fallback_cli` | §8 备用账号，可选；`warn` 时桥接视为未配置备用 |
 | `env_shadowed` | §10 |
 | `env_*_format` / `env_domain` / `env_tool_profile` / `env_owner_claim` | `.env` 写法提醒 |
 
@@ -362,6 +363,8 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 工具审计每日汇总 | audit / strict 下 `21:30` | `TOOL_AUDIT_SUMMARY_AT=`（留空关闭） | owner 工具档为 audit / strict |
 | 忙时连续发消息（owner 私聊排队、合并、接着办） | 关 | `OWNER_MESSAGE_QUEUE=true` | 无；只影响 owner 私聊，队列在内存里，重启不保留 |
 | lark-cli（日历、审批、任务等） | 关 | `LARK_CLI=true` | 同「外部增量」 |
+| 业务系统只读查询（bms / ias） | 关 | `BMS_TOOL_ENABLED=1` | 仅 macOS。`[需要人]` owner 在本机终端把每个系统的只读 Key 写进钥匙串：命令模板由 `npm run -s biz-check` 在缺条目时打印，你不要经手 Key。写完再跑一次，每个系统一行 `HTTP 200` 即可 |
+| 备用账号（主用额度用完 / 登录失效时自动切换） | 关 | `CLAUDE_FALLBACK_BIN=<备用 claude 路径>`；冷却 `CLAUDE_FALLBACK_COOLDOWN_MIN`（默认 30，1–720） | 备用 claude 能跑 `--version`（doctor 项 `claude_fallback_cli`）；两个 claude 最好共用同一个 CLI 配置目录，否则换账号时两边都会自动开新会话；备用账号的登录是 `[需要人]` |
 | 语音兜底转写 | 自动 | — | `ffmpeg` 在 PATH 里（常驻服务的 PATH 也要有） |
 | 优雅退出等待 | `120` 秒（macOS launchd 下最多 50） | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |
 

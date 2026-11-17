@@ -10,7 +10,9 @@
     "install-service": "node scripts/install-service.js",
     "uninstall-service": "node scripts/uninstall-service.js",
     "doctor": "node scripts/doctor.js",
-    "setup": "node scripts/setup.js"
+    "setup": "node scripts/setup.js",
+    "biz-check": "node scripts/biz-check.js",
+    "bms-check": "node scripts/biz-check.js bms"
   },
   "keywords": [],
   "author": "",
