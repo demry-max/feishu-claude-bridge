@@ -102,7 +102,7 @@ describe('PUB-3 非法称呼退回默认并告警', () => {
     assert.equal(v('李·四'), '李·四');
     assert.equal(v('x'.repeat(OWNER_NAME_MAX)), 'x'.repeat(OWNER_NAME_MAX));
     for (const raw of [undefined, null, '', '   ', '\n\t']) assert.deepEqual(parseOwnerName(raw), { value: null, problem: '' }, JSON.stringify(raw));
-    for (const raw of ['x'.repeat(OWNER_NAME_MAX + 1), '<x>', 'a`b', '（王总）', '「王总」', '『x』', 'a--b', '-a', 'a-', 'a/b', 'a:b', '#1', '王总：']) {
+    for (const raw of ['x'.repeat(OWNER_NAME_MAX + 1), '<x>', 'a<b', 'a>b', 'a`b', 'a"b', 'a“b', '（王总）', '「王总」', '『x』', 'a--b', '-a', 'a-', 'a/b', 'a:b', '#1', '王总：']) {
       const r = parseOwnerName(raw);
       assert.equal(r.value, null, raw);
       assert.ok(r.problem, raw);
@@ -204,6 +204,12 @@ describe('PUB-5 OWNER_EXTRA_WRITE_DIRS', () => {
       assert.equal(warns.length, 1, JSON.stringify(b));
       assert.match(warns[0], /^\[config\] ⚠️ OWNER_EXTRA_WRITE_DIRS 忽略 "/);
       assert.ok(!/[\u0007\u202e]/.test(warns[0]), '控制 / 格式字符不原样进日志');
+    }
+    // 根目录不靠家目录检查兜底也要拒（没给 home / bridgeRoot 时）
+    for (const root of ['/', '//', '/./', '/..']) {
+      const warns = [];
+      assert.deepEqual(parseExtraWriteDirs(root, { warn: (m) => warns.push(m) }), [], root);
+      assert.match(warns[0], /不能是根目录/, root);
     }
     // 桥接目录里其它与工作区不重叠的路径不一概拒
     assert.deepEqual(parseExtraWriteDirs('/Users/me/code/bridge/data', { ...ctx, warn: () => {} }), ['/Users/me/code/bridge/data']);
