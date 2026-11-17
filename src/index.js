@@ -15,6 +15,7 @@ import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderN
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
 import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
+import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -157,16 +158,33 @@ const chatQueues = new Map();
 let turnsInFlight = 0; // 刚收到还没排队 + 排队中 + 进行中的对话轮（BRIDGE-VR-1：优雅退出等它们做完）
 function enqueue(chatId, task) {
   turnsInFlight += 1;
+  ownerQueue.turnStarted(chatId); // BRIDGE-MQ-1：本会话有一轮在途（含起子进程前、回复收尾时 isRunning 为 false 的窗口）；开关关时空操作
   const prev = chatQueues.get(chatId) ?? Promise.resolve();
-  const next = prev.then(task).catch((e) => console.error('[queue]', e)).finally(() => { turnsInFlight -= 1; });
+  const next = prev.then(task).catch((e) => console.error('[queue]', e)).finally(() => { turnsInFlight -= 1; ownerQueue.turnEnded(chatId); });
   chatQueues.set(chatId, next);
   return next;
 }
 // 收到的消息从进 handleMessage 起就算进行中（下载附件、拼提示词时还没进队列），优雅退出也等它（BRIDGE-VR-1）
 function trackedHandleMessage(data) {
+  const seq = ++arrivalSeq; // BRIDGE-MQ-1：先取号＝到达顺序（早于任何 await）；收消息流程走完在 finally 里销号（等更早到的那条，R1）
   turnsInFlight += 1;
-  return handleMessage(data).finally(() => { turnsInFlight -= 1; });
+  return handleMessage(data, seq).finally(() => { turnsInFlight -= 1; ownerQueue.arrivalSettled(seq); });
 }
+// ---- owner 私聊忙时排队（BRIDGE-MQ-1，OWNER_MESSAGE_QUEUE=true 才启用；关时 shouldQueue 恒 false、钩子全空操作，逐项同基线）----
+// 忙时 owner 私聊的普通消息进内存队列（上限 10），当前轮结束（成功 / 报错 / 取消）后按到达顺序取出：
+// 1 条原样走平时路径，多条合并成一轮；出队的那轮照样经 runTurn 接进上面的串行链。群聊、访客、定时任务、心跳不进队列。
+let arrivalSeq = 0; // 到达序号：附件下载有快有慢，合并按到达先后而不是处理完的先后
+const ownerQueue = createOwnerMessageQueue({
+  enabled: messageQueueEnabled(process.env),
+  startTurn: (spec) => runTurn(spec),
+  reply,
+  react,
+  isDraining: () => shutdown.isDraining(),
+  merge: (entries) => mergeQueuedTurns(entries, { routeTurn, detectConfirm, confirmChannel: OWNER_TOOL_PROFILE === 'strict' }),
+  confirmProbe: (s) => OWNER_TOOL_PROFILE === 'strict' && detectConfirm(routeTurn(s.text).prompt, s.message?.chat_type, s.isOwner)?.confirmed === true,
+  log: console.log,
+  warn: console.error,
+});
 
 async function reply(messageId, text) {
   const safe = redact(text);
@@ -197,12 +215,14 @@ async function reply(messageId, text) {
 
 async function react(messageId, emoji) {
   try {
-    await client.im.v1.messageReaction.create({
+    const res = await client.im.v1.messageReaction.create({
       path: { message_id: messageId },
       data: { reaction_type: { emoji_type: emoji } },
     });
+    return !(res && typeof res.code === 'number' && res.code !== 0); // BRIDGE-MQ-1：排队表情加没加上（飞书回非 0 code 也算没加上）；其余调用方不看返回值
   } catch {
     // 无 reaction 权限时静默跳过
+    return false;
   }
 }
 
@@ -220,7 +240,7 @@ async function getBotOpenId() {
   return botOpenId;
 }
 
-async function handleMessage(data) {
+async function handleMessage(data, seq = ++arrivalSeq) {
   const message = data.message;
   const senderOpenId = data.sender?.sender_id?.open_id;
   if (!message || !senderOpenId) return;
@@ -287,6 +307,7 @@ async function handleMessage(data) {
     // 再按发言人细分：同一个群里访客 A 的历史不该出现在访客 B 的上下文里，
     // 也避免任一访客往共用会话里植入长效指令
     : `guest:${message.chat_id}:${senderOpenId}`;
+  if (ownerQueue.applies(isOwner, message.chat_type)) ownerQueue.arrivalStarted(sessionKey, seq); // BRIDGE-MQ-1：登记「已到达、还没交给队列」，出队等它（R1）
 
   // ---- 消息 → 提示词（文本/图片/文件/富文本/合并转发/卡片） ----
   // 附件落在各自工作区：非 owner 的文件不该出现在 owner 的工作区里，反之亦然
@@ -321,6 +342,8 @@ async function handleMessage(data) {
     await reply(message.message_id, '群会话里只有 owner 能使用会话控制指令（可以私聊我使用）。');
     return;
   }
+  // BRIDGE-MQ-1：/new 照旧处理；owner 私聊队列非空时先清空并单独回一句清掉几条（/cancel、/redirect 在各自分支里清；/voice、/tasks 等不清）
+  if (text === '/new' && ownerQueue.applies(isOwner, message.chat_type)) await ownerQueue.clearAndTell(sessionKey, message.message_id);
 
   if (text === '/new') {
     resetSession(sessionKey);
@@ -367,7 +390,7 @@ async function handleMessage(data) {
     ledgerHint = shortcut?.hint ?? '';
   }
   if (text === '/status') {
-    await reply(message.message_id, sessionInfo(sessionKey, isOwner));
+    await reply(message.message_id, sessionInfo(sessionKey, isOwner) + ownerQueue.statusLine(sessionKey, isOwner, message.chat_type)); // BRIDGE-MQ-1：owner 私聊且开关开时多一行排队条数，其余为空串
     return;
   }
   if (text === '/help' || text === '帮助') {
@@ -449,6 +472,7 @@ async function handleMessage(data) {
     return;
   }
   if (text === '/cancel' || text === '取消') {
+    const cleared = ownerQueue.applies(isOwner, message.chat_type) ? ownerQueue.clear(sessionKey) : 0; // BRIDGE-MQ-1：先清队列，免得取消后排队的接着跑
     // 群里 owner 还要能停掉访客跑飞的任务（它们注册在 guest: 键下）
     let killed = cancelRun(sessionKey);
     // 退避等待中没有活着的子进程，但重试仍会发生——必须一并叫停
@@ -458,7 +482,7 @@ async function handleMessage(data) {
         killed = cancelRun(k) || killed;
       }
     }
-    await reply(message.message_id, killed ? '🛑 已取消当前任务。' : '当前没有正在运行的任务。');
+    await reply(message.message_id, withClearedNote(killed ? '🛑 已取消当前任务。' : '当前没有正在运行的任务。', cleared)); // 清掉 0 条时逐字同基线
     return;
   }
   if (text === '/voice' || text === '/voice on' || text === '/voice off') {
@@ -471,11 +495,24 @@ async function handleMessage(data) {
     await reply(message.message_id, on ? '🔊 已开启语音回复（回答会附一条语音）。发 /voice off 关闭。' : '🔇 已关闭语音回复。');
     return;
   }
+  // BRIDGE-MQ-1：owner 私聊 + 开关开 + 本会话正忙（含 isRunning 为 false 的起步 / 收尾窗口）→ 入队，当前轮结束后接着办
+  const spec = { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, seq, at: Number(message.create_time) || Date.now() };
+  if (ownerQueue.shouldQueue({ key: sessionKey, isOwner, chatType: message.chat_type, text })) {
+    await ownerQueue.offer(sessionKey, spec);
+    return;
+  }
   // 任务进行中收到新指令：提示可取消/重定向
   if (isRunning(sessionKey) && !text.startsWith('/redirect')) {
     await reply(message.message_id, '⏳ 上一个任务还在跑。发 **/cancel** 取消，或 **/redirect 你的新要求** 取消并按新要求重来（会话上下文保留）。');
     return;
   }
+  return runTurn(spec);
+}
+
+// ---- 起一轮对话（BRIDGE-MQ-1：从 handleMessage 原样拆出。空闲时由 handleMessage 直接调；
+// 排队出队时由 ownerQueue 调——1 条就是那条消息自己的 spec，多条是 mergeQueuedTurns 合并后的 spec，带 merged）----
+async function runTurn(spec) {
+  const { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, merged, queued } = spec;
   // 附件存放于 workspace/incoming/，即使非 owner 也放行该目录的只读访问
   const extraTools = built.attachments.length ? ['Read(./incoming/**)'] : [];
   // 注意：prompt 必须在 /redirect 分支之前声明。此前它声明在分支之后，
@@ -491,6 +528,7 @@ async function handleMessage(data) {
     }
     cancelRun(sessionKey);
     abortRetries(sessionKey); // 退避等待中没有子进程，但重试仍会发生
+    if (ownerQueue.applies(isOwner, message.chat_type)) ownerQueue.clearAndTell(sessionKey, message.message_id); // BRIDGE-MQ-1：排队的不再处理，单独回一句清掉几条（不等它发完，新要求照旧立即接上）
     prompt = extra; // 会话通过 --resume 保留，直接以新要求继续
   }
 
@@ -499,9 +537,12 @@ async function handleMessage(data) {
   // 这样 `/redirect 执行` 也能走执行车道。
   const route = routeTurn(prompt);
   prompt = route.prompt;
+  if (merged) { route.lane = merged.lane; prompt = merged.prompt; } // BRIDGE-MQ-1：多条合并的一轮——车道按各条分别判定（任一条要执行就执行），提示词换成逐条标号的合并稿
   // BRIDGE-PERM-1：strict 档 owner 私聊句首「确认」放行上一轮草稿里的确认级操作（只管这一轮）；
   // audit/strict 收集本轮工具事件给回复附回执。legacy 与访客原样透传。
-  const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm: detectConfirm(prompt, message.chat_type, isOwner), runClaude, redact });
+  // BRIDGE-MQ-1：合并的一轮、排队后单条出队的一轮恒不放行（夹在里面 / 排队等着的「确认」不算确认，提示光总看完再单独回）
+  const confirm = (merged || queued) ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner);
+  const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm, runClaude, redact });
   prompt = toolTurn.prompt;
 
   // 群聊带上发言人姓名，机器人才知道是谁在说话。
@@ -834,8 +875,10 @@ const shutdown = createShutdown({
   graceSec: shutdownGraceSec(process.env, console.error),
   inflight: () => turnsInFlight
     + runningKeysWithPrefix('sched:').filter((k) => k !== HEARTBEAT_KEY && k !== VERIFY_KEY).length
-    + (heartbeat.isInflight() ? 1 : 0),
-  onDrain: () => heartbeat.stop(),
+    + (heartbeat.isInflight() ? 1 : 0)
+    + ownerQueue.inflight(), // BRIDGE-MQ-1：「请稍后重发」等通知还没发完的、刚出队还没接上的（开关关时恒 0）
+  // BRIDGE-MQ-1：停心跳后，owner 私聊队列里没处理的逐条回「助理正在重启，这条没处理，请稍后重发」（停心跳抛错也照发）
+  onDrain: () => { try { heartbeat.stop(); } finally { ownerQueue.flushForShutdown(); } },
   log: console.log,
 });
 shutdown.install(process);
