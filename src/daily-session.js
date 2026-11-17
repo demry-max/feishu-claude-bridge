@@ -870,8 +870,15 @@ export function createDailySession({
       at: cfg.at,
     });
     if (!d.rotate && !shadow && st.carry && !getSessionId(key)) {
-      // 上次换新没落下新会话 id：没有会话可续，推迟原因（确认 / 排队等）不适用；不改 born / prev，重带接续材料
+      // 上次换新没落下新会话 id：没有会话可续，排队等推迟原因不适用；不改 born / prev，重带接续材料
       const cr = st.carry;
+      if (confirmed === true) {
+        // 「确认」只对同一会话里的草稿有效：这一轮已放行确认级规则，绝不能再带旧会话的原话 / 草稿。
+        // carry 先留着、照常记原话；本轮成功且已有会话 id 时由 wrapCarry 清掉
+        wrapCarry(key, toolTurn, text, cr.at);
+        log(`[daily-session] ${tag(key)} 上次换新后还没有会话 id，但本轮是「确认」，不带接续材料（确认只对同一会话的草稿有效）`);
+        return prompt;
+      }
       const g = gather(key, st, cr.prev_sid, t);
       wrapCarry(key, toolTurn, text, cr.at);
       log(`[daily-session] ${tag(key)} 上次换新后还没有会话 id，本轮重带接续材料 ${clen(g.text)} 字（摘要${g.summary ? '有' : '无'}；原话 ${g.rounds} 轮）`);

@@ -952,8 +952,8 @@ describe('R1 返工', () => {
   }
 
   /** 真实 claude.js + 假 CLI：昨天 adopt 一轮，时钟拨到今天 09:00。run 可在开跑后插一个动作（超时 / 取消）。 */
-  async function realSetup(env = {}) {
-    const m = await loadClaude(env);
+  async function realSetup(env = {}, { strict = false, oldAnswer = '昨天的回答' } = {}) {
+    const m = await loadClaude(strict ? { OWNER_TOOL_PROFILE: 'strict', ...env } : env);
     const ws = freshDir('ws');
     fs.mkdirSync(path.join(ws, 'memory', 'journal'), { recursive: true });
     fs.writeFileSync(path.join(ws, 'memory', 'journal', '2026-11-16.md'), '昨天的日记');
@@ -962,8 +962,9 @@ describe('R1 返工', () => {
     const run = async (text, planned, during = null) => {
       plan(planned);
       const route = routeTurn(text);
-      const toolTurn = createToolTurn({ profile: 'legacy', isOwner: true, chatType: 'p2p', prompt: route.prompt, confirm: { confirmed: false }, runClaude: m.runClaude, redact: String });
-      const prompt = r.ds.beforeTurn({ sessionKey: KEY, prompt: toolTurn.prompt, text, isOwner: true, chatType: 'p2p', confirmed: false, route, toolTurn });
+      const confirm = strict ? detectConfirm(route.prompt, 'p2p', true) : { confirmed: false };
+      const toolTurn = createToolTurn({ profile: strict ? 'strict' : 'legacy', isOwner: true, chatType: 'p2p', prompt: route.prompt, confirm, runClaude: m.runClaude, redact: String });
+      const prompt = r.ds.beforeTurn({ sessionKey: KEY, prompt: toolTurn.prompt, text, isOwner: true, chatType: 'p2p', confirmed: confirm.confirmed === true, route, toolTurn });
       const runClaude = toolTurn.runClaude;
       const p = quiet(() => runClaude(KEY, prompt, true, [], null, { lane: route.lane }));
       if (during) await during(p);
@@ -974,9 +975,16 @@ describe('R1 返工', () => {
         return { call: fakeCalls()[0], error: e, note: r.ds.failureNote(e) };
       }
     };
-    await run('昨天聊的', OK('sess-old', '昨天的回答'));
+    await run('昨天聊的', OK('sess-old', oldAnswer));
     r.now = T(17, 9);
     return { m, r, run };
+  }
+
+  /** 直接改状态文件里本会话那一项（预置 carry / born 等）。 */
+  function seedState(r, patch) {
+    const st = r.state();
+    Object.assign(st[KEY], patch);
+    fs.writeFileSync(path.join(r.dsDir, 'state.json'), JSON.stringify(st));
   }
 
   /** 让假 CLI 先把事件吐完、被 claude.js 读到，再用模拟时钟把空闲超时拨过去（检查间隔是 15 秒）。 */
@@ -1074,19 +1082,83 @@ describe('R1 返工', () => {
     assert.ok(!third.call.stdin.includes('接续材料'));
   });
 
-  test('R2 carry：「确认」也照带；/new、/session back 清掉；非法值丢弃', async () => {
-    const seed = (r, extra = {}) => {
-      const st = r.state();
-      Object.assign(st[KEY], { born: T(17, 9), carry: { at: T(17, 9), prev_sid: 'sess-old' }, ...extra });
-      fs.writeFileSync(path.join(r.dsDir, 'state.json'), JSON.stringify(st));
-    };
+  test('R2 N1（真实 strict 档）：carry 生效后发「确认」→ 不带接续材料与旧草稿、成功后清 carry；第三条续新会话不带材料', async () => {
+    const DRAFT = '草稿甲：给客户的回复邮件，回「确认」就发';
+    const { r, run } = await realSetup({}, { strict: true, oldAnswer: DRAFT });
+    const first = await run('今天的问题', { events: [INIT, ASSIST_TEXT('首轮半截回答')], exit: 1 });
+    assert.ok(!first.error, '兜底当成功');
+    assert.equal(sessionsFile()[KEY], undefined);
+    assert.deepEqual(r.st().carry, { at: T(17, 9), prev_sid: 'sess-old' }, 'carry 生效');
+    r.now = T(17, 9, 5);
+    const second = await run('确认', OK('sess-new'));
+    assert.ok(!second.call.argv.includes('--resume'));
+    assert.ok(!second.call.stdin.includes('接续材料'), '「确认」不带接续材料');
+    assert.ok(!second.call.stdin.includes(DRAFT) && !second.call.stdin.includes('首轮半截回答'), '没有旧草稿与首轮原文');
+    assert.equal(sessionsFile()[KEY], 'sess-new');
+    assert.equal(r.st().carry, null, '成功拿到会话 id 后清掉');
+    assert.equal(r.st().born, T(17, 9), '不改 born');
+    assert.deepEqual(r.st().prev.map((p) => p.sid), ['sess-old'], '不改 prev');
+    r.now = T(17, 9, 10);
+    const third = await run('第三条', OK('sess-new'));
+    assert.equal(third.call.argv[third.call.argv.indexOf('--resume') + 1], 'sess-new');
+    assert.ok(!third.call.stdin.includes('接续材料'));
+  });
+
+  test('R2 N1 对照（真实 strict 档）：carry 生效后发普通消息 → 照带接续材料、没有确认级规则', async () => {
+    const DRAFT = '草稿甲：给客户的回复邮件，回「确认」就发';
+    const { r, run } = await realSetup({}, { strict: true, oldAnswer: DRAFT });
+    await run('今天的问题', { events: [INIT, ASSIST_TEXT('首轮半截回答')], exit: 1 });
+    assert.deepEqual(r.st().carry, { at: T(17, 9), prev_sid: 'sess-old' });
+    r.now = T(17, 9, 5);
+    const second = await run('第二条', OK('sess-new'));
+    assert.ok(!second.call.argv.includes('--resume'));
+    assert.ok(second.call.stdin.startsWith('【接续材料'));
+    assert.ok(second.call.stdin.includes(DRAFT) && second.call.stdin.includes(ds.CARRY_DRAFTS_VOID));
+    assert.ok(!second.call.argv.join('\n').includes('本轮已回复「确认」'), '普通消息没有确认级规则');
+    assert.equal(r.st().carry, null);
+  });
+
+  test('R2 X4：预置 carry 但会话表里已有 id → 续 sess-live、不带材料', async () => {
+    const { m, r, run } = await realSetup();
+    seedState(r, { born: T(17, 9), carry: { at: T(17, 9), prev_sid: 'sess-old' } });
+    m.restoreSession(KEY, 'sess-live');
+    r.now = T(17, 9, 5);
+    const x = await run('下一条', OK('sess-live'));
+    assert.ok(!x.error);
+    assert.equal(x.call.argv[x.call.argv.indexOf('--resume') + 1], 'sess-live');
+    assert.ok(!x.call.stdin.includes('接续材料'));
+  });
+
+  test('R2 X11：预置昨天的 carry，过边界正常换新 → 拿到新 id 后 carry 为 null', async () => {
+    const { r, run } = await realSetup();
+    seedState(r, { carry: { at: T(16, 10), prev_sid: 'sess-older' } });
+    const x = await run('今天的问题', OK('sess-new'));
+    assert.ok(!x.error);
+    assert.ok(!x.call.argv.includes('--resume'), '正常换新');
+    assert.ok(x.call.stdin.startsWith('【接续材料'));
+    assert.equal(sessionsFile()[KEY], 'sess-new');
+    assert.equal(r.st().born, T(17, 9));
+    assert.equal(r.st().carry, null, '换新清掉昨天的 carry');
+  });
+
+  test('R2 carry：「确认」不带材料、失败留着 carry、成功有了会话 id 才清；/new、/session back 清掉；非法值丢弃', async () => {
+    const seed = (r, extra = {}) => seedState(r, { born: T(17, 9), carry: { at: T(17, 9), prev_sid: 'sess-old' }, ...extra });
     const r = await adopted();
     delete r.sessions[KEY];
     seed(r);
     r.n = 100;
+    const failed = await r.turn('确认', { fail: new Error('boom') });
+    assert.ok(failed.error);
+    assert.ok(!failed.sent.includes('接续材料'), '「确认」不带接续材料');
+    assert.deepEqual(r.st().carry, { at: T(17, 9), prev_sid: 'sess-old' }, '失败不动 carry');
     const x = await r.turn('确认');
-    assert.ok(x.sent.startsWith('【接续材料'), '没有会话可续，确认也带');
-    assert.equal(r.st().carry, null, '有了会话 id 就清');
+    assert.ok(!x.sent.includes('接续材料'), '「确认」不带接续材料');
+    assert.equal(x.sent, x.prompt);
+    assert.ok(r.logs.some((l) => l.includes('但本轮是「确认」，不带接续材料')));
+    assert.equal(r.rounds().at(-1).user, '确认', '照常记原话');
+    assert.equal(r.st().carry, null, '成功且有了会话 id 就清');
+    const y = await r.turn('下一条');
+    assert.ok(!y.sent.includes('接续材料'), '清掉后不再带');
     const a = await adopted();
     delete a.sessions[KEY];
     seed(a);
