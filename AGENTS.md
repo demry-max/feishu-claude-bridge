@@ -192,10 +192,10 @@ npm ci
    - 人坚持把值发给你时，用不回显的方式写入，例如：
 
      ```bash
-     node -e "import('./src/env-file.js').then(m=>m.patchEnvFile('.env',{FEISHU_APP_ID:process.argv[1],FEISHU_APP_SECRET:process.argv[2]}))" 'cli_xxx' '<secret>'
+     node -e "import('./src/env-file.js').then(m=>m.patchEnvFile('.env',{FEISHU_APP_ID:process.argv[1],FEISHU_APP_SECRET:process.argv[2]}))" 'cli_xxx' '<secret>' && chmod 600 .env
      ```
 
-     命令行参数会进 shell 历史，所以能让人自己填就让人自己填。之后不在对话里重复这个值。
+     写完再跑 `npm run setup`，它也会把权限收紧为 600。命令行参数会进 shell 历史，所以能让人自己填就让人自己填。之后不在对话里重复这个值。
    - 国际版 Lark 另加一行 `FEISHU_DOMAIN=lark`。
    - **验证**：`npm run setup`，`feishu_credentials` ✅。
 2. **`[需要人]` 开发者后台确认**（不是新建应用，是检查这个已有应用的配置）

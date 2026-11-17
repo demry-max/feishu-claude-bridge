@@ -125,10 +125,13 @@ export function checkClaudeAuth({ bin = 'claude', run = defaultRun, env = proces
     '请人确认：在终端运行 claude 能正常对话即已登录；或升级 CLI 后重跑 npm run setup');
 }
 
-/** .env 不存在时从 .env.example 生成（权限 600）。幂等：已存在一个字节都不动。 */
-export function ensureEnvFile(root) {
+/**
+ * .env 不存在时从 .env.example 生成（权限 600）。幂等：已存在时内容一个字节都不动；
+ * 但权限对组 / 其他用户开放（别的写入路径留下的 644）时收紧为 600（Windows 不动）。
+ */
+export function ensureEnvFile(root, { platform = process.platform } = {}) {
   const envPath = path.join(root, '.env');
-  if (fs.existsSync(envPath)) return item('env_file', 'ok', '.env', '已存在（未改动）');
+  if (fs.existsSync(envPath)) return tightenEnvMode(envPath, platform);
   const example = path.join(root, '.env.example');
   if (!fs.existsSync(example)) {
     return item('env_file', 'fail', '.env', '.env 与 .env.example 都不存在', '确认在仓库根目录；git checkout -- .env.example 恢复模板后重跑');
@@ -140,6 +143,18 @@ export function ensureEnvFile(root) {
   } catch (e) {
     if (e?.code === 'EEXIST') return item('env_file', 'ok', '.env', '已存在（未改动）');
     return item('env_file', 'fail', '.env', `生成失败：${e?.code || e?.message}`, '检查仓库目录是否可写');
+  }
+}
+
+function tightenEnvMode(envPath, platform) {
+  const unchanged = item('env_file', 'ok', '.env', '已存在（未改动）');
+  if (platform === 'win32') return unchanged;
+  try {
+    if ((fs.statSync(envPath).mode & 0o077) === 0) return unchanged;
+    fs.chmodSync(envPath, 0o600);
+    return item('env_file', 'ok', '.env', '已存在（权限已收紧为 600）');
+  } catch (e) {
+    return item('env_file', 'warn', '.env', `已存在，但权限没能收紧为 600：${e?.code || e?.message}`, 'chmod 600 .env');
   }
 }
 

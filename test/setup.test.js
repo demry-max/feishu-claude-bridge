@@ -534,11 +534,57 @@ test('setup e2e: --set-owner 写入后 .env 是 600；已有不同 owner 要 --f
   assert.match(fs.readFileSync(envPath, 'utf8'), /^OWNER_OPEN_ID=ou_intruder2$/m);
 });
 
-test('checkClaudeAuth: 子进程只多拿到 CLAUDE_CODE_OAUTH_TOKEN，.env 其它值（App Secret）不进环境（R2 L5）', () => {
+test('checkClaudeAuth: 子进程只多拿到 CLAUDE_CODE_OAUTH_TOKEN，.env 其它值（App Secret）不进环境', () => {
   let seen = null;
   const spy = (cmd, args, opts) => { seen = opts.env; return { ok: true, stdout: '{"loggedIn":true}' }; };
   checkClaudeAuth({ run: spy, env: { PATH: '/bin' }, envFile: { FEISHU_APP_SECRET: SECRET, CLAUDE_CODE_OAUTH_TOKEN: 'tok_123456' } });
   assert.deepEqual(seen, { CLAUDE_CODE_OAUTH_TOKEN: 'tok_123456', PATH: '/bin' });
   checkClaudeAuth({ run: spy, env: { PATH: '/bin' }, envFile: { FEISHU_APP_SECRET: SECRET } });
   assert.deepEqual(seen, { PATH: '/bin' });
+});
+
+test('ensureEnvFile: 已有 .env 是 644 → 收紧为 600；已是 600 → 未改动；win32 不动权限', { skip: process.platform === 'win32' && '没有 POSIX 权限位' }, () => {
+  const root = tmp();
+  const envPath = path.join(root, '.env');
+  fs.writeFileSync(envPath, 'FEISHU_APP_ID=cli_x\n');
+  fs.chmodSync(envPath, 0o644);
+  const loose = ensureEnvFile(root);
+  assert.equal(loose.status, 'ok');
+  assert.match(loose.message, /收紧/);
+  assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(envPath, 'utf8'), 'FEISHU_APP_ID=cli_x\n');
+  const tight = ensureEnvFile(root);
+  assert.equal(tight.status, 'ok');
+  assert.match(tight.message, /未改动/);
+  fs.chmodSync(envPath, 0o644);
+  const win = ensureEnvFile(root, { platform: 'win32' });
+  assert.match(win.message, /未改动/);
+  assert.equal(fs.statSync(envPath).mode & 0o777, 0o644);
+});
+
+test('setup e2e: 已有 .env 是 644 → 跑一次 setup 后是 600', { skip: skipNoSh }, () => {
+  const root = makeRoot();
+  const home = tmp('gh1-home-');
+  const envPath = path.join(root, '.env');
+  fs.writeFileSync(envPath, `FEISHU_APP_ID=cli_testapp\nFEISHU_APP_SECRET=${SECRET}\nOWNER_OPEN_ID=ou_testowner\n`);
+  fs.chmodSync(envPath, 0o644);
+  const r = runScript('setup.js', ['--json', '--no-network', '--root', root], { claudeBin: makeStub(home), home });
+  assert.equal(r.status, 0, r.stdout);
+  assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
+  assert.match(JSON.parse(r.stdout).items.find((i) => i.id === 'env_file').message, /收紧/);
+  assert.doesNotMatch(r.stdout + r.stderr, /S3cr3t/);
+});
+
+test('doctor e2e: 从 data/owner.json 补 OWNER_OPEN_ID 之后 .env 仍是 600', { skip: skipNoSh }, () => {
+  const root = makeRoot();
+  const home = tmp('gh1-home-');
+  const envPath = path.join(root, '.env');
+  fs.writeFileSync(envPath, `FEISHU_APP_ID=cli_testapp\nFEISHU_APP_SECRET=${SECRET}\nOWNER_OPEN_ID=\n`, { mode: 0o600 });
+  fs.chmodSync(envPath, 0o600);
+  fs.mkdirSync(path.join(root, 'data'));
+  fs.writeFileSync(path.join(root, 'data', 'owner.json'), JSON.stringify({ open_id: 'ou_fromownerjson' }));
+  const d = runScript('doctor.js', ['--json', '--no-network', '--root', root], { claudeBin: makeStub(home), home });
+  assert.match(JSON.parse(d.stdout).items.find((i) => i.id === 'env_file').message, /补写 OWNER_OPEN_ID/);
+  assert.match(fs.readFileSync(envPath, 'utf8'), /^OWNER_OPEN_ID=ou_fromownerjson$/m);
+  assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
 });

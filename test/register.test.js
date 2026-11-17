@@ -1,6 +1,6 @@
-// npm run register 端到端（BRIDGE-GH-1 R2）：用 --import 注入假 fetch，不联网。
-// 覆盖：有效 pending 时不重新 begin（M2）、--restart 重来、--resume 用 pending 里的 domain（L3）、
-// 成功后 .env 仍是 600 且输出里没有 Secret（M1）。
+// npm run register 端到端：用 --import 注入假 fetch，不联网。
+// 覆盖：有效 pending 时不重新 begin、--restart 重来、--resume 用 pending 里的 domain、
+// 成功后 .env 仍是 600 且输出里没有 Secret。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

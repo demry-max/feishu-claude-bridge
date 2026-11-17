@@ -6,6 +6,7 @@
 // 退出码（文本模式，与旧版兼容）：0 = 全部通过（⚠️ 提醒不算失败）；1 = 有 ❌ 或 🙋（需要人）项。
 // --json 模式与 npm run setup 一致用三态：0 全绿 / 2 只差需要人的步骤 / 1 有失败项（JSON 里的 exit 字段同值）。
 // 依赖（npm ci）没装时也能跑：先报「依赖未安装」，不抛 ERR_MODULE_NOT_FOUND。
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,6 +83,8 @@ if (cliItem.status !== 'fail') {
 
 // 5) .env
 const env = checkEnvFile(ROOT);
+// 补写 OWNER_OPEN_ID 走 patchEnvFile（会按 umask 落成 644）：写完收紧回 600
+if (env.autofilled) { try { fs.chmodSync(path.join(ROOT, '.env'), 0o600); } catch { /* Windows 无 chmod 语义 */ } }
 if (!envFile.exists) {
   add(item('env_file', 'fail', '.env', '不存在', 'npm run setup（从 .env.example 生成），或 npm run register 扫码新建应用'));
 } else {
