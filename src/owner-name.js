@@ -56,7 +56,7 @@ const needsGap = (a, b) => (isAsciiAlnum(a) && isHan(b)) || (isHan(a) && isAscii
 
 /**
  * 带称呼的模板（标签函数）：`ownerText\`等${OWNER}回「确认」\``。
- * 只在称呼与相邻文字一边是 ASCII 字母数字、一边是汉字时补一个空格（「等 owner 回」「Demry 点了」）；
+ * 只在称呼与相邻文字一边是 ASCII 字母数字、一边是汉字时补一个空格（「等 owner 回」「Alex 点了」）；
  * 称呼本身是汉字（如「王总」「你」）时不补，输出与写死时逐字相同。其它插值原样拼接、不补空格。
  */
 export function ownerText(strings, ...vals) {
