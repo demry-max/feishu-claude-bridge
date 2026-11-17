@@ -163,7 +163,7 @@ legacy 的排查诊断逐字不变。
 与代码的对应关系：
 
 - 工具与目标表：`src/mcp-biz.js`（MCP 服务）、`src/biz-targets.js`（主机、前缀、钥匙串条目名、限额、路径拒绝规则，都是常量）。
-- 哪些轮次有这个工具：`src/claude.js` 的 `bizGranted`（owner 私聊、定时任务、心跳有；群聊、访客、sched-diag、验收、交接没有）。
+- 哪些轮次有这个工具：`src/claude.js` 的 `bizGranted`（owner 私聊、心跳有；结果发往 owner 私聊的定时任务有；发往群的没有；群聊、访客、sched-diag、验收、交接没有）。
 - 端点速查：技能 `biz-readonly`（`docs/skills/biz-readonly/SKILL.md`，开关开时由桥接同步进工作区的 `.claude/skills/`）。
 - 心跳轮次：桥接在心跳系统提示末尾另加一行例外说明（`src/biz-wiring.js` 的 `BIZ_HEARTBEAT_LINE`），不依赖这里的原文。
 
