@@ -11,6 +11,7 @@ import { VERIFY_KEY } from './verifier.js';
 import { createShutdown, shutdownGraceSec, replyIfDraining } from './shutdown.js';
 import { createEventHandlers, heartbeatReplyShortcut, sendCardWithFallback } from './events.js'; import { createWatchSources, createLarkRunner } from './watch-sources.js';
 import { CronExpressionParser } from 'cron-parser';
+import { setAccountNotifier, verifyFallbackAtStartup } from './account-fallback.js'; // BRIDGE-ACCT-1
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
@@ -937,6 +938,9 @@ async function scopeSelfCheck() {
       cliProblem = [cliProblem, `执行模型：${cliExec.problem}`].filter(Boolean).join('\n');
     }
   }
+  // BRIDGE-ACCT-1：配置了备用账号时自检备用 bin；失败只告警、本次视为未配置。未配置时什么也不打
+  verifyFallbackAtStartup({ log: console.log, warn: console.error });
+  setAccountNotifier((text) => sendToOwner(text)); // 切到备用时私信 owner（一次备用期一条；失败不影响对话）
   if (shadowed.length) {
     console.error(`[config] ⚠️ 以下变量被 shell 环境覆盖，.env 里的值未生效：${shadowed.join(', ')}`);
   }
