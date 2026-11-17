@@ -3,6 +3,7 @@
 // 全部用注入的桩：不连飞书、不起 lark-cli、不调真实 claude。index.js 一 import 就连飞书，接线只做源码文本断言。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { ownerText, OWNER as O_NAME, YOU as O_YOU } from '../src/owner-name.js'; // BRIDGE-PUB-1：称呼按配置（测试里未设：owner / 你）
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -195,9 +196,9 @@ describe('测试 7：卡片回调', () => {
     assert.deepEqual(leftovers(), []);
 
     assert.equal(journalOf(env), [
-      '（桥接）光总点了『知道了』：tasks/quote.json',
-      '（桥接）光总点了『推迟一天』：tasks/quote.json',
-      '（桥接）光总点了『不做了』：tasks/quote.json',
+      ownerText`（桥接）${O_NAME}点了『知道了』：tasks/quote.json`,
+      ownerText`（桥接）${O_NAME}点了『推迟一天』：tasks/quote.json`,
+      ownerText`（桥接）${O_NAME}点了『不做了』：tasks/quote.json`,
       '',
     ].join('\n'));
     st = h.readState();
@@ -370,7 +371,7 @@ describe('测试 9：引用回复', () => {
     h.setNow(plus(T0, 5));
     assert.deepEqual(await ask(quoted('om_1', ' 推迟一天。')), { reply: '已记下：『推迟一天』 tasks/quote.json' });
     assert.equal(readTask(env, 'quote').next_check_at, '2026-11-17T09:00');
-    assert.equal(journalOf(env), '（桥接）光总回复『推迟一天』：tasks/quote.json\n');
+    assert.equal(journalOf(env), ownerText`（桥接）${O_NAME}回复『推迟一天』：tasks/quote.json\n`);
     assert.equal(h.calls.length, 1, 'runClaude 调用 0 次');
     assert.deepEqual(await ask(quoted('om_1', '推迟一天')), { reply: '这条心跳消息已经按『推迟一天』处理过了，不重复执行。' });
     assert.equal(readTask(env, 'quote').next_check_at, '2026-11-17T09:00', '不重复推迟');
@@ -489,7 +490,7 @@ describe('测试 10：未读暂停', () => {
     assert.ok(pack.startsWith('💓 **心跳 · 待发汇总（2 条）**\n\n（心跳此前因最近 3 条消息都超过 24 小时未读，暂停了发送；现已恢复，暂停期间攒下的消息按顺序补发。）\n\n**1.** '), pack);
     assert.ok(pack.includes('第 4 拍') && pack.includes('第 5 拍'));
     assert.equal(h.sent[4].text, '💓 **心跳**\n\n第 6 拍：报价单还没回', '恢复后的新消息不再带说明');
-    assert.ok(h.logs.some((l) => l.includes('未读暂停解除（光总已读心跳消息）')));
+    assert.ok(h.logs.some((l) => l.includes(ownerText`未读暂停解除（${O_NAME}已读心跳消息）`)));
   });
 
   test('N=3：/heartbeat on 也能恢复', async () => {
@@ -648,8 +649,8 @@ describe('测试 13：Sonnet 默认值', () => {
     assert.equal(claude.normalizeModel('sonnet'), 'claude-sonnet-5-5');
     assert.equal(claude.MODEL_ALIASES.sonnet, 'claude-sonnet-5-5');
     assert.equal(heartbeatConfig({}, quietLog).model, 'claude-sonnet-5-5');
-    assert.equal(claude.normalizeModel('haiku'), 'claude-haiku-4-5-20251001');
-    assert.equal(claude.MODEL_ALIASES.haiku, 'claude-haiku-4-5-20251001');
+    assert.equal(claude.normalizeModel('haiku'), 'claude-haiku-5-5'); // BRIDGE-PUB-1：haiku 别名改指 claude-haiku-5-5
+    assert.equal(claude.MODEL_ALIASES.haiku, 'claude-haiku-5-5');
   });
 });
 

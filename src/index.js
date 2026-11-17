@@ -540,7 +540,7 @@ async function runTurn(spec) {
   if (merged) { route.lane = merged.lane; prompt = merged.prompt; } // BRIDGE-MQ-1：多条合并的一轮——车道按各条分别判定（任一条要执行就执行），提示词换成逐条标号的合并稿
   // BRIDGE-PERM-1：strict 档 owner 私聊句首「确认」放行上一轮草稿里的确认级操作（只管这一轮）；
   // audit/strict 收集本轮工具事件给回复附回执。legacy 与访客原样透传。
-  // BRIDGE-MQ-1：合并的一轮、排队后单条出队的一轮恒不放行（夹在里面 / 排队等着的「确认」不算确认，提示光总看完再单独回）
+  // BRIDGE-MQ-1：合并的一轮、排队后单条出队的一轮恒不放行（夹在里面 / 排队等着的「确认」不算确认，提示 owner 看完再单独回）
   const confirm = (merged || queued) ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner);
   const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm, runClaude, redact });
   prompt = toolTurn.prompt;
@@ -617,7 +617,7 @@ async function runTurn(spec) {
 
 const eventDispatcher = new lark.EventDispatcher({}).register({
   'im.message.receive_v1': trackedHandleMessage,
-  // 机器人事件 → 「光总对心跳消息的操作」信号（BRIDGE-EV-1）：表情 / 已读 / 撤回原本到达即丢，卡片按钮回调是新增的。
+  // 机器人事件 → 「owner 对心跳消息的操作」信号（BRIDGE-EV-1）：表情 / 已读 / 撤回原本到达即丢，卡片按钮回调是新增的。
   // 全部由桥接按确定规则处理：不调模型、永不抛出；按钮回调同步校验后立即回 toast，回写异步排队
   ...(() => {
     const ev = createEventHandlers({ getOwner: () => OWNER_OPEN_ID || loadOwner(), heartbeat: () => heartbeat, log: console.log });
@@ -818,7 +818,7 @@ startScheduler({
           true,
           [],
           null,
-          { model: process.env.DIAG_MODEL || 'claude-haiku-4-5-20251001', effort: 'low' }
+          { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low' }
         ),
       });
       // 失败时也要清空本任务的回传目录，否则残留文件会搭下一次报告一起发出
@@ -863,7 +863,7 @@ const heartbeat = startHeartbeat({
   // 按钮 / 引用回复回写后在当天 journal 记一行（与提示词里的 memory/journal/ 同一目录）
   journalDir: path.join(WORKSPACE_DIR, 'memory', 'journal'),
   // BRIDGE-VR-1：验收的规则核对复用 EV-1 的只读 lark-cli（同一份白名单，HEARTBEAT_VERIFY=off 时一次都不跑）；
-  // getOwner 用来认出「光总本人发的」不算对方回复
+  // getOwner 用来认出「owner 本人发的」不算对方回复
   verifyRunner: createLarkRunner(),
   getOwner: () => OWNER_OPEN_ID || loadOwner(),
 });

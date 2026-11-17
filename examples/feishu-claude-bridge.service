@@ -23,7 +23,8 @@ ExecStart=/usr/bin/node src/index.js
 Environment=PATH=/home/USERNAME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=60
-# 优雅退出：要大于 .env 的 SHUTDOWN_GRACE_SEC（默认 120）
+# 优雅退出：要不小于 .env 的 SHUTDOWN_GRACE_SEC（默认 120）再加 10 秒，留时间回「请稍后重发」和收尾。
+# systemd 没有 launchd 那样的 60 秒上限（macOS 的情况见 README「优雅退出」）；改了 SHUTDOWN_GRACE_SEC 这里跟着改。
 TimeoutStopSec=130
 KillSignal=SIGTERM
 # mixed：停止时只给主进程（桥接）发 SIGTERM，让它等进行中的对话收尾；超过 TimeoutStopSec 才 SIGKILL 整个 cgroup。

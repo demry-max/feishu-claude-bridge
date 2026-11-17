@@ -4,7 +4,7 @@
 // 模型用收紧的心跳工具档（见 claude.js buildHeartbeatArgs）推进台账；
 // 只有它说出 HEARTBEAT_OK 以外的话才私聊 owner，其余时候完全静默。
 //
-// 台账是模型写的（owner 交办时由主会话建档）；桥接只在光总点按钮 / 引用回复短语时按确定规则回写
+// 台账是模型写的（owner 交办时由主会话建档）；桥接只在 owner 点按钮 / 引用回复短语时按确定规则回写
 // （BRIDGE-EV-1，见 ledger-actions.js）。桥接自己的计数、去重、待发队列、心跳消息索引放
 // data/heartbeat-state.json，事件信号放 data/heartbeat-signals.json，与台账分开，模型改不到。
 // 时钟、runClaude、发送函数、外部增量拉取、状态文件路径、定时器全部可注入，测试不起子进程、不联网。
@@ -24,10 +24,11 @@ import {
   ruleCheck, buildVerifyPrompt, buildVerifyCard,
 } from './verifier.js';
 import { parseDigestAt, msUntilNext, inDigestWindow, buildDigest, plain, UNDOABLE_VIA } from './digest.js';
+import { ownerText, OWNER, YOU } from './owner-name.js';
 
 // 以 sched 开头：claude.js 的 isEphemeral 据此保证不 --resume、不落会话
 export const HEARTBEAT_KEY = 'sched:heartbeat';
-// verify（BRIDGE-VR-1）：助理说办完了、等桥接 / 光总验收；不算在跟进中（不到期、不进心跳提示词）
+// verify（BRIDGE-VR-1）：助理说办完了、等桥接 / owner 验收；不算在跟进中（不到期、不进心跳提示词）
 export const TASK_STATUSES = ['open', 'waiting', 'verify', 'done', 'dropped'];
 const ACTIVE_STATUSES = new Set(['open', 'waiting']);
 export const WATCH_TYPES = ['chat_reply', 'approval', 'calendar', 'none'];
@@ -38,7 +39,7 @@ const MAX_PENDING = 20; // 待发队列上限，超出丢最早的
 const MAX_DUE_IN_PROMPT = 15; // 一拍最多交给模型的到期条目，其余下拍再说
 // BRIDGE-VR-1：心跳消息索引里的消息种类（验收卡片 / 升级模板 / 日结也进索引，按钮与引用回复据此分流）
 const MSG_KINDS = ['heartbeat', 'pending', 'verify', 'escalate', 'digest'];
-// history.changes 的 via：rule / model＝自动验收，heartbeat＝心跳轮写的，owner＝光总按钮 / 引用回复，chat＝拍与拍之间（会话里）改的
+// history.changes 的 via：rule / model＝自动验收，heartbeat＝心跳轮写的，owner＝owner 按钮 / 引用回复，chat＝拍与拍之间（会话里）改的
 const CHANGE_VIA = ['rule', 'model', 'heartbeat', 'owner', 'chat'];
 const MAX_CHANGES = 200;
 const CHANGES_TTL_MS = 7 * DAY_MS;
@@ -463,7 +464,7 @@ export function buildHeartbeatPrompt({ due, deltas = [], now, stats = {}, omitte
     lines.push(
       `- 桥接记录：连续第 ${st.attempts ?? 1} 拍到期且台账未变；上次检查 ${lastChecked ? fmtLocal(lastChecked) : '无'}；`
         + `上次私聊提醒 ${lastNotified ? fmtLocal(lastNotified) : '无'}`
-        + (acked ? `；光总 ${fmtLocal(acked)} 对这条点过「知道了」` : ''),
+        + (acked ? ownerText`；${OWNER} ${fmtLocal(acked)} 对这条点过「知道了」` : ''),
     );
     const notes = task.notes?.trim() ? task.notes : '（无）';
     lines.push(fenceUntrusted(`台账 tasks/${task.slug}.json 的 title/notes`, `title: ${task.title.replace(/\s+/g, ' ')}\nnotes: ${notes}`));
@@ -513,8 +514,8 @@ function cleanVerifyEntry(e) {
  * signalsFile（事件信号，默认与状态文件同目录的 heartbeat-signals.json）、journalDir（回写时追加 journal；不给就不写）、
  * ledgerAction（确定性回写，默认 ledger-actions.js 的 applyLedgerAction）、defer（动作队列的调度，默认 setImmediate）。
  * BRIDGE-VR-1 另有可选的 verifyAction（验收 / 阶梯 / 撤销的确定性回写，默认 applyVerifyAction）、
- * getOwner（owner 的 open_id，规则核对时排除光总本人发的消息）、verifyRunner（只读 lark-cli 执行器，
- * 规则核对用 EV-1 已有的 approvalGet / messageGet 模板；不给就只能按依据类型判，核不了的交光总）。
+ * getOwner（owner 的 open_id，规则核对时排除 owner 本人发的消息）、verifyRunner（只读 lark-cli 执行器，
+ * 规则核对用 EV-1 已有的 approvalGet / messageGet 模板；不给就只能按依据类型判，核不了的交 owner）。
  * send(text[, { actions }]) 返回飞书 message_id（拿不到返回 undefined，只是不记索引）；没有按钮时只传一个参数。
  */
 export function createHeartbeat(deps) {
@@ -994,7 +995,7 @@ export function createHeartbeat(deps) {
     try {
       raw = JSON.parse(fs.readFileSync(signalsFile, 'utf8'));
     } catch {
-      return out; // 没有或坏了：按空的来（信号只是「光总看过」的提示，丢了不影响台账）
+      return out; // 没有或坏了：按空的来（信号只是「owner 看过」的提示，丢了不影响台账）
     }
     if (!isObj(raw)) return out;
     if (raw.day === out.day && isObj(raw.counts)) {
@@ -1051,7 +1052,7 @@ export function createHeartbeat(deps) {
         newlyRead = true;
       }
     }
-    if (newlyRead && st.unread_pause?.active) resumeUnread(st, nowMs, '光总已读心跳消息');
+    if (newlyRead && st.unread_pause?.active) resumeUnread(st, nowMs, ownerText`${OWNER}已读心跳消息`);
     if (!persist(st)) return;
     try {
       writeJsonAtomic(signalsFile, { ...readSignals(d), signals: [] });
@@ -1091,7 +1092,7 @@ export function createHeartbeat(deps) {
   }
 
   // ---------------------------------------------------------------- watch 锁（BRIDGE-EV-1）
-  // watch 决定桥接以光总身份去拉哪个会话 / 审批，只认 owner 对话里改的。心跳轮（模型刚读过外部原文）里新增或改动的
+  // watch 决定桥接以 owner 身份去拉哪个会话 / 审批，只认 owner 对话里改的。心跳轮（模型刚读过外部原文）里新增或改动的
   // watch 不生效：记 watch_locked（沿用旧值）、记一行日志、下一条心跳消息末尾说明。之后文件里的 watch 被改成别的
   // （只可能来自心跳轮之外，即 owner 对话）就解锁、按新值生效
 
@@ -1206,7 +1207,7 @@ export function createHeartbeat(deps) {
     return Object.keys(LEDGER_ACTIONS);
   }
 
-  // 日结的撤销只对「最后一次变化是桥接 / 模型 / 心跳轮自动判定的 done」有效（光总自己确认的、之后又改过的都不给撤）
+  // 日结的撤销只对「最后一次变化是桥接 / 模型 / 心跳轮自动判定的 done」有效（owner 自己确认的、之后又改过的都不给撤）
   function undoable(slug, st = loadState(now(), { repair: false })) {
     const changes = st.history?.changes;
     if (!Array.isArray(changes)) return false;
@@ -1275,7 +1276,7 @@ export function createHeartbeat(deps) {
         const label = actionLabel(job.action) ?? '未知动作';
         const entry = typeof job.messageId === 'string' ? st.msg_index[job.messageId] : undefined;
         const ev1 = Object.hasOwn(LEDGER_ACTIONS, job.action);
-        // 只认光总能做的动作（EV-1 三个 + VR-1 五个）；桥接内部动作（demote / autodone）不从这里进
+        // 只认 owner 能做的动作（EV-1 三个 + VR-1 五个）；桥接内部动作（demote / autodone）不从这里进
         if (!ev1 && !['done', 'accept', 'reopen', 'vdrop', 'undo'].includes(job.action)) {
           log(`[heartbeat] tasks/${job.slug}.json：动作不认识，跳过`);
           continue;
@@ -1299,14 +1300,14 @@ export function createHeartbeat(deps) {
         }
         if (job.action === 'ack') st.tasks[job.slug] = { ...(st.tasks[job.slug] ?? {}), acked_at: iso(ms) };
         if (job.action === 'reopen' || job.action === 'undo') {
-          // 光总判过这条「没办完」：按台账记（不按依据指纹——模型改一个字就绕得过去）。
-          // 之后这条再被写成 done，不核对、不问模型，一律发卡片请光总确认；光总验收 / 点「办完了」或台账删掉才清
+          // owner 判过这条「没办完」：按台账记（不按依据指纹——模型改一个字就绕得过去）。
+          // 之后这条再被写成 done，不核对、不问模型，一律发卡片请 owner 确认；owner 验收 / 点「办完了」或台账删掉才清
           st.tasks[job.slug] = { ...(st.tasks[job.slug] ?? {}), rejected_at: iso(ms) };
         } else if ((job.action === 'accept' || job.action === 'done') && st.tasks[job.slug]?.rejected_at) {
           const { rejected_at: _cleared, ...rest } = st.tasks[job.slug];
           st.tasks[job.slug] = rest;
         }
-        if (!ev1 && st.verify) delete st.verify[job.slug]; // 光总处理过了：这条的验收卡片记录作废
+        if (!ev1 && st.verify) delete st.verify[job.slug]; // owner 处理过了：这条的验收卡片记录作废
         if (historyOn() && prev?.ok) {
           const after = readTaskRaw(tasksDir, job.slug);
           if (after.ok) recordChange(st, job.slug, prev.raw?.status ?? null, after.raw?.status, 'owner', ms);
@@ -1315,7 +1316,7 @@ export function createHeartbeat(deps) {
           if (!isDigest) entry.acted = { ...(entry.acted ?? {}), [job.action]: iso(ms) };
           if (!entry.read_at) {
             entry.read_at = iso(ms); // 点了按钮 / 回复了＝读过
-            if (st.unread_pause?.active) resumeUnread(st, ms, '光总操作了心跳消息');
+            if (st.unread_pause?.active) resumeUnread(st, ms, ownerText`${OWNER}操作了心跳消息`);
           }
         }
         dirty = true;
@@ -1452,7 +1453,7 @@ export function createHeartbeat(deps) {
   // 验收（HEARTBEAT_VERIFY=rule|rule+model）：每条 verify 台账按依据核对一次——规则 pass 桥接直接写 done；
   // 规则 fail 直接发验收卡片；规则 unknown（没写依据 / other / 模型写的 owner）：rule 档发卡片，
   // rule+model 档再问一次 Haiku（每日 VERIFY_MAX_PER_DAY 次），pass 写 done，unsure / fail / 没按格式 / 调用失败都发卡片。
-  // 依据改了（指纹变了）重新核对；光总判过这条没办完（rejected_at）之后一律发卡片
+  // 依据改了（指纹变了）重新核对；owner 判过这条没办完（rejected_at）之后一律发卡片
   async function verifyStep(st, tasks, d, quota) {
     const nowMs = d.getTime();
     const pending = tasks.filter((t) => t.status === 'verify').sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
@@ -1463,15 +1464,15 @@ export function createHeartbeat(deps) {
       const key = evidenceKey(t.done_evidence);
       if (st.verify[t.slug]?.key !== key) st.verify[t.slug] = { key };
       const e = st.verify[t.slug];
-      if (e.card_at) continue; // 卡片已发：等光总
+      if (e.card_at) continue; // 卡片已发：等 owner
       if (handled >= MAX_VERIFY_PER_BEAT) break;
       handled += 1;
       if (e.finding) { // 上一拍已核对完、卡片没发出去：只补发卡片，不重新核对
         await sendVerifyCard(st, t, e, nowMs, quota);
         continue;
       }
-      if (st.tasks[t.slug]?.rejected_at) { // 光总判过这条没办完：不核对、不问模型
-        e.finding = '光总之前判过这条没办完，这次请你确认';
+      if (st.tasks[t.slug]?.rejected_at) { // owner 判过这条没办完：不核对、不问模型
+        e.finding = ownerText`${YOU}之前判过这条没办完，这次请你确认`;
         await sendVerifyCard(st, t, e, nowMs, quota);
         continue;
       }
@@ -1492,7 +1493,7 @@ export function createHeartbeat(deps) {
       const max = verifyMax();
       const n = Number.isInteger(st.verify_runs) ? st.verify_runs : max;
       if (n >= max) {
-        log(`[heartbeat] 今日验收审核已到上限 ${n}/${max}，tasks/${t.slug}.json 直接请光总验收`);
+        log(ownerText`[heartbeat] 今日验收审核已到上限 ${n}/${max}，tasks/${t.slug}.json 直接请${OWNER}验收`);
         e.finding = `${rc.finding}；今日模型审核已到上限（${n}/${max}），请你直接验收`;
         await sendVerifyCard(st, t, e, nowMs, quota);
         continue;
@@ -1535,7 +1536,7 @@ export function createHeartbeat(deps) {
 
   // 升级阶梯（HEARTBEAT_ESCALATE_LADDER=true）：st.tasks[slug].esc＝{ for: 这一轮的 escalate_after, level, last_at, mid }。
   // 第一级＝escalate_after 第一次越过那拍的心跳消息（照 HB-1B 调模型）；之后每级是固定模板（不调模型）：
-  // 上一级读了满 24 小时、或没读满 48 小时，且光总没点「知道了」，才升一级；到 ESCALATE_MAX 级后只进日结「卡住」。
+  // 上一级读了满 24 小时、或没读满 48 小时，且 owner 没点「知道了」，才升一级；到 ESCALATE_MAX 级后只进日结「卡住」。
   // escalate_after 改了（或台账不在跟进中、阶梯关了）就清掉，下一次越过重新从第一级来
   function resetLadders(st, tasks) {
     const bySlug = new Map(tasks.map((t) => [t.slug, t]));
@@ -1557,7 +1558,7 @@ export function createHeartbeat(deps) {
       const lastMs = msOf(esc.last_at);
       if (lastMs === null) continue;
       const acked = msOf(rec.acked_at);
-      if (acked !== null && acked >= lastMs) continue; // 光总点过「知道了」：不再升级
+      if (acked !== null && acked >= lastMs) continue; // owner 点过「知道了」：不再升级
       const read = typeof esc.mid === 'string' ? st.msg_index[esc.mid]?.read_at : undefined;
       if (nowMs - lastMs < (read ? DAY_MS : 2 * DAY_MS)) continue; // 读了等满 24 小时；没读等满 48 小时（未读不叠发）
       if (!canSendNow(st, quota)) return;
@@ -1641,7 +1642,7 @@ export function createHeartbeat(deps) {
       st.pending = left;
       sentItems += pack.items.length;
     }
-    // 发出的消息尽快记进索引：这一拍接下来可能要跑几分钟模型，期间光总点按钮也要认得出这条消息
+    // 发出的消息尽快记进索引：这一拍接下来可能要跑几分钟模型，期间 owner 点按钮也要认得出这条消息
     if (indexed) persist(st);
     log(`[heartbeat] 已合并补发 ${sentItems} 条待发消息${left.length ? `，剩余 ${left.length} 条下一拍再发（一拍合计最多发 ${MAX_SENDS_PER_BEAT} 条）` : ''}`);
   }
@@ -1700,7 +1701,7 @@ export function createHeartbeat(deps) {
     const nowMs = d.getTime();
     const st = loadState(d);
     st.last_beat_at = iso(nowMs);
-    takeSignals(st, d, nowMs); // 光总的已读 / 表情（事件处理函数写的信号）先并进来，未读暂停据此解除
+    takeSignals(st, d, nowMs); // owner 的已读 / 表情（事件处理函数写的信号）先并进来，未读暂停据此解除
     // 本拍合计发送额度：先补发，剩下的才给新消息。paused：未读暂停中只排队；failed：本拍补发失败过
     const quota = { left: MAX_SENDS_PER_BEAT, paused: checkUnreadPause(st, nowMs), failed: false };
     if (!inQuietHours(d, config.quietHours) && st.pending.length && !quota.paused) await flushPending(st, nowMs, quota);
@@ -1858,7 +1859,7 @@ export function createHeartbeat(deps) {
   }
 
   // 调模型之后（成功或失败）：HEARTBEAT_VERIFY 开着时，这一拍里新写成 done 的台账改成 verify 等验收
-  // （模型说办完了不算数，要桥接核对或光总确认）；然后把这一拍的状态变化记作 heartbeat
+  // （模型说办完了不算数，要桥接核对或 owner 确认）；然后把这一拍的状态变化记作 heartbeat
   function afterModel(st, statusBefore, d) {
     if (!statusBefore) return;
     if (verifyOn()) {

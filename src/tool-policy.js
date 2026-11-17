@@ -1,18 +1,19 @@
 // BRIDGE-PERM-1：owner 工具档（OWNER_TOOL_PROFILE=audit|strict）的纯策略层。
-// 只有数据和纯函数：不读环境变量、不碰文件、不联网（realpath/readlink/home/vars/tmpDirs 由调用方注入）。
+// 只有数据和纯函数：除称呼 OWNER_NAME（owner-name.js）外不读环境变量、不碰文件、不联网（realpath/readlink/home/vars/tmpDirs 由调用方注入）。
 // claude.js 用它生成 --allowedTools/--disallowedTools，tool-audit.js 用它给审计记录和回执分级，
 // hooks/untrusted-note.js 用它判断哪些输出含第三方内容，hooks/output-guard.js 用它判 lark 写文件落点。
 //
-// 分级：read（两档都放行）/ write（只对话放行，回复末尾附回执）/ confirm（先出草稿，光总回「确认」的下一轮才放行）
+// 分级：read（两档都放行）/ write（只对话放行，回复末尾附回执）/ confirm（先出草稿，owner 回「确认」的下一轮才放行）
 //      / chat-only（只对话放行，如 auth login）/ deny（一律拒绝）。不在表里的 lark 子命令一律按 deny 处理。
 
 import path from 'node:path';
+import { ownerText, OWNER } from './owner-name.js';
 
 export const STRICT_TOOLS = Object.freeze(['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash', 'WebSearch', 'ToolSearch', 'Skill']);
 export const FEISHU_MCP_READ = Object.freeze(['doc_read', 'sheet_read', 'bitable_tables', 'bitable_fields', 'bitable_records', 'mail_attachment_download']);
 export const FEISHU_MCP_WRITE = Object.freeze(['doc_append', 'bitable_create_record', 'bitable_update_record', 'sheet_write']);
 export const HELP_DOMAINS = Object.freeze(['im', 'contact', 'approval', 'calendar', 'mail', 'docs', 'sheets', 'drive', 'whiteboard', 'auth']);
-export const CONFIRM_DEFAULT_PROMPT = '（光总已确认上一轮的草稿，请执行）';
+export const CONFIRM_DEFAULT_PROMPT = ownerText`（${OWNER}已确认上一轮的草稿，请执行）`;
 const OTHER = '<其他>';
 
 const entry = (cls, domain, cmd = null, method = null) => Object.freeze({ domain, cmd, method, class: cls });
@@ -41,7 +42,7 @@ export const LARK_POLICY = Object.freeze([
   // ---- write：直接执行，回复末尾附回执 ----
   entry('write', 'im', '+messages-send'), entry('write', 'im', '+messages-reply'),
   entry('write', 'drive', '+import'), entry('write', 'calendar', '+create'),
-  // ---- confirm：先出草稿，光总回「确认」的下一轮才放行 ----
+  // ---- confirm：先出草稿，owner 回「确认」的下一轮才放行 ----
   ...['+reply', '+reply-all', '+send', '+draft-send'].map((c) => entry('confirm', 'mail', c)),
   ...['approve', 'reject', 'transfer', 'rollback', 'add_sign', 'remind'].map((m) => entry('confirm', 'approval', 'tasks', m)),
   ...['create', 'cancel', 'cc'].map((m) => entry('confirm', 'approval', 'instances', m)),

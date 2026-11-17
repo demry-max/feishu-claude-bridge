@@ -157,7 +157,7 @@ export const MODEL_ALIASES = {
   'fable5.1': 'claude-fable-5-1',
   opus: 'claude-opus-5',
   sonnet: 'claude-sonnet-5-5',
-  haiku: 'claude-haiku-4-5-20251001',
+  haiku: 'claude-haiku-5-5',
 };
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -737,6 +737,12 @@ import { larkRules, larkClassRules, STRICT_TOOLS, FEISHU_MCP_READ, FEISHU_MCP_WR
 import { createToolRecorder } from './tool-audit.js';
 import { fenceUntrusted } from './messages.js'; // BRIDGE-PERM-2：sched-diag 把任务指令/报错围栏起来
 import { DATA_DIR } from './store.js';
+import { ownerText, OWNER } from './owner-name.js';
+import { parseExtraWriteDirs, extraWriteDenyRules } from './extra-write-dirs.js';
+// BRIDGE-PUB-1：strict 档额外拒写的 owner 目录（OWNER_EXTRA_WRITE_DIRS，默认空）
+const OWNER_EXTRA_WRITE_DENY = extraWriteDenyRules(parseExtraWriteDirs(process.env.OWNER_EXTRA_WRITE_DIRS, {
+  home: os.homedir(), bridgeRoot: path.resolve(__dirname, '..'), workspaces: [WORKSPACE_DIR, GUEST_WORKSPACE_DIR],
+}));
 export { detectConfirm } from './tool-policy.js';
 export { createToolTurn, startToolAuditSummary } from './tool-audit.js';
 
@@ -790,8 +796,8 @@ function ownerToolLines(kind, confirm) {
   }
   return [
     '- 工具档：strict。发消息、导入文档、建日程可直接执行（回复末尾自动附回执）；回邮件/发邮件、审批、撤回消息、建群改群、' +
-      '增删群成员必须先给出草稿，等光总回「确认」后的下一轮才能执行。',
-    ...(confirm ? ['- 光总本轮已回复「确认」：可以执行上一轮草稿里列出的确认级操作，草稿之外的不做。'] : []),
+      ownerText`增删群成员必须先给出草稿，等${OWNER}回「确认」后的下一轮才能执行。`,
+    ...(confirm ? [ownerText`- ${OWNER}本轮已回复「确认」：可以执行上一轮草稿里列出的确认级操作，草稿之外的不做。`] : []),
     LARK_FLAG_LINE,
   ];
 }
@@ -819,7 +825,7 @@ function ownerHookSettings(strict) {
 function ownerDenyList(sched) {
   const deny = [
     ...ACCOUNT_TOOLS, 'WebFetch', 'Bash(lark-cli api:*)', 'Bash(lark-cli auth logout:*)', 'Bash(codex:*)', 'Bash(nohup:*)',
-    'Bash(npx:*)', `Edit(//${os.homedir().replace(/^\/+/, '')}/code/ias-ops/**)`, 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)',
+    'Bash(npx:*)', ...OWNER_EXTRA_WRITE_DENY, 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)',
   ];
   if (sched) {
     // 定时只读的纵深拒绝：即便哪天 allow 规则写宽了，写类 lark 子命令与飞书写工具也过不去

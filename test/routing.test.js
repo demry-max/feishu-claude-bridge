@@ -142,7 +142,7 @@ describe('车道 → 模型（buildClaudeArgs 行为断言）', () => {
       const s = mod.buildClaudeArgs('sched:weekly.json', true, []);
       assert.equal(argVal(s.args, '--model'), 'claude-sonnet-5-5');
       const own = mod.buildClaudeArgs('sched:weekly.json', true, [], { model: 'haiku' });
-      assert.equal(argVal(own.args, '--model'), 'claude-haiku-4-5-20251001');
+      assert.equal(argVal(own.args, '--model'), 'claude-haiku-5-5'); // BRIDGE-PUB-1：haiku 别名改指 claude-haiku-5-5
       // 自诊断任务由调用方显式指定 DIAG_MODEL，不受车道影响
       const diag = mod.buildClaudeArgs('sched-diag:weekly.json', true, [], { model: 'claude-haiku-4-5-20251001' });
       assert.equal(argVal(diag.args, '--model'), 'claude-haiku-4-5-20251001');

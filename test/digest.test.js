@@ -2,6 +2,7 @@
 // 全部用注入的桩：不连飞书、不起 lark-cli、不调真实 claude。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { ownerText, OWNER as O_NAME, YOU as O_YOU } from '../src/owner-name.js'; // BRIDGE-PUB-1：称呼按配置（测试里未设：owner / 你）
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -212,7 +213,7 @@ describe('测试 8：日结内容', () => {
     h.setNow(NIGHT);
     assert.equal((await h.hb.digestNow()).action, 'sent');
     const dg = h.sent.at(-1);
-    assert.ok(dg.text.includes('**今天办完**（2）：①任务甲（心跳轮写的） · 任务乙（光总确认）'), dg.text);
+    assert.ok(dg.text.includes(ownerText`**今天办完**（2）：①任务甲（心跳轮写的） · 任务乙（${O_YOU}确认）`), dg.text);
     assert.deepEqual(dg.opts.actions, undoButtons(['a'], btn(dg, 'undo').n));
     const u = btn(dg, 'undo', 'a');
     h.setNow(plus(NIGHT, 5));
@@ -225,7 +226,7 @@ describe('测试 8：日结内容', () => {
     assert.equal(a.status, 'open');
     assert.equal(a.next_check_at, '2026-11-17T21:35');
     assert.equal(a.updated_at, '2026-11-16T21:35');
-    assert.match(journalOf(env), /（桥接）光总点了『撤销』：tasks\/a\.json/);
+    assert.ok(journalOf(env).includes(ownerText`（桥接）${O_NAME}点了『撤销』：tasks/a.json`), journalOf(env));
     assert.deepEqual(await h.handlers.cardAction(click(dg.mid, u)), TOAST_STALE);
   });
 

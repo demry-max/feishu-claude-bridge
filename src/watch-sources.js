@@ -1,6 +1,6 @@
 // 心跳外部增量（BRIDGE-EV-1）：HEARTBEAT_WATCH 的 chat_reply / approval 两个源。
 //
-// 桥接以光总身份（lark-cli --as user）执行**固定的只读命令**，拉取台账 watch 指定的增量；
+// 桥接以 owner 身份（lark-cli --as user）执行**固定的只读命令**，拉取台账 watch 指定的增量；
 // argv 模板逐字冻结在下面 TEMPLATES 里，变量只来自校验过的值（会话 ID、消息 ID、审批实例码、
 // 桥接自己算的时间），runner 再按模板逐项比对一遍，对不上一律不执行。
 // 子进程不经 shell、15 秒超时、输出上限 1MB，环境变量只给 HOME、PATH、LANG（不带 FEISHU_* 等密钥）。
@@ -8,6 +8,7 @@
 import { execFile as nodeExecFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import { parseTime } from './heartbeat.js';
+import { ownerText, OWNER } from './owner-name.js';
 
 /**
  * 三个只读模板（参数名以 lark-cli v1.0.97 内置文档为准）：
@@ -331,7 +332,7 @@ export function createWatchSources({ runner, getOwner = () => '', log = console.
       fresh.sort((x, y) => x.ts - y.ts || x.id.localeCompare(y.id));
       const shown = fresh.slice(-MAX_SHOWN);
       const more = hasMoreOf(o);
-      const lines = [`会话 ${w.chat_id} 自 ${fmtShort(from)} 起有 ${fresh.length}${more ? '+' : ''} 条新消息（已去掉光总本人、机器人和系统消息），最近 ${shown.length} 条：`];
+      const lines = [ownerText`会话 ${w.chat_id} 自 ${fmtShort(from)} 起有 ${fresh.length}${more ? '+' : ''} 条新消息（已去掉${OWNER}本人、机器人和系统消息），最近 ${shown.length} 条：`];
       for (const m of shown) lines.push(`- ${fmtShort(m.ts)} ${m.name || '（发送人未知）'}（${m.id}）：${m.text}`);
       if (more) lines.push('（另有更多较早的新消息未列出）');
       else if (fresh.length > shown.length) lines.push(`（另有 ${fresh.length - shown.length} 条较早的新消息未列出）`);

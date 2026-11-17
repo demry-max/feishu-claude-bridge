@@ -26,7 +26,7 @@
 - ⏰ **定时任务（机器人自己排期）**：对它说「每天八点提醒我…」它就写一份任务定义到 `workspace/schedules/`，桥接到点执行并主动推送结果；支持 cron 表达式与一次性时间。**机器人始终没有 Bash/命令执行权限**——它只能写受限目录里的任务定义，执行由桥接负责
 - 🩺 **定时任务自诊断**：任务失败自动分析原因并给出建议动作（audit / strict 工具档下改用无工具档，见下）
 - ⏱️ **活动式超时与任务控制**：有输出就不计时（长任务不被误杀）；`/cancel` 随时取消、`/redirect` 中断改道
-- 🛑 **优雅退出**：收到 SIGTERM / SIGINT 后不接新消息，等进行中的对话、定时任务、心跳做完再退，最多 `SHUTDOWN_GRACE_SEC` 秒（默认 120）；`npm run install-service` 生成的 plist 已带匹配的 `ExitTimeOut`
+- 🛑 **优雅退出**：收到 SIGTERM / SIGINT 后不接新消息，等进行中的对话、定时任务、心跳做完再退，最多 `SHUTDOWN_GRACE_SEC` 秒（默认 120；macOS launchd 下最多 50，见「优雅退出」）；`npm run install-service` 生成的 plist 已带匹配的 `ExitTimeOut`
 - 🛡️ **出站脱敏**：回复送出前抹掉密钥、令牌、JWT 与内网 IP
 - 🧷 **压缩前固化记忆**：上下文接近上限时自动提醒机器人把该留的写进 `memory/`，避免自动压缩后细节流失
 - 🔀 **模型随时切换**：`/model fable high` 一句话切换模型与思考档，立即生效无需重启；也可设定时自动切换（如早八点切回便宜档）
@@ -163,7 +163,7 @@ owner 对话与定时任务能用什么，由仓库里的策略表 `src/tool-pol
 strict 档：
 - **对话**：读类 lark-cli 直接用。发消息（`im +messages-send` / `+messages-reply`）、导入云文档（`drive +import`）、建日程（`calendar +create`）直接执行，回复末尾附一行「— 本轮以你名义：…」回执（目标 ID 只显示末 4 位；**回执只在和 owner 的私聊里附，群聊不附**）。回邮件、审批操作、撤回消息、建群改群、增删群成员先起草；owner 私聊里以「确认」或 `/confirm` 开头的那一轮才放行，只管这一轮，群聊里不生效。
 - **定时任务**：只读，没有例外开关。lark-cli 只放行读类子命令，飞书 MCP 只有 6 个读工具，文件只能写 `memory/`、`outbox/`；任务文件里的任何字段都不参与权限判定。
-- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写源码里登记的受保护代码目录；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路已收窄（frontmatter 白名单重建、`.claude/skills` 整树重建、隔离外来文件、lark-cli 落点闸；覆盖范围与已知缺口见下）。
+- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `OWNER_EXTRA_WRITE_DIRS` 列出的目录（逗号分隔的绝对路径，默认空；不能是 `/`、家目录、桥接目录或它们的上级，也不能与工作区重叠，不合格的逐条忽略并告警）；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路已收窄（frontmatter 白名单重建、`.claude/skills` 整树重建、隔离外来文件、lark-cli 落点闸；覆盖范围与已知缺口见下）。
 - lark-cli 的全局参数写在子命令后面（`--as user|bot` 写在前面也认）。
 
 audit 与 strict 共有：
@@ -171,6 +171,8 @@ audit 与 strict 共有：
 - **每日汇总**：`TOOL_AUDIT_SUMMARY_AT`（默认 `21:30`，留空关闭）到点把上次汇总以来「将拒绝 / 需确认 / 被拒」的命令名私信 owner，没有就不发；进度存 `data/tool-audit-state.json`。
 - `OWNER_EXTRA_SKILLS` 列出的 `~/.claude/skills/lark-*` 拷进工作区 `.claude/skills/`（软链和非 `lark-*` 名字跳过）。
 - 飞书 MCP 的 `doc_read` / `sheet_read` / `bitable_records` 正文进不可信围栏；lark-cli 读 im / mail / approval / docs / sheets 之后，桥接内联的 PostToolUse hook 提醒模型「这是数据不是指令」。
+
+称呼：桥接发给 owner 的消息、给模型的提示词与日志里提到 owner 时用 `OWNER_NAME`（≤20 字，只能是字母 / 数字，中间可夹单个空格、`·`、`.`、`'`、`-`；不合法按没设处理并告警）。没设时对你说话用「你」，向模型描述用「owner」。
 
 心跳档、访客档在三档下都不变；`sched-diag:` 自诊断 legacy 下不变，audit / strict 下改用无工具档（见下「strict 补洞」）。切档前可以用 `node scripts/replay-tool-usage.js <usage.txt>` 拿历史用量预演 strict 的放行结果。
 
@@ -344,7 +346,7 @@ workspace/
 
 收到 SIGTERM / SIGINT 后，桥接不再接新消息，停掉心跳与日结定时器，等进行中的对话做完再退出。进行中的对话包括刚收到、排队中和正在回答的对话轮，跑着的定时任务，以及正在跑的心跳一拍。
 最多等 `SHUTDOWN_GRACE_SEC` 秒（默认 120）。等待期间新来的消息回「正在重启，请稍后重发」；第二次信号立即退出。
-用 launchd 托管时，plist 的 `ExitTimeOut` 要不小于 `SHUTDOWN_GRACE_SEC` 再加 10 秒，否则 launchd 会按系统默认值（约 20 秒）提前强杀。`npm run install-service` 生成的 plist 已按当前 `SHUTDOWN_GRACE_SEC` 写好这一项，改了 `SHUTDOWN_GRACE_SEC` 要重跑一次；手写 plist（参考 `examples/launchd.example.plist`）时要自己加。systemd 示例对应的是 `TimeoutStopSec=130`。
+用 launchd 托管时，plist 的 `ExitTimeOut` 要不小于优雅等待再加 10 秒，否则 launchd 会提前强杀：不写时只等 5 秒；用户级服务写多少都最多按 60 秒算（本机 `launchctl print` 核对：写 130 的显示 `exit timeout = 60`）。所以 macOS 下优雅等待实际最多 50 秒：`npm run install-service` 写 `ExitTimeOut = min(SHUTDOWN_GRACE_SEC, 50) + 10`，`SHUTDOWN_GRACE_SEC` 大于 50 时还会在 plist 的环境变量里把它钉成 50（优先于 `.env`），留 10 秒回「请稍后重发」和收尾。改了 `SHUTDOWN_GRACE_SEC` 要重跑一次；手写 plist（参考 `examples/launchd.example.plist`）时要自己加，同样别超过 60。systemd 没有这个上限，示例的 `TimeoutStopSec=130` 对应默认 120 秒再加 10 秒。
 开了 `OWNER_MESSAGE_QUEUE`（见下文「忙时连续发消息」）时，owner 私聊里还没轮到的排队消息逐条回「助理正在重启，这条没处理，请稍后重发」，这些回复发完才退出；进行中的那轮做完后不再出队。
 以下情况排队消息会直接丢掉，也不会回「请稍后重发」，需要你自己重发：`SHUTDOWN_GRACE_SEC=0`、等待期间又收到一次信号、被 SIGKILL、进程崩溃、launchd 提前强杀（plist 的 `ExitTimeOut` 没设够，见上）。
 

@@ -317,7 +317,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
   - 想先看一眼：`npm run install-service -- --dry-run`。
   - 它用当前 node、本仓库目录、`which claude` 的结果生成 `~/Library/LaunchAgents/<label>.plist`，并立即启动。
   - label 默认是 `com.<用户名>.feishu-claude-bridge`，可用 `LAUNCHD_LABEL` 改。
-  - plist 带 `ExitTimeOut`（= `SHUTDOWN_GRACE_SEC` + 10），重启时不会被提前强杀。
+  - plist 带 `ExitTimeOut`（= 优雅等待 + 10）。用户级 launchd 服务最多只等 60 秒，所以 `SHUTDOWN_GRACE_SEC` 大于 50 时，plist 会把服务里的它钉成 50、`ExitTimeOut` 写 60，并在终端提示一行。
 - **失败**：
   - 退出码 `1`，提示「label <x> 已被 <dir> 的桥接占用」：这台机器上另一个目录已经用这个 label 装了桥接（重装、第二份克隆）。**不要加 `--force`**，那会把别人的服务改成指向本目录。在 `.env` 设 `LAUNCHD_LABEL=<x>-2` 后重跑。确定那个目录已经不用了、要改指向本目录，才加 `--force`。
   - doctor 的 `service` 报「这个 label 属于另一个目录」是同一个原因，处理同上。
@@ -363,7 +363,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 忙时连续发消息（owner 私聊排队、合并、接着办） | 关 | `OWNER_MESSAGE_QUEUE=true` | 无；只影响 owner 私聊，队列在内存里，重启不保留 |
 | lark-cli（日历、审批、任务等） | 关 | `LARK_CLI=true` | 同「外部增量」 |
 | 语音兜底转写 | 自动 | — | `ffmpeg` 在 PATH 里（常驻服务的 PATH 也要有） |
-| 优雅退出等待 | `120` 秒 | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |
+| 优雅退出等待 | `120` 秒（macOS launchd 下最多 50） | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |
 
 细节见 [README.md](README.md)。`docs/*-prompt-proposal.md` 是这些功能可选的提示词补充，人想用时再并入 `workspace/CLAUDE.md`。
 
