@@ -4,6 +4,9 @@
 
 **中文** | [English](README.en.md)
 
+> 🤖 **把这个仓库链接交给 AI agent（Claude Code、Codex 等）安装时，请让它先读 [`AGENTS.md`](AGENTS.md)。**
+> 那里有逐步命令、每步的检查方法，以及哪些步骤必须由人来做。
+
 **把 Claude Code 接进飞书** —— 私聊或群里 @机器人，让 Claude 回答问题、看图片、读文件、听语音，并保持上下文连续。无需公网服务器、域名、回调地址：飞书事件走长连接（WebSocket），跑在一台装有 Claude Code 的电脑上即可。
 
 **Chat with Claude Code from Feishu/Lark** — DM the bot or @mention it in groups. Handles text, images, files, voice messages, and rich posts with persistent per-chat sessions. No public server needed: events arrive over Feishu's persistent WebSocket connection, so it runs on any machine with Claude Code installed.
@@ -12,30 +15,118 @@
 
 ## 特性 Features
 
+### 默认就有
+
 - 🔒 **访客隔离**：非 owner 跑在独立工作区、切断用户级配置与 MCP、显式禁用本机工具——碰不到你的记忆，也借不到你的权限
 - 🔌 **零公网依赖**：长连接收事件，家用电脑即可部署
-- 📲 **扫码即建应用**：`npm run register` 走飞书官方应用注册接口，扫一次码自动创建应用、写入凭据、登记 owner
+- 📲 **扫码即建应用**：`npm run register` 走飞书官方应用注册接口，扫一次码自动创建应用、写入凭据、登记 owner；没有终端交互时（AI agent 代跑）自动分成「打印链接 → 人扫码 → `--resume` 取回」两段
+- 🩺 **安装自检与体检**：`npm run setup` 一条命令检查 Node / 依赖 / claude 登录 / `.env` / 必填项并给出下一步；`npm run doctor` 再查工作区、常驻服务、飞书 scope。两者都有 `--json`（程序解析时用 `npm run -s setup -- --json`，否则 stdout 开头带 npm 横幅）和「全绿 / 只差人工 / 失败」三态退出码；启动日志也会自检 scope
 - 🧠 **会话记忆**：每个飞书会话映射一个 Claude session（`--resume` 续聊），跨天跨周有效；`/new` 重开，`/status` 查看
 - 🗂️ **Agent 工作区**：workspace 内置 CLAUDE.md 人格 + `memory/` 三层长期记忆（画像 USER.md / 事实文件+索引 / journal 流水；纠正、决定、偏好主动落盘，不用等「记住」）+ `skills/` 技能沉淀（说「存成技能」自动生成 SKILL.md 并在后续会话自动加载）
 - ⏰ **定时任务（机器人自己排期）**：对它说「每天八点提醒我…」它就写一份任务定义到 `workspace/schedules/`，桥接到点执行并主动推送结果；支持 cron 表达式与一次性时间。**机器人始终没有 Bash/命令执行权限**——它只能写受限目录里的任务定义，执行由桥接负责
-- 💓 **桥接自带心跳（默认关闭）**：交办给它的事记在 `workspace/tasks/<slug>.json` 台账里；每拍先由脚本读台账，有到期项才调一次模型（收紧的固定工具档：无 Bash、无联网、无飞书工具，只能写 `tasks/` 与 `memory/journal/`），有事才私聊 owner、无事完全静默；每日调用上限、免打扰时段、24 小时去重。`HEARTBEAT_ENABLED=true` 开启，`/heartbeat on|off|status` 运行时开关（仅 owner 私聊）
+- 🩺 **定时任务自诊断**：任务失败自动分析原因并给出建议动作（audit / strict 工具档下改用无工具档，见下）
 - ⏱️ **活动式超时与任务控制**：有输出就不计时（长任务不被误杀）；`/cancel` 随时取消、`/redirect` 中断改道
-- 📨 **忙时连续发消息（默认关闭）**：`OWNER_MESSAGE_QUEUE=true` 时，owner 私聊里助理正忙时接着发的消息排队（最多 10 条），手头这轮一结束按顺序合并成一轮接着办（见下文「忙时连续发消息」）
+- 🛑 **优雅退出**：收到 SIGTERM / SIGINT 后不接新消息，等进行中的对话、定时任务、心跳做完再退，最多 `SHUTDOWN_GRACE_SEC` 秒（默认 120）；`npm run install-service` 生成的 plist 已带匹配的 `ExitTimeOut`
 - 🛡️ **出站脱敏**：回复送出前抹掉密钥、令牌、JWT 与内网 IP
-- 🔊 **语音回复**：`/voice` 开启后回答附带语音消息
-- 🩺 **定时任务自诊断**：任务失败自动分析原因并给出建议动作
 - 🧷 **压缩前固化记忆**：上下文接近上限时自动提醒机器人把该留的写进 `memory/`，避免自动压缩后细节流失
 - 🔀 **模型随时切换**：`/model fable high` 一句话切换模型与思考档，立即生效无需重启；也可设定时自动切换（如早八点切回便宜档）
-- 🚦 **聊天/规划与执行分工两个模型**：`CLAUDE_MODEL` 负责平常对话与规划（如 fable 5.1），`CLAUDE_EXEC_MODEL` 负责执行（如 sonnet 5.5）——说「执行」「去做」或发 `/do <任务>` 时下一轮自动切到执行模型，会话上下文保留（执行模型看得见刚谈妥的计划）；定时任务默认走执行模型。`/model exec sonnet` 随时改，留空即关闭分工
-- 🩺 **安装体检**：`npm run doctor` 检查 Node / npm / claude 登录 / `.env` / 工作区 / 飞书 scope，能自动修的直接修；启动日志也会自检 scope，告诉你哪些飞书工具因权限未开而不可用
-- 📄 **飞书文档 / 多维表格读写**：内置 MCP 工具（读文档、追加段落、多维表格查表/读记录/增改记录）；用**机器人应用自己的租户权限**，能碰什么由飞书后台 scope 精确控制，仅 owner 可用
+- 🚦 **聊天/规划与执行分工两个模型**：`CLAUDE_MODEL` 负责平常对话与规划，`CLAUDE_EXEC_MODEL` 负责执行——说「执行」「去做」或发 `/do <任务>` 时下一轮自动切到执行模型，会话上下文保留；定时任务默认走执行模型。留空即关闭分工
+- 📄 **飞书文档 / 多维表格 / 电子表格读写**：内置 MCP 工具，用**机器人应用自己的租户权限**，能碰什么由飞书后台 scope 精确控制，仅 owner 可用
 - 🖼️ **回传图片与文件**：机器人写进 `workspace/outbox/` 的文件自动上传发送（图片可直接预览）
 - 🎫 **进度卡片原地更新**：长任务的阶段说明更新同一张卡片而非刷屏，完成后自动折叠
 - 🛂 **访问控制**：`ALLOW_USERS` / `ALLOW_CHATS` 白名单（留空＝不限制）；群聊自动带上发言人姓名
 - 🖼️ **多消息类型**：文本 / 图片（Claude 直接看图）/ 文件 / 语音（飞书转写字段 → ffmpeg + 语音识别 API 兜底）/ 富文本 / 合并转发 / 分享卡片
-- 🔐 **权限分级**：owner 由 `npm run register` 扫码时登记（手动安装则在 `.env` 设 `OWNER_OPEN_ID`）；其他成员跑在隔离工作区、只有联网搜索，碰不到主机文件与记忆
+- 🔊 **语音回复**：`/voice` 开启后回答附带语音消息
+- 🔐 **权限分级**：owner 由 `npm run register` 扫码时登记（已有应用则用 `npm run setup -- --set-owner` 或在 `.env` 设 `OWNER_OPEN_ID`）；其他成员跑在隔离工作区、只有联网搜索，碰不到主机文件与记忆
 - 💰 **用订阅不用 API Key**：通过 `claude -p` 无头模式调用本机 Claude Code 登录态
-- 🖥️ **macOS + Windows**：launchd / 启动项自启脚本齐备（Linux systemd 同理）
+- 🖥️ **macOS / Linux / Windows**：macOS 用 `npm run install-service`（launchd）；Linux 有 systemd 用户服务示例 [`examples/feishu-claude-bridge.service`](examples/feishu-claude-bridge.service)；Windows 有登录自启脚本（崩溃后不自动重启）
+
+### 可选功能（默认关闭，在 `.env` 打开）
+
+| 功能 | 默认 | 开关 | 详见 |
+|---|---|---|---|
+| 💓 桥接心跳与交办台账 | 关 | `HEARTBEAT_ENABLED=true`；运行时 `/heartbeat on\|off\|status` | [桥接心跳](#-桥接心跳默认关闭) |
+| 🔘 心跳消息按钮（知道了 / 推迟一天 / 不做了） | 关 | `HEARTBEAT_BUTTONS=true`（后台要用长连接接收 `card.action.trigger`） | [owner 对心跳消息的操作](#owner-对心跳消息的操作全部由桥接处理不调模型) |
+| ↩️ 引用回复快捷操作 | 关 | `HEARTBEAT_REPLY_SHORTCUTS=true` | 同上 |
+| 👀 表情 / 已读 / 撤回事件、未读暂停 | 事件按订阅接收；暂停关 | 后台订阅三类事件；`HEARTBEAT_UNREAD_PAUSE=N` | 同上 |
+| 📡 外部增量（群回复、审批状态） | 关 | `HEARTBEAT_WATCH=chat_reply,approval`（需 lark-cli 以 owner 身份登录） | [外部增量](#外部增量heartbeat_watch) |
+| ✅ 验收 | 关 | `HEARTBEAT_VERIFY=rule` 或 `rule+model` | [验收、升级阶梯与每晚日结](#验收升级阶梯与每晚日结全部默认关闭) |
+| 📈 升级阶梯 | 关 | `HEARTBEAT_ESCALATE_LADDER=true`、`ESCALATE_MAX` | 同上 |
+| 🌙 每晚台账日结 | 关 | `HEARTBEAT_DIGEST_AT=HH:MM` | 同上 |
+| 🧰 owner 工具档 | `legacy`（与旧版一致） | `OWNER_TOOL_PROFILE=audit`（只记录）/ `strict`（按策略表拦） | [owner 工具档](#owner-工具档owner_tool_profile默认-legacy) |
+| 📊 工具审计每日汇总 | audit / strict 下 `21:30` | `TOOL_AUDIT_SUMMARY_AT`（留空关闭） | 同上 |
+| 🚧 写文件落点闸、技能 frontmatter 白名单、`.claude` 外来文件隔离 | 随 audit / strict 开启；legacy 不变 | `OWNER_TOOL_PROFILE` | [strict 补洞](#strict-补洞只在-audit--strict-生效legacy-逐字不变) |
+| 🩺 定时任务自诊断无工具档 | 随 audit / strict 开启；legacy 不变 | `OWNER_TOOL_PROFILE` | 同上 |
+| 📨 忙时连续发消息（owner 私聊排队、合并、接着办） | 关 | `OWNER_MESSAGE_QUEUE=true` | [忙时连续发消息](#-忙时连续发消息排队合并接着办默认关闭) |
+| 🧩 lark-cli（日历、审批、任务、消息检索…） | 关 | `LARK_CLI=true` | [飞书侧能做什么](#-飞书侧能做什么不能做什么) |
+
+## 快速开始 Quick Start
+
+> 让 AI agent 代装：把仓库链接给它，并让它先读 [`AGENTS.md`](AGENTS.md)。下面是人自己装的最短路径。
+
+**前置条件**
+
+- **Node ≥ 18**。没有 Node 也没有 Homebrew 时，用官方 tarball 免 sudo 安装：
+
+  ```bash
+  V=v24.21.0   # 到 https://nodejs.org/dist/ 看最新 LTS；建议同时校验 SHASUMS256.txt
+  curl -fsSL -o node.tar.xz "https://nodejs.org/dist/$V/node-$V-darwin-arm64.tar.xz"   # Intel Mac 换 darwin-x64，Linux 换 linux-x64
+  mkdir -p ~/.local && tar -xJf node.tar.xz -C ~/.local && mv ~/.local/node-$V-darwin-arm64 ~/.local/node
+  echo 'export PATH="$HOME/.local/node/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+  ```
+
+- **Claude Code CLI**，并已登录：
+
+  ```bash
+  npm install -g @anthropic-ai/claude-code   # 或按官方文档安装
+  claude                                     # 在里面输入 /login，浏览器完成授权（订阅账号）
+  ```
+
+- 可选：ffmpeg（语音兜底转写）。
+
+**安装**
+
+```bash
+git clone https://github.com/demry-max/feishu-claude-bridge.git
+cd feishu-claude-bridge
+npm ci
+npm run setup          # 自检：没有 .env 就从 .env.example 生成，并列出还缺什么（可反复跑）
+```
+
+**飞书应用**：安装过程自动生成，**不用到开发者后台手工创建**
+
+- **默认**：`npm run register`，用飞书 App 扫码，应用自动创建，凭据与 `OWNER_OPEN_ID` 写入 `.env`（走飞书官方应用注册接口）。
+  - 结束时会打印一段 scope JSON。到开发者后台打开这个刚生成的应用，「权限管理 → 批量导入」粘贴，然后「版本管理与发布」发布版本。只做一次。
+  - 注册接口建出来的应用没有开通 scope：不做这步，文档 / 多维表格工具用不了，聊天不受影响。
+  - 国际版 Lark 先在 `.env` 设 `FEISHU_DOMAIN=lark`。
+  - 没有终端时（AI agent 代跑）是两段式：`npm run register -- --no-wait` 打印链接，人扫完后 `npm run register -- --resume`。链接没过期时重复 `--no-wait` 只重新打印同一条链接、不会新建应用；确定作废重来加 `--restart`。
+- **和 lark-cli 的关系**：lark-cli 的 `lark-cli config init --new`（安装向导里的「配置应用」）走的是同一个注册接口，**每扫一次码就新建一个应用**。所以别两边各扫一次：先让桥接建好应用，再用 `npm run setup -- --link-lark-cli` 把同一个应用交给 lark-cli（Secret 经 stdin 传，不打印）。反过来不行：lark-cli 的 App Secret 存在系统钥匙串里，没有导出命令，setup 只读得到它的 App ID。详见 [AGENTS.md §3](AGENTS.md#3-飞书应用安装过程自动生成)。
+- **例外：沿用已有的应用**：把 App ID / App Secret 填进 `.env`，再到开发者后台检查这个应用（不是新建）：
+  1. 已添加「机器人」能力；
+  2. 事件订阅用「使用长连接接收事件」，并添加 `im.message.receive_v1`；
+  3. 批量导入 scope（JSON 见 [AGENTS.md §3B](AGENTS.md#3b-沿用已有的应用例外不扫码)）；
+  4. 已发布版本。
+
+  owner 的登记：先 `npm start > bridge.log 2>&1`（`>` 覆盖旧日志，只看本次启动之后），只有你自己私聊机器人一句；再跑 `npm run setup`，日志里只有一个人时它会给出 `npm run setup -- --set-owner ou_…`。有多人私聊过时它不给命令：请别人先别私聊，重启后重做。`.env` 已有别的 owner 时 `--set-owner` 拒绝覆盖，确认要换再加 `--force`。
+
+**验证与常驻**
+
+```bash
+npm run doctor         # 体检：全部通过（或只剩 ⚠️）即可
+npm start              # 日志出现 [ws] ws client ready 即连上；在飞书私聊机器人发「你好」
+npm run install-service   # macOS 开机自启（launchd）；npm run uninstall-service 卸载
+```
+
+- macOS：`install-service` 用当前 node、本仓库目录与 `which claude` 的结果生成 plist 并立即启动，不用手改占位符。
+  - 日志在 `~/Library/Logs/<label>.log`。
+  - `LAUNCHD_LABEL` 可指定 label。
+  - [examples/launchd.example.plist](examples/launchd.example.plist) 仅供参考。
+- Linux：按 [examples/feishu-claude-bridge.service](examples/feishu-claude-bridge.service) 顶部注释装成 systemd 用户服务。
+- Windows：`powershell -ExecutionPolicy Bypass -File scripts\windows\install-startup.ps1`。
+  - 日志在 `bridge.log`。
+  - 崩溃后不会自动重启。
+- 升级：`git pull && npm ci && npm run setup`，然后重启服务。
+- 回滚、卸载、常见故障：见 [AGENTS.md](AGENTS.md) §10–§11。
 
 ## 🔒 权限边界（v2.0.0 起）
 
@@ -59,7 +150,7 @@ owner 与其他人跑在**两个物理隔离的工作区**里，这是本项目�
 
 **心跳轮次**（`HEARTBEAT_ENABLED=true` 时）用比 owner 普通会话更窄、且不受 env 放宽影响的固定工具档：`--setting-sources ''` + `--strict-mcp-config`，内置工具只有 Read/Grep/Glob/Edit/Write，写入只限 `tasks/` 与 `memory/journal/`；没有 Bash、lark-cli、联网与飞书工具，也不能改 `schedules/`。台账里的 title/notes 进不可信围栏；对外动作只起草，私聊 owner 确认。
 
-### owner 工具档（`OWNER_TOOL_PROFILE`，默认 `legacy`，BRIDGE-PERM-1 / PERM-2）
+### owner 工具档（`OWNER_TOOL_PROFILE`，默认 `legacy`）
 
 owner 对话与定时任务能用什么，由仓库里的策略表 `src/tool-policy.js` 决定：lark-cli 按子命令分 read / write / confirm / chat-only / deny 五级。分三档，启动时读一次，非法值按 legacy 处理：
 
@@ -70,9 +161,9 @@ owner 对话与定时任务能用什么，由仓库里的策略表 `src/tool-pol
 | `strict` | 不再加载 | 按策略表 | 内置工具白名单 `Read,Grep,Glob,Edit,Write,Bash,WebSearch,ToolSearch,Skill`；**`ALLOWED_TOOLS` 与 `LARK_CLI` 在 strict 下不起作用** |
 
 strict 档：
-- **对话**：读类 lark-cli 直接用。发消息（`im +messages-send` / `+messages-reply`）、导入云文档（`drive +import`）、建日程（`calendar +create`）直接执行，回复末尾附一行「— 本轮以你名义：…」回执（目标 ID 只显示末 4 位；**回执只在和 owner 的私聊里附，群聊不附**，BRIDGE-PERM-2）。回邮件、审批操作、撤回消息、建群改群、增删群成员先起草；owner 私聊里以「确认」或 `/confirm` 开头的那一轮才放行，只管这一轮，群聊里不生效。
+- **对话**：读类 lark-cli 直接用。发消息（`im +messages-send` / `+messages-reply`）、导入云文档（`drive +import`）、建日程（`calendar +create`）直接执行，回复末尾附一行「— 本轮以你名义：…」回执（目标 ID 只显示末 4 位；**回执只在和 owner 的私聊里附，群聊不附**）。回邮件、审批操作、撤回消息、建群改群、增删群成员先起草；owner 私聊里以「确认」或 `/confirm` 开头的那一轮才放行，只管这一轮，群聊里不生效。
 - **定时任务**：只读，没有例外开关。lark-cli 只放行读类子命令，飞书 MCP 只有 6 个读工具，文件只能写 `memory/`、`outbox/`；任务文件里的任何字段都不参与权限判定。
-- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写 `~/code/ias-ops`；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路由 BRIDGE-PERM-2 收窄（frontmatter 白名单重建、`.claude/skills` 整树重建、隔离外来文件、lark-cli 落点闸；覆盖范围与已知缺口见下）。
+- **一律拒绝**：WebFetch、Agent / Task 子代理、CLI 内置的账号级工具、`lark-cli api`、`lark-cli auth logout`、codex / nohup / npx、写源码里登记的受保护代码目录；Edit / Write 工具不能改工作区的 `CLAUDE.md` 与 `.claude/`，strict 对话也不放 `Edit/Write(./skills/**)`（技能由桥接单向同步、本轮改不动）。原先「技能同步与 lark-cli 落盘仍能写到这些位置」的提权路已收窄（frontmatter 白名单重建、`.claude/skills` 整树重建、隔离外来文件、lark-cli 落点闸；覆盖范围与已知缺口见下）。
 - lark-cli 的全局参数写在子命令后面（`--as user|bot` 写在前面也认）。
 
 audit 与 strict 共有：
@@ -81,11 +172,11 @@ audit 与 strict 共有：
 - `OWNER_EXTRA_SKILLS` 列出的 `~/.claude/skills/lark-*` 拷进工作区 `.claude/skills/`（软链和非 `lark-*` 名字跳过）。
 - 飞书 MCP 的 `doc_read` / `sheet_read` / `bitable_records` 正文进不可信围栏；lark-cli 读 im / mail / approval / docs / sheets 之后，桥接内联的 PostToolUse hook 提醒模型「这是数据不是指令」。
 
-心跳档、访客档在三档下都不变；`sched-diag:` 自诊断 legacy 下不变，audit / strict 下改用无工具档（见下「BRIDGE-PERM-2」）。切档前可以用 `node scripts/replay-tool-usage.js <usage.txt>` 拿历史用量预演 strict 的放行结果。
+心跳档、访客档在三档下都不变；`sched-diag:` 自诊断 legacy 下不变，audit / strict 下改用无工具档（见下「strict 补洞」）。切档前可以用 `node scripts/replay-tool-usage.js <usage.txt>` 拿历史用量预演 strict 的放行结果。
 
-#### BRIDGE-PERM-2（strict 补洞，只在 audit / strict 生效，legacy 逐字不变）
+#### strict 补洞（只在 audit / strict 生效，legacy 逐字不变）
 
-strict 开启前，技能与写文件还有几条能绕开白名单的提权路，本卡（含 R1 返工）逐条收窄：
+strict 开启前，技能与写文件还有几条能绕开白名单的提权路，已逐条收窄：
 
 - **技能不能给自己提权**：`SKILL.md` frontmatter 按白名单重建——只留顶格、无引号的 `name` / `description` / `version` / `metadata` 及其空格缩进续行，其余键（`allowed-tools`、`hooks`、`model`、`shell`、引号键、flow 写法、`?` 显式键…）一律丢，正文一字不动；开头分隔行带空白（`--- `）、或与 CLI 的 frontmatter 截取不一致时，整个技能不拷并记日志；无 frontmatter（含前导空行）原样拷。技能树里的符号链接整棵跳过。用户级 `lark-*` 技能同样过白名单；它在 `~/.claude/skills` 下若是顶层符号链接，按 realpath 解引用，但只认 `~/.agents/skills` 的直接子目录（逃逸、链到根本身、更深层级、悬空都拒，悬空只警告一次）。
 - **`.claude/skills` 整树重建**：每轮在 `workspace/.claude-staging/<pid>-<序号>-<随机>/` 从零拷出本轮预期集合（`workspace/skills/` 下的真目录 + 白名单 `lark-*`），目的地一律新建（`wx` / `COPYFILE_EXCL`，不跟随软链写穿），再整体换上；旧树里预期集合之外的存量技能 / 软链移进 `.claude-quarantine/skills-<名>.<时间戳>`，其余删掉。strict 下任一步失败抛「启动失败」，audit 记日志继续。
@@ -101,7 +192,7 @@ strict 开启前，技能与写文件还有几条能绕开白名单的提权路�
 - 系统临时目录（`/tmp`、`$TMPDIR`）整体放行，落点闸不细分其中路径；
 - 内联 shell（`bash -c`、`eval`、`$(…)` 里的写文件）只做了尽力解析，阻断效果待真机 smoke；
 - 钩子超时（CLI 侧 5 秒）时 CLI 的实际放行 / 拒绝行为待真机 smoke；
-- 用户级技能软链目标在 `~/.claude/skills` 根下（而非 `~/.agents/skills`）时暂不拷，待协调者裁定。
+- 用户级技能软链目标在 `~/.claude/skills` 根下（而非 `~/.agents/skills`）时暂不拷，待确认。
 
 ## 🗂️ Agent 工作区（OpenClaw / Hermes 式三层记忆与技能）
 
@@ -173,9 +264,9 @@ workspace/
 `HEARTBEAT_ENABLED` 不是 `true` 时 `on` 会拒绝。`/heartbeat` 只在 owner 私聊里生效：群聊里（包括 owner 本人发的）
 不回复、不读不改心跳状态。台账协议与心跳轮次的提示词约定见
 [`docs/heartbeat-prompt-proposal.md`](docs/heartbeat-prompt-proposal.md)，`watch` 怎么填、外部原文怎么转述见
-[`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md)（都是建议稿，过审后并入 `workspace/CLAUDE.md`）。
+[`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md)（都是[可选的提示词补充](#-可选的提示词补充)）。
 
-### 光总对心跳消息的操作（全部由桥接处理，不调模型）
+### owner 对心跳消息的操作（全部由桥接处理，不调模型）
 
 - **事件**：表情、已读、撤回三类机器人事件和卡片按钮回调（`card.action.trigger`）按确定规则处理，处理函数遇到坏载荷也不抛错。
   只有 owner 本人对心跳消息的表情 / 已读才记信号（`data/heartbeat-signals.json`，下一拍并进状态里的 `read_at` / `reacted_at`）；
@@ -186,7 +277,7 @@ workspace/
   回调 3 秒内返回，回写异步排队；心跳这一拍正在跑时，等这一拍结束再写。
   「知道了」只在心跳状态里记一笔（下次提示词里带上）、不改台账；「推迟一天」把 `next_check_at` / `escalate_after` 各推后一天；已经过期的，从现在起推一天；
   「不做了」把 `status` 改成 `dropped`。改台账只动目标字段和 `updated_at`，不认识的字段原样保留，原子写；
-  每次都在当天 journal 记一行「（桥接）光总点了『…』：tasks/<slug>.json」。
+  每次都在当天 journal 记一行，写明点了哪个按钮、对应哪个 `tasks/<slug>.json`。
 - **引用回复快捷**（`HEARTBEAT_REPLY_SHORTCUTS=true`）：owner 私聊里引用回复心跳消息，正文恰好是「知道了」「推迟一天」「不做了」
   （允许带结尾标点），且那条消息只涉及一条台账 → 桥接按同样的规则回写并回一句确认，不进模型；
   其余引用回复照常进 owner 对话，提示词末尾加一行「（你在回复关于 tasks/<slug>.json 的心跳消息）」。
@@ -210,7 +301,7 @@ workspace/
   沿用原值、记日志，下一条心跳消息末尾说明。
 - 需要本机已安装并以 owner 身份登录 `lark-cli`；`HEARTBEAT_WATCH` 不配时一次 lark-cli 都不跑。
 
-### 验收、升级阶梯与每晚日结（BRIDGE-VR-1，全部默认关闭）
+### 验收、升级阶梯与每晚日结（全部默认关闭）
 
 - **验收**（`HEARTBEAT_VERIFY=rule|rule+model`）：台账多一个状态 `verify`（等验收）和一个可选字段
   `done_evidence: { "kind": "approval|message|owner|other", "ref": "…", "summary": "≤200 字" }`
@@ -218,7 +309,7 @@ workspace/
   依据格式不合规时台账照常有效（不会因此逃出验收）：桥接不取这份依据、记下原因，核对时直接发卡片。
   心跳一拍里被写成 `done` 的台账，桥接在这一拍结束时改成 `verify`——模型说办完了不算数；owner 对话里、桥接自己写的 `done` 照旧。
   之后每拍最多核对 3 条待验收：
-  1. **脚本规则**（只读，只用 EV-1 已有的 lark-cli 模板），结果分三种：
+  1. **脚本规则**（只读，只用外部增量已有的只读 lark-cli 模板），结果分三种：
      - **通过**（桥接写 `done`）只有两种：`approval` 的 ref 等于台账 `watch.instance_code` 且审批状态是 `APPROVED`（已通过）；
        `message` 那条消息在台账 `watch.chat_id` 的会话里、是对方真人发的（不是 owner 本人、机器人、系统消息或已撤回），
        而且发在交办之后——发送时间（10 位按秒、13 位按毫秒）不早于台账 `created_at` 与数字 `watch.after` 中晚的那个；两样都没有就判不了，算不通过。
@@ -238,7 +329,7 @@ workspace/
   或 24 小时内发过同样的，这几条也都登第 1 级；这时不记消息 ID，下一级按没读等满 48 小时；阶梯按钮只给只涉及一条的消息）；之后按固定模板再提醒（不调模型）：
   上一级读了满 24 小时、或没读满 48 小时才升一级（没读不叠发），owner 点过「知道了」就不再升；最多 `ESCALATE_MAX` 级，之后只进日结「卡住」。
   模板消息带［知道了］［推迟一天］［不做了］［办完了］，引用回复也多认「办完了」；`escalate_after` 改了就从第 1 级重新来。
-- **每晚日结**（`HEARTBEAT_DIGEST_AT=HH:MM`）：到点私聊 owner 一份五栏日结——今天办完（注明规则验收 / 模型验收 / 心跳轮写的 / 光总确认 / 会话里改的）、
+- **每晚日结**（`HEARTBEAT_DIGEST_AT=HH:MM`）：到点私聊 owner 一份五栏日结——今天办完（注明规则验收 / 模型验收 / 心跳轮写的 / owner 确认 / 会话里改的）、
   今天放弃、待你验收、卡住、明天到期。每栏最多列 5 条，整条消息不超过 15 行；**五栏都空不发**。
   「今天办完」「今天放弃」从上一份日结的时刻（发出、进待发队列、重复不发、五栏全空都算）往后数，第一次从当天 0 点起：
   日结发完之后才关的单、哪天没发日结那天关的单，都进下一份（带撤销）。
@@ -247,17 +338,17 @@ workspace/
   一天只发一次（重启不重发）；到点后 30 分钟内没发出去（心跳正忙、进程刚起）就不补发。
 - `/heartbeat status` 多三行：验收（档位、待验收条数、今日模型审核次数）、升级阶梯（级数、升级中的条数）、日结时间。
 - 状态文件新增顶层键 `verify` / `history`（含 `digest_at`）/ `verify_runs` 与 `tasks.<slug>.esc` / `tasks.<slug>.rejected_at`，缺了按空处理，不升版本号。
-- 心跳轮怎么写 `done_evidence` 的提示词约定见 [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md)（建议稿，过审后并入 `workspace/CLAUDE.md`）。
+- 心跳轮怎么写 `done_evidence` 的提示词约定见 [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md)（[可选的提示词补充](#-可选的提示词补充)）。
 
 ### 优雅退出（SIGTERM / SIGINT）
 
 收到 SIGTERM / SIGINT 后，桥接不再接新消息，停掉心跳与日结定时器，等进行中的对话做完再退出。进行中的对话包括刚收到、排队中和正在回答的对话轮，跑着的定时任务，以及正在跑的心跳一拍。
 最多等 `SHUTDOWN_GRACE_SEC` 秒（默认 120）。等待期间新来的消息回「正在重启，请稍后重发」；第二次信号立即退出。
-用 launchd 托管时，plist 的 `ExitTimeOut` 要不小于 `SHUTDOWN_GRACE_SEC` 再加 10 秒。默认的 `examples/launchd.example.plist` 和 `scripts/install-service.js` 没设这一项，launchd 会按系统默认值提前强杀。
-开了 `OWNER_MESSAGE_QUEUE`（见下节）时，owner 私聊里还没轮到的排队消息逐条回「助理正在重启，这条没处理，请稍后重发」，这些回复发完才退出；进行中的那轮做完后不再出队。
+用 launchd 托管时，plist 的 `ExitTimeOut` 要不小于 `SHUTDOWN_GRACE_SEC` 再加 10 秒，否则 launchd 会按系统默认值（约 20 秒）提前强杀。`npm run install-service` 生成的 plist 已按当前 `SHUTDOWN_GRACE_SEC` 写好这一项，改了 `SHUTDOWN_GRACE_SEC` 要重跑一次；手写 plist（参考 `examples/launchd.example.plist`）时要自己加。systemd 示例对应的是 `TimeoutStopSec=130`。
+开了 `OWNER_MESSAGE_QUEUE`（见下文「忙时连续发消息」）时，owner 私聊里还没轮到的排队消息逐条回「助理正在重启，这条没处理，请稍后重发」，这些回复发完才退出；进行中的那轮做完后不再出队。
 以下情况排队消息会直接丢掉，也不会回「请稍后重发」，需要你自己重发：`SHUTDOWN_GRACE_SEC=0`、等待期间又收到一次信号、被 SIGKILL、进程崩溃、launchd 提前强杀（plist 的 `ExitTimeOut` 没设够，见上）。
 
-## 📨 忙时连续发消息：排队、合并、接着办（默认关闭，BRIDGE-MQ-1）
+### 📨 忙时连续发消息：排队、合并、接着办（默认关闭）
 
 `OWNER_MESSAGE_QUEUE=true`（精确等于 `true`）时，**只在 owner 私聊里**：助理正在办一件事时，接着发来的普通消息不再回「⏳ 上一个任务还在跑…」，而是排进内存队列，手头这轮一结束就接着办。
 群聊、访客、非 owner、定时任务、心跳完全不受影响；不设或设成别的值时，行为与以前逐项相同。
@@ -273,7 +364,7 @@ workspace/
 - **接着办**：当前这轮结束（答完、出错、被取消都算）后，把此刻队列里的消息按到达顺序一次取走：
   - 更早发来、还没接收完的消息（比如附件还在下载）会先等它处理好（最多 30 秒）再一起取，免得后发的先办；30 秒还没好就先办已排好的，它好了进下一轮，不会丢；
   - 只有 1 条：照平时那样办（引用回复快捷、台账提示都和空闲时直接发一样；确认通道例外，见下），回复挂在这条上；
-  - 多条：合并成一轮，开头说明「以下是你忙的时候光总连续发来的消息，按顺序一并处理；后面的消息可能是对前面的补充或更正」，每条前标「第 N 条（HH:MM）」，
+  - 多条：合并成一轮，开头注明这些是你在它忙的时候连续发来的消息、要按顺序一并处理、后面的可能是对前面的补充或更正，每条前标「第 N 条（HH:MM）」，
     回复挂在最后一条上；其中任一条是执行指令（`/do`、「执行」等）就整轮走执行车道。
   - 合并这一轮期间新来的消息继续排队，等它结束再取。
 - **排队的「确认」不放行、合并轮不走引用回复快捷**：strict 档下合并的消息里即使有「确认」也不算数，桥接会提示单独再回一次「确认」；
@@ -286,43 +377,6 @@ workspace/
 - **重启**：队列只在内存里，不落盘；优雅退出时还没轮到的消息逐条回「助理正在重启，这条没处理，请稍后重发」，不会悄悄丢掉（例外：不等、二次信号、强杀、崩溃，见「优雅退出」）。
 - 排队的文字和平时一样按 owner 本人的输入对待，引用 / 转发的第三方内容照旧装在不可信围栏里；合并后的提示词照旧经 stdin 交给 claude，不进命令行。
 
-## 快速开始 Quick Start
-
-**前置条件：Node ≥ 18**（下面第一条命令就要用到）。没有 Node 也没有 Homebrew 时，用官方 tarball 免 sudo 安装：
-
-```bash
-V=v24.21.0   # 到 https://nodejs.org/dist/ 看最新 LTS；建议同时校验 SHASUMS256.txt
-curl -fsSL -o node.tar.xz "https://nodejs.org/dist/$V/node-$V-darwin-arm64.tar.xz"   # Intel Mac 换 darwin-x64
-mkdir -p ~/.local && tar -xJf node.tar.xz -C ~/.local && mv ~/.local/node-$V-darwin-arm64 ~/.local/node
-echo 'export PATH="$HOME/.local/node/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
-```
-
-可选：ffmpeg（语音兜底转写）。
-
-```bash
-npm install -g @anthropic-ai/claude-code   # 安装/更新 Claude Code CLI
-claude /login                              # 弹出登录选项，浏览器完成授权
-
-git clone https://github.com/demry-max/feishu-claude-bridge.git
-cd feishu-claude-bridge
-npm install
-npm run register       # 飞书 App 扫码 → 应用自动创建，凭据与 OWNER_OPEN_ID 自动写入 .env
-#   ↑ 结束时会打印一段 scope JSON：到开发者后台「权限管理 → 批量导入」粘贴并发布版本
-#     （注册接口建出来的应用是零权限，不做这步文档/多维表格工具用不了；聊天不受影响）
-npm run doctor         # 体检：Node / npm / claude 登录 / .env / 工作区 / 飞书 scope，能自动修的直接修
-npm start              # 日志出现 [ws] ws client ready 即成功
-```
-
-然后在飞书里私聊机器人发「你好」。
-
-> `npm install` 在 npm ≥ 11 上会打印 `npm warn install-scripts …`（`@anthropic-ai/claude-code`、`protobufjs`）——
-> 这是 npm 11 起对依赖 install 脚本的默认提示，**不是安装失败**，`claude --version` 能跑即可。
-
-- 开机自启（macOS）：`npm run install-service`——用当前 node、本仓库目录与 `which claude` 的结果生成 plist 并立即启动，不用手改占位符；`npm run uninstall-service` 卸载；`LAUNCHD_LABEL` 可指定 label。（[examples/launchd.example.plist](examples/launchd.example.plist) 仅供参考）
-- 开机自启（Windows）：`powershell -ExecutionPolicy Bypass -File scripts\windows\install-startup.ps1`
-- 完整部署手册（可直接丢给 Claude Code 执行）：[docs/飞书-Claude-机器人架设方案.md](docs/飞书-Claude-机器人架设方案.md)
-- 扫码注册失败时的手动配置：见手册附录 A
-
 ## 🚦 模型分工：聊天/规划 vs 执行
 
 ```
@@ -333,7 +387,7 @@ CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EF
 
 - 触发执行车道：消息以 `/do`、`/exec`、`/run` 开头（前缀会被剥掉），或句首是「执行」「开始执行」「去做」「动手」「go」「do it」等触发词（`EXEC_TRIGGERS` 可整体覆盖）。裸 `/do` = 「按上面已确认的计划执行」。
 - 判定是**确定性的**（前缀/句首词边界），不靠模型猜：「执行力很重要」「google 一下」都不会误切。
-- 执行轮通过 `--resume` 复用同一会话：sonnet 5.5 看得见 fable 刚谈妥的计划。桥接会在系统提示词里告诉模型本轮车道与分工。
+- 执行轮通过 `--resume` 复用同一会话：执行模型看得见聊天模型刚谈妥的计划。桥接会在系统提示词里告诉模型本轮车道与分工。
 - 定时任务默认走执行车道（任务定义里写 `model` 可覆盖）；失败自诊断仍用 `DIAG_MODEL`。
 - `/model` 查看两个模型；`/model exec sonnet` 改执行模型、`/model exec off` 关闭分工；`set-model` 定时动作支持 `exec_model` / `exec_effort` 字段。
 
@@ -351,7 +405,18 @@ CLAUDE_EXEC_EFFORT=          # 执行车道的思考档，留空沿用 CLAUDE_EF
 
 **不支持**（租户身份答不了，或根本没做）：审批、日历、任务、通讯录、云盘文件列表、消息历史检索、视频会议、打卡、OKR。
 
-想要这些，接飞书官方 [lark-cli](https://github.com/larksuite/cli)（22 个业务域 200+ 命令，走**用户 OAuth**，凭据在系统钥匙串）：`npx @larksuite/cli@latest install` 登录后，在 `.env` 设 `LARK_CLI=true`。桥接只给 owner 加一条 `Bash(lark-cli:*)`——实测 `lark-cli x && whoami` 这类拼接被挡，`env` / `ps aux` / `curl` 被拒，机器人读不到 `.env` 里的 App Secret；`whoami` / `pwd` 这类 CLI 内置的无害只读命令会放行。访客永远拿不到它。
+想要这些，接飞书官方 [lark-cli](https://github.com/larksuite/cli)（22 个业务域 200+ 命令，走**用户 OAuth**，凭据在系统钥匙串）：`npm install -g @larksuite/cli` 装好命令 → `npm run setup -- --link-lark-cli` 让它用桥接同一个应用 → `lark-cli auth login --recommend` 以 owner 身份登录（要人在浏览器同意）→ 在 `.env` 设 `LARK_CLI=true`（步骤见 [AGENTS.md §3C](AGENTS.md#3c-让-lark-cli-用同一个应用可选只在要用-lark-cli-功能时)）。不要再跑 `lark-cli config init --new`，那会多建一个应用。桥接只给 owner 加一条 `Bash(lark-cli:*)`——实测 `lark-cli x && whoami` 这类拼接被挡，`env` / `ps aux` / `curl` 被拒，机器人读不到 `.env` 里的 App Secret；`whoami` / `pwd` 这类 CLI 内置的无害只读命令会放行。访客永远拿不到它。
+
+## 🧩 可选的提示词补充
+
+`workspace/CLAUDE.md` 是 owner 的提示词模板，仓库默认不改它。下面四份是配合可选功能的提示词补充，按需并入 `workspace/CLAUDE.md`。不并入功能照样工作，模型只是不知道相应的约定：
+
+| 文档 | 内容 | 前提 |
+|---|---|---|
+| [`docs/heartbeat-prompt-proposal.md`](docs/heartbeat-prompt-proposal.md) | 交办台账（`tasks/`）的写法、心跳轮次的约定 | 打开心跳时 |
+| [`docs/ev-prompt-proposal.md`](docs/ev-prompt-proposal.md) | `watch` 怎么填、外部原文怎么转述、心跳消息上的操作 | 先并入上一份 |
+| [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md) | `verify` 状态与 `done_evidence` 的写法、升级阶梯、日结 | 先并入上两份 |
+| [`docs/owner-tools-prompt-proposal.md`](docs/owner-tools-prompt-proposal.md) | 工具描述修正、audit / strict 工具档下的用法 | 切换工具档时 |
 
 ## 架构 Architecture
 
@@ -370,9 +435,10 @@ Markdown 卡片回复（失败自动降级纯文本）+ 表情回执
 
 ## 安全 Security
 
-- `.env`（App Secret）与运行数据均被 `.gitignore` 排除
-- 非 owner 无任何本机文件访问权限；附件目录仅只读放行
-- 默认只授予 Claude 只读工具；请勿给无人值守机器人开 Write/Bash
+- `.env`（App Secret、可选的 `CLAUDE_CODE_OAUTH_TOKEN`）与运行数据 `data/`、工作区内容均被 `.gitignore` 排除。不要提交，不要贴进聊天。`npm run setup` / `doctor` 只报「齐 / 缺」，不输出值。
+- 非 owner 无任何本机文件访问权限；附件目录仅只读放行。
+- owner 默认只有本机只读工具，外加受限目录（`memory/`、`skills/`、`schedules/`、`tasks/`、`outbox/`）的写入。不要给无人值守机器人开 Bash，不要加 `--dangerously-skip-permissions`。
+- 想进一步收紧 owner 的工具面：先用 `OWNER_TOOL_PROFILE=audit` 观察审计日志，再切 `strict`。
 
 ## License
 

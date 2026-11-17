@@ -4,10 +4,37 @@
 
 ## [Unreleased]
 
+### 安装与文档（让没见过仓库的 AI agent 只凭链接装到可用）
+
+- **新增 `AGENTS.md`**：给 AI agent 的安装手册——每步「命令 / 预期 / 失败怎么办」，`[需要人]` 步骤附中英双语转告话术与核验命令；
+  已有 App ID/Secret 与全新建应用两条路径；安全须知、验收清单、升级 / 回滚 / 卸载、可选功能总表。README 顶部提示「把仓库链接交给 AI agent 时先读 AGENTS.md」。
+- **新增 `npm run setup`**（`scripts/setup.js`，可重复执行）：Node → 依赖 → claude CLI 与版本 → 登录态（`claude auth status`，拿不准报「未能确认」）
+  → `.env` 不存在则从 `.env.example` 生成（权限 600）→ 必填项 → doctor。`--json` 每项 `id / status(ok|warn|fail|needs_human) / message / fix`；
+  退出码 0 全绿 / 2 只差人 / 1 有失败。`--set-owner <ou_…>` 写 OWNER_OPEN_ID；OWNER_OPEN_ID 未填时从日志里找「owner 未登记时私聊过机器人的人」。不输出任何密钥值。
+- **`npm run doctor`**：新增 `--json`（三态退出码）与 `--root`；依赖没装时报「先 npm ci」而不是抛 `ERR_MODULE_NOT_FOUND`；找不到 claude 时给安装命令、不再倾倒整条 PATH；
+  登录邮箱打码；新增常驻服务（launchd plist / PATH 里的 claude / ExitTimeOut）、shell 环境变量覆盖 `.env`、`.env` 值格式、lark-cli / ffmpeg 检查。文本输出格式与退出码 0/1 不变。
+- **`npm run register`**：新增 `--no-wait`（打印扫码链接、保存设备码后退出，退出码 2）与 `--resume [--timeout 秒]`（人扫完后取回凭据）；
+  没有 TTY 时默认两段式，不再阻塞 10 分钟；`.env` 已有凭据时默认拒绝（避免重复建应用），`--force` 才继续；写凭据前先从 `.env.example` 生成完整 `.env`；
+  不打印 App Secret；国际版的后台链接改为 `open.larksuite.com`；`FEISHU_DOMAIN` 从仓库根目录的 `.env` 读，不再依赖当前目录。
+- **`npm run install-service`**：plist 写入 `ExitTimeOut = SHUTDOWN_GRACE_SEC + 10`（launchd 默认约 20 秒强杀，优雅退出等不完）；`LAUNCHD_LABEL` / `CLAUDE_BIN` 也读 `.env`；装完打印核验命令。
+- **飞书应用由安装过程自动生成，不再要求到开发者后台手工建应用**：默认 `npm run register` 扫码（与 lark-cli `config init --new` 同一个注册接口，每扫一次码一个新应用）；
+  新增 `npm run setup -- --link-lark-cli`（`scripts/lib/lark-link.js`）：用 `lark-cli config init --app-id … --app-secret-stdin --brand …` 让 lark-cli 用 `.env` 里同一个应用，Secret 只走 stdin；
+  lark-cli 已配置别的应用时报 🙋、加 `--force` 才替换。`npm run setup` 新增 `lark_cli_app` 一项（只读 `lark-cli config show` 的 appId；没装 lark-cli 不报）。
+- **新增 `examples/feishu-claude-bridge.service`**：Linux systemd 用户服务示例（本仓库不自动安装）。
+- README.md / README.en.md 重写快速开始与功能列表（逐项写默认状态），中英文对齐，去掉内部称呼与内部路径；
+  `docs/*-prompt-proposal.md` 去内部化，作为「可选的提示词补充」；旧版从零手写部署手册标注为过时、改指向 AGENTS.md。
+- **安装加固**：`npm run register` 在上一条扫码链接没过期时不再重新申请（只重新打印同一条链接和剩余秒数，退出码 2），`--restart` 才作废重来；
+  `--resume` 按 pending 里记下的 domain 轮询；register / `setup --set-owner` / doctor 补 owner 写完收紧回 600；`npm run setup` 每次都会把已有 `.env` 收紧为 600。
+  owner 候选：日志里只有 1 人时才预填 `--set-owner`，≥2 人只列出、不给命令；`--set-owner` 遇到不同的已有 owner 拒绝覆盖（`--force` 才换），相同值不改动；文档改为 `npm start > bridge.log` 覆盖旧日志。
+  `install-service` 发现同 label 的 plist 指向别的目录时拒绝覆盖（退出码 1，`--force` 才改）；doctor 的 `service` 对这种情况只报一条 ⚠️，owner 日志也不再读别的目录的 launchd 日志。
+  文档里要解析的 JSON 一律 `npm run -s …`（去掉 npm 横幅）；systemd 示例加 `KillMode=mixed`（停止时只给主进程发 SIGTERM，进行中的 claude 不被一起杀）；
+  `--link-lark-cli` 先校验 App ID 以 `cli_` 开头；`claude auth status` 子进程只额外传 `CLAUDE_CODE_OAUTH_TOKEN`。
+- 测试：新增 `test/setup.test.js`、`test/register.test.js`（假 fetch，不调真实 claude、不连飞书、不装服务）；既有测试一个未改。
+
 ### 新增
 
-- **心跳第二步：机器人事件 + 按钮 + 外部增量（新能力默认全关，BRIDGE-EV-1）**：表情 / 已读 / 撤回事件与卡片按钮回调
-  （`card.action.trigger`）接成「光总对心跳消息的操作」信号，全部由桥接按确定规则处理、不调模型；`sendMarkdown` 返回
+- **心跳第二步：机器人事件 + 按钮 + 外部增量（新能力默认全关）**：表情 / 已读 / 撤回事件与卡片按钮回调
+  （`card.action.trigger`）接成「owner 对心跳消息的操作」信号，全部由桥接按确定规则处理、不调模型；`sendMarkdown` 返回
   `message_id`（降级纯文本也返回），心跳消息记索引（最多 200 条、保留 14 天）。`HEARTBEAT_BUTTONS=true` 时只涉及一条台账的
   心跳消息带［知道了］［推迟一天］［不做了］：回调校验 owner、索引、nonce、台账后才异步回写（原子写、未知字段保留、journal 记一行），
   否则回「已失效」、不改任何文件；`HEARTBEAT_REPLY_SHORTCUTS=true` 时引用回复的同名短语确定性处理，其余引用回复带台账提示行进对话。
@@ -18,7 +45,7 @@
   队满丢最旧一条，两者都在下一条成功发出的消息末尾说明；`/heartbeat status` 增加外部增量、watch、按钮、暂停与今日事件计数。
   新增 `.env` 项 `HEARTBEAT_WATCH_MAX` / `_BUTTONS` / `_REPLY_SHORTCUTS` / `_UNREAD_PAUSE`、`LARK_CLI_BIN`。
   `sonnet` 别名与 `HEARTBEAT_MODEL` 默认值统一为 `claude-sonnet-5-5`（`haiku` 别名、`DIAG_MODEL` 不变）。
-- **桥接自带心跳（默认关闭，BRIDGE-HB-1）**：交办台账 `workspace/tasks/<slug>.json`（一事一个 JSON，
+- **桥接自带心跳（默认关闭）**：交办台账 `workspace/tasks/<slug>.json`（一事一个 JSON，
   open/waiting/done/dropped）。每拍先由脚本读台账，有到期项才调一次模型（`sched:heartbeat`，不续会话、
   无中间进度、自带互斥锁），提示词只含到期条目、title/notes 进不可信围栏；答复不是 `HEARTBEAT_OK` 才以应用身份
   私聊 owner。每日调用上限（按本地日期，重启不清零）、免打扰时段（期间只记状态，结束后合并成一条）、
@@ -29,29 +56,29 @@
   写入只预批 `tasks/` 与 `memory/journal/`；无 Bash、lark-cli、联网、飞书 MCP，显式拒绝改 `schedules/`。
 - **`/heartbeat on|off|status`**（仅 owner）：只改运行时开关、不写 `.env`；配置未启用时 `on` 拒绝并说明。
 - owner 默认工具集新增 `Edit(./tasks/**)`；工作区启动时建 `tasks/`。
-- **心跳反复到期退避（BRIDGE-HB-1B）**：同一条台账连续 3 次被成功送进模型、文件内容哈希一直没变，
+- **心跳反复到期退避**：同一条台账连续 3 次被成功送进模型、文件内容哈希一直没变，
   之后每再送一次就按 1 → 2 → 4 → 8 拍递增跳过（封顶 8 拍），文件一变即清零；`escalate_after` 首次越过的那一拍
   不受退避影响。退避中的条目不进提示词、不占每日次数（到期项全在退避里时整拍不调模型，动作记为 `backoff`）；
   退避状态（`stale_runs` / `skip_left` / `escalated`）放 `data/heartbeat-state.json`，`/heartbeat status` 显示退避中的条数。
 
 ### 修复
 
-- **心跳每日计数遇时钟回拨被清零（BRIDGE-HB-1B）**：旧实现只要本地日期与记录日期不同就把计数归零，
+- **心跳每日计数遇时钟回拨被清零**：旧实现只要本地日期与记录日期不同就把计数归零，
   时钟往回拨一下（或回拨后再追回）每日上限就整份重新放出。现在只有本地日期晚于记录日期才翻日；
   日期变早时沿用原日期与计数，并每拍记一行「本机时钟回拨」日志。
-- **群聊里的 `/heartbeat` 会回复并改状态（BRIDGE-HB-1B）**：现在只在 owner 私聊生效；群聊里（包括 owner 本人发的、
+- **群聊里的 `/heartbeat` 会回复并改状态**：现在只在 owner 私聊生效；群聊里（包括 owner 本人发的、
   `chat_type` 缺失或不认识的）不回复、不读不改心跳状态，也不落到 Claude。
-- **心跳新消息插队、单拍发送超额（BRIDGE-HB-1B）**：待发队列没补发完（含本拍补发失败）时，本拍新产生的消息
+- **心跳新消息插队、单拍发送超额**：待发队列没补发完（含本拍补发失败）时，本拍新产生的消息
   排到队尾、不再直接发；一拍合计（补发的包 + 新消息）最多发 3 条，超出的下一拍按原顺序再发。
 - **调度器并发已满时触发永久丢失**：旧实现先把任务标成 `running` 再检查并发，被挡下的这次触发在下一拍
   因 `due <= last` 被当成「已经跑过」跳过，状态还一直停在 `running`。现在先查并发、被挡的不留占位，下一拍照常触发。
 
 ### 测试
 
-- BRIDGE-HB-1B 补测：待发队列首包（或唯一一包）发送失败时队列原样保留、下一拍补发；cron 任务并发已满被延后后
+- 心跳补测：待发队列首包（或唯一一包）发送失败时队列原样保留、下一拍补发；cron 任务并发已满被延后后
   逐拍补跑并当天落 `done`（新文件 `test/scheduler-cron-defer.test.js`）；心跳提示词永远不以 `/` 开头。
 
-### BRIDGE-PERM-1
+### owner 工具档（第一步）
 
 - **owner 工具档 `OWNER_TOOL_PROFILE=legacy|audit|strict`（默认 `legacy`，合入后线上行为不变）**：策略表
   `src/tool-policy.js`（纯数据 + 纯函数）把 lark-cli 按子命令分成 read / write / confirm / chat-only / deny 五级，
@@ -61,7 +88,7 @@
 - **strict 档**：内置工具白名单 `Read,Grep,Glob,Edit,Write,Bash,WebSearch,ToolSearch,Skill`，lark-cli 按策略表逐条放行
   （每条子命令兼容 `--as user|bot` 前置写法）。发消息 / 导入云文档 / 建日程直接执行并在回复末尾附回执；回邮件、审批、
   撤回消息、建群改群、增删群成员先起草，owner 私聊以「确认」或 `/confirm` 开头的那一轮才放行。定时任务只读、
-  没有例外开关。一律拒绝 WebFetch、Agent / Task、账号级工具、`lark-cli api`、codex / nohup / npx、写 ias-ops。
+  没有例外开关。一律拒绝 WebFetch、Agent / Task、账号级工具、`lark-cli api`、codex / nohup / npx、写 owner 指定的受保护代码目录。
   strict 下 `ALLOWED_TOOLS` 与 `LARK_CLI` 不起作用。
 - **审计与每日汇总**（audit / strict）：stream 里的 tool_use / tool_result / `permission_denials` 写进
   `data/tool-audit.jsonl`（8 个键、命令名过白名单，不记参数正文；超过 5MB 轮转一份）；`TOOL_AUDIT_SUMMARY_AT`
@@ -74,19 +101,19 @@
 - 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md`（本版不改 `workspace/CLAUDE.md`）。
 - 测试：新增 `test/tool-policy.test.js`、`test/owner-profiles.test.js`、`test/tool-audit.test.js` 与两个夹具；既有测试一个未改。
 
-### BRIDGE-VR-1
+### 验收、升级阶梯与每晚日结
 
 - **验收（`HEARTBEAT_VERIFY=off|rule|rule+model`，默认 `off`）**：台账新增状态 `verify` 与可选字段 `done_evidence`
   （`kind` ∈ approval / message / owner / other，`ref` 按 kind 校验，`summary` ≤200 字；不合规时台账照常有效，记下原因、核对时直接发卡片）。
   开着时，心跳一拍里新写成 `done` 的台账在这一拍结束时改成 `verify`；owner 对话与桥接写的 `done` 不动。
-  脚本规则（只读，只调 EV-1 已有的 `approvalGet` / `messageGet`）分通过 / 不通过 / 核对不了三种：只有审批状态 `APPROVED`、
+  脚本规则（只读，只调外部增量已有的 `approvalGet` / `messageGet`）分通过 / 不通过 / 核对不了三种：只有审批状态 `APPROVED`、
   或对方真人在交办（`created_at` 与数字 `watch.after` 中晚的那个）之后在 watch 的会话里回了消息才算通过，由桥接写 `done`；
   审批被拒绝 / 撤回 / 删除、还没通过、ref 对不上、owner 本人发的、早于交办、查询失败、依据格式不合规都算不通过，直接发卡片、不问模型。
   只有核对不了的（没写依据、`kind=other`、模型写的 `kind=owner`）在 `rule+model` 档用 `VERIFY_MODEL`
   （默认 `claude-haiku-5-5`，每日 `VERIFY_MAX_PER_DAY` 次，默认 10）审核一次，只认一行严格 JSON。`pass` 写 `done`，
   `fail` / `unsure` / 格式不对 / 调用失败一律发「🔍 待你验收」卡片：［验收］［没办完］［不做了］或引用回复同名短语。
-  光总点过「没办完」或在日结里撤销过的台账按台账记下（`tasks.<slug>.rejected_at`），之后再写 `done` 不论依据改没改一律发卡片，
-  光总验收或点［办完了］后清掉。
+  owner 点过「没办完」或在日结里撤销过的台账按台账记下（`tasks.<slug>.rejected_at`），之后再写 `done` 不论依据改没改一律发卡片，
+  owner 验收或点［办完了］后清掉。
 - **verifier 工具档**（`toolProfile:'verifier'`，仅 owner 调用生效）：`--tools ''`、`--setting-sources ''`、`--strict-mcp-config`，
   不续会话、`--effort low`，cwd 为每次新建、用完即删的系统临时目录（只删 `os.tmpdir()` 正下方 `feishu-verifier-` 开头的那个）；
   owner / 定时 / 心跳 / 访客四类 argv 逐字不变。
@@ -104,9 +131,9 @@
 - 状态文件 `data/heartbeat-state.json` 新增顶层键 `verify` / `history` / `verify_runs` 与 `tasks.<slug>.esc`，缺了当空，不升版本号。
 - 提示词改动另见建议稿 `docs/vr-prompt-proposal.md`（本版不改 `workspace/CLAUDE.md`）。
 - 测试：新增 `test/verifier.test.js`、`test/digest.test.js`、`test/shutdown.test.js` 与共用夹具 `test/vr-harness.js`；
-  `test/heartbeat.test.js`、`test/owner-tools.test.js` 只在本卡的 describe 块里加用例与断言，EV-1 / HB-1B 既有断言一条未改。
+  `test/heartbeat.test.js`、`test/owner-tools.test.js` 只新增用例与断言，既有断言一条未改。
 
-### BRIDGE-PERM-2
+### owner 工具档（第二步：strict 补洞）
 
 > strict 档补洞：技能 / `.claude` 提权路、写文件落点、排查诊断工具面、群聊回执。全部只在 `audit` / `strict` 下生效，`legacy` 逐字不变。
 
@@ -127,11 +154,11 @@
   （外加 `--disallowedTools` 黑名单兜底、`autoMemoryEnabled:false`），`job.prompt` 与报错包进随机 nonce 的不可信围栏；legacy 的排查诊断逐字不变。
 - **群聊不附回执（Q3）**：owner 以名义对外的动作，回执「— 本轮以你名义：…」只在 owner 私聊（`p2p`）末尾追加；
   群聊轮不附回执（群里的写动作仍照常记审计）。
-- 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md` §五（本版不改 `workspace/CLAUDE.md`）。本卡未引入新 `.env` 项。
+- 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md` §五（本版不改 `workspace/CLAUDE.md`）。这一步未引入新 `.env` 项。
 - 测试：新增 `test/owner-profiles-perm2.test.js`（legacy 全矩阵回归、同步树、隔离 + 剥键、fail-closed、Q1-B、sched-diag）、
   `test/tool-policy-output.test.js`（落点闸纯函数 / 真实软链逃逸 / 审计 judge 闸 / 钩子子进程 / 词法分类对基线逐字回归）与两个夹具；
   既有 `test/owner-profiles.test.js`、`test/tool-audit.test.js` 各补测。
-- **R1 返工（审查 §9）**：
+- **第一轮修正**：
   - `.claude/skills` 改为整树重建（`.claude-staging/<pid>-<序号>-<8 位随机 hex>/` 暂存后整体换上），存量外来技能 / 软链进
     `.claude-quarantine/skills-<名>.<时间戳>`；拷贝目的地一律 `wx` / `COPYFILE_EXCL` 新建，不再跟随软链写穿。
   - `SKILL.md` frontmatter 从「黑名单剥键」改为「白名单重建」（只留 `name` / `description` / `version` / `metadata`）；开头分隔行带空白、
@@ -143,10 +170,10 @@
   - 钩子只静态 import `node:*`，判定模块动态加载，加载失败 / 未捕获异常都 `exit 2`。
   - 新增导出 `usesEqAsPrefix`：`lark-cli --as=user …` 在审计判定里一律 deny（`classifyCommand` / strict argv 不变）。
   - sched-diag（audit / strict）任务名单行化、限 80 字。
-  - 测试：新增 `test/skills-sync-perm2.test.js`，`test/tool-policy-output.test.js` / `test/owner-profiles-perm2.test.js` 补 `测PERM2-R1-*`。
-- **R2 返工**：隐式落点所在那一段自己用 `env -C` / `--chdir` / 嵌套 `sh -c` 的 `cd` 改了目录时不按 `cd` 链判、退回全部 base；用户级技能软链只认 `~/.agents/skills`（协调者裁定，删去被跳过的 R1-4b）；补测 `测PERM2-R2-1..5`。
+  - 测试：新增 `test/skills-sync-perm2.test.js`，`test/tool-policy-output.test.js` / `test/owner-profiles-perm2.test.js` 补用例。
+- **第二轮修正**：隐式落点所在那一段自己用 `env -C` / `--chdir` / 嵌套 `sh -c` 的 `cd` 改了目录时不按 `cd` 链判、退回全部 base；用户级技能软链只认 `~/.agents/skills`；补测对应用例。
 
-### BRIDGE-MQ-1
+### owner 私聊忙时连续发消息（排队、合并、接着办）
 
 > 助理忙时 owner 可以连续发消息：排队、合并、接着办。新开关 `OWNER_MESSAGE_QUEUE` 默认关，关着时与以前逐项相同。
 
@@ -155,19 +182,19 @@
   「排队已满（10 条），等手头的办完再发」、不入队）。入队成功加表情（`OnIt`，与开轮时同一个）；加表情失败退回为每一轮忙碌期只回一次
   「收到，办完手头的接着办这条」。附件 / 图片 / 富文本照现有接收路径在入队前处理好，失败照旧当场告知。
 - **接着办**：当前轮结束（答完、出错、被取消、整轮抛异常都算）后一次取走此刻队列里的全部消息：1 条照平时路径（引用回复快捷、
-  台账提示与空闲时直接发完全相同；确认通道例外，见下「复审返工 R1」）；多条按到达顺序合并成一轮，开头说明「以下是你忙的时候光总连续发来的消息，
-  按顺序一并处理；后面的消息可能是对前面的补充或更正」，每条前标「第 N 条（HH:MM）」，回复挂最后一条，任一条是执行指令就整轮走执行车道。
-  合并轮不触发确认通道（strict 档下其中的「确认」不算数，并提示光总单独再回「确认」），也不触发引用回复快捷（快捷只在到达时判定一次）。
+  台账提示与空闲时直接发完全相同；确认通道例外，见下「第一轮修正」）；多条按到达顺序合并成一轮，开头注明这些是 owner 在助理忙时
+  连续发来的消息、按顺序一并处理、后面的可能是对前面的补充或更正，每条前标「第 N 条（HH:MM）」，回复挂最后一条，任一条是执行指令就整轮走执行车道。
+  合并轮不触发确认通道（strict 档下其中的「确认」不算数，并提示 owner 单独再回「确认」），也不触发引用回复快捷（快捷只在到达时判定一次）。
 - **取消与生命周期命令**：`/cancel`（或「取消」）取消并清空队列，同一条回复里说明清掉几条；`/redirect X` 取消、清空（另回一句条数）、只按 X 重来；
   `/new` 照旧处理，队列非空时一并清空并先回一句清掉几条；`/voice`、`/tasks` 等其它命令不清队列。`/status` 在 owner 私聊（开关开着）多一行「排队消息: N 条」。
 - **优雅退出**：还没轮到的排队消息逐条回「助理正在重启，这条没处理，请稍后重发」，这些回复发完前不退出（计入进行中）；进行中那轮做完后不再出队。
 - 群聊、访客、非 owner、定时任务、心跳完全不变；排队文字按 owner 输入对待，第三方内容的不可信围栏原样保留，合并 prompt 照旧经 stdin 传给 claude。
 - 新增 `src/message-queue.js`；`src/index.js` 把原 `handleMessage` 末段原样拆成 `runTurn(spec)`（出队时复用同一条路径），`enqueue` 挂轮次开始 / 结束钩子，
   `react` 返回是否加上（既有调用方不看返回值）。测试：新增 `test/message-queue.test.js`（MQ-1…MQ-10，执行 index.js 真实代码段、依赖全桩），既有测试一条未改。
-- **复审返工 R1**：
+- **第一轮修正**：
   - `/voice`、`/voice on|off`、`/tasks` 不再清队列（只有 `/new`、`/cancel`、「取消」、`/redirect` 清）；
   - 入队表情改为 `OnIt`（仓库里 runTurn 开轮时每轮都在用的那个；原先选的类型没核实过）；
-  - strict 档下单独排队的「确认」出队时不放行确认级操作（排队期间上一轮可能已出新草稿），原样交给模型并提示光总看完最新回复再单独回「确认」；
+  - strict 档下单独排队的「确认」出队时不放行确认级操作（排队期间上一轮可能已出新草稿），原样交给模型并提示 owner 看完最新回复再单独回「确认」；
   - 附件下载慢时出队先等更早到、还没接收完的消息（最多 30 秒，`ARRIVAL_HOLD_MS`），合并仍按到达顺序；下载失败照旧告知、不拖住后面的；到点先办已排好的，迟到的进下一轮；
   - 文档写明优雅退出的例外：`SHUTDOWN_GRACE_SEC=0`、二次信号、SIGKILL、崩溃、launchd 提前强杀时排队消息直接丢、不回「请重发」。
 

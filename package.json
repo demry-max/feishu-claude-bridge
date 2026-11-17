@@ -9,7 +9,8 @@
     "register": "node scripts/register.js",
     "install-service": "node scripts/install-service.js",
     "uninstall-service": "node scripts/uninstall-service.js",
-    "doctor": "node scripts/doctor.js"
+    "doctor": "node scripts/doctor.js",
+    "setup": "node scripts/setup.js"
   },
   "keywords": [],
   "author": "",

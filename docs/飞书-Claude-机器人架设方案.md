@@ -1,6 +1,12 @@
-# 飞书 ⇆ Claude 机器人部署手册
+# 飞书 ⇆ Claude 机器人部署手册（已过时，仅供参考）
 
-> **给 Claude 的指令**：按步骤 1→11 顺序执行，源码原样写入不要改动。全程自动，唯一人工动作是步骤 9 用户扫码。
+> ⚠️ **已过时，请勿照此执行。** 本文是项目早期「从零手写源码」的部署手册，里面的源码与现在仓库里的 `src/` 不一致；
+> 照它把源码「原样写入」会覆盖掉当前代码。**安装请看仓库根目录的 [`AGENTS.md`](../AGENTS.md)**（给 AI agent）或 [`README.md`](../README.md)（给人）。
+> 本文只保留作背景参考：现在飞书应用由 `npm run register` 扫码自动生成，**不要再手工建应用**；附录 A（开发者后台配置）只适用于沿用已有应用（AGENTS.md §3B）时对照检查。附录 B（订阅令牌 `claude setup-token`）的思路仍然适用。
+>
+> **This document is obsolete — do not follow it.** Install with [`AGENTS.md`](../AGENTS.md) instead.
+
+> ~~**给 Claude 的指令**：按步骤 1→11 顺序执行，源码原样写入不要改动。~~（已作废，见上）
 >
 > **效果**：飞书私聊/群 @机器人 → 本机 Claude Code 回答（文本/图片/文件/语音/富文本/转发均可），会话持久续聊。无需公网服务器，飞书事件走长连接。前置：macOS 或 Windows、Node ≥ 18；可选 ffmpeg（语音兜底转写，`brew install ffmpeg` / `winget install ffmpeg`）。
 
