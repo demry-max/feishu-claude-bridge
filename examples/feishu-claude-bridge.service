@@ -1,0 +1,31 @@
+# Linux 常驻示例（systemd 用户服务；本仓库不自动安装）。
+#
+# 安装（把 /path/to/feishu-claude-bridge 换成仓库绝对路径，ExecStart 换成 `which node` 的结果）：
+#   mkdir -p ~/.config/systemd/user
+#   cp examples/feishu-claude-bridge.service ~/.config/systemd/user/
+#   $EDITOR ~/.config/systemd/user/feishu-claude-bridge.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now feishu-claude-bridge
+#   loginctl enable-linger "$USER"      # 不登录桌面也保持运行（需要时）
+# 验证：systemctl --user status feishu-claude-bridge；journalctl --user -u feishu-claude-bridge -f
+#       日志里出现 "ws client ready" 即已连上飞书。
+# 卸载：systemctl --user disable --now feishu-claude-bridge && rm ~/.config/systemd/user/feishu-claude-bridge.service
+[Unit]
+Description=Feishu <-> Claude Code bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/feishu-claude-bridge
+ExecStart=/usr/bin/node src/index.js
+# claude 所在目录必须在 PATH 里（`dirname "$(which claude)"`）；服务不读你的 shell 配置
+Environment=PATH=/home/USERNAME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=60
+# 优雅退出：要大于 .env 的 SHUTDOWN_GRACE_SEC（默认 120）
+TimeoutStopSec=130
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

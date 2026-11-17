@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// BRIDGE-PERM-1：把 owner 会话的 lark-cli 用量统计（只有子命令名与次数）按 strict 档策略回放一遍。
+// 切换 owner 工具档前的预演：把 owner 会话的 lark-cli 用量统计（只有子命令名与次数）按 strict 档策略回放一遍。
 // 用法：node scripts/replay-tool-usage.js <usage.txt>
 // 输入格式：「## lark-cli 子命令」段下每行「次数 子命令…」（见 test/fixtures/owner-lark-usage-45d.txt）。
 // 只读这一个文件、只往 stdout 打表；不联网、不调 lark-cli。

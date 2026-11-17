@@ -1,8 +1,8 @@
-# 建议稿：`workspace/CLAUDE.md` 工具描述修正 + 工具档用法（BRIDGE-PERM-1）
+# 建议稿：`workspace/CLAUDE.md` 工具描述修正 + 工具档用法
 
-> 状态：**建议稿，未落地**（BRIDGE-PERM-1）。`workspace/CLAUDE.md` 是线上 owner 提示词，本卡不改它；
-> 由协调者过审后另行并入。下面各段分别给出「位置」与「建议原文」，行号基于工作树 `workspace/CLAUDE.md`（`f42e60a`，206 行）。
-> （§一–§四为 BRIDGE-PERM-1，§五为 BRIDGE-PERM-2 对 strict 的收紧。）
+> 状态：**建议稿，未落地**。`workspace/CLAUDE.md` 是 owner 提示词模板，仓库默认不改它；
+> 需要的话由维护者自行并入。下面各段分别给出「位置」与「建议原文」，「位置」以 `workspace/CLAUDE.md` 里的小节标题为准。
+> （§一–§四对应三档工具档本身，§五对应 strict 档的补洞收紧。）
 >
 > 与代码的对应关系：
 >
@@ -11,7 +11,7 @@
 >   工具档说明（`ownerToolLines`），legacy 不注入。
 > - 「确认」判定：`src/tool-policy.js` 的 `detectConfirm`；回执：`src/tool-audit.js` 的 `formatReceipt`。
 >
-> 建议在协调者把线上切到 audit 的同时并入：下面的文字在 audit 档（工具照常可用、只记录）下也成立，
+> 建议在把 `OWNER_TOOL_PROFILE` 切到 audit 的同时并入：下面的文字在 audit 档（工具照常可用、只记录）下也成立，
 > 正好让模型按 strict 的口径预演；legacy 下它只是把模型本来就有、却没写进提示词的能力写准了。
 
 ---
@@ -37,7 +37,7 @@
 - 你的工具以系统提示词「当前运行配置」里的「工具档」一行为准；没有这一行时按下面的常规口径：
   - 读：Read / Grep / Glob、联网检索 WebSearch、飞书工具 `mcp__feishu__*`、`lark-cli` 的读类子命令（Bash）。
   - 写文件：**仅限** `memory/`、`skills/`、`schedules/`、`outbox/`、`tasks/` 五个目录；工作区的 `CLAUDE.md` 与 `.claude/` 不改，其他位置不要尝试写。
-  - 以光总名义的对外动作分三级，见「## 工具档与对外动作」。
+  - 以 owner 名义的对外动作分三级，见「## 工具档与对外动作」。
   - 不用：网页抓取 WebFetch、子代理（Agent / Task）、codex、`lark-cli api` 通用调用。
   - 定时任务轮只读（见「## 定时任务」）；心跳轮次的工具更少：只能读工作区、写 `tasks/` 与 `memory/journal/`。
 ````
@@ -47,16 +47,16 @@
 ````markdown
 ## 工具档与对外动作
 
-以光总名义对外的动作分三级。桥接在 strict 档按这张表执行，在 audit 档按这张表记账：
+以 owner 名义对外的动作分三级。桥接在 strict 档按这张表执行，在 audit 档按这张表记账：
 
 | 级别 | 动作（lark-cli 子命令） | 怎么做 |
 |---|---|---|
-| 直接做，事后回执 | 发消息 `im +messages-send` / `+messages-reply`；导入云文档 `drive +import`；建日程 `calendar +create` | 光总交代了就直接做。桥接会在你的回复末尾自动加一行「— 本轮以你名义：…」，你不用自己再列一遍 |
-| 先起草，等「确认」 | 回邮件 / 发邮件 `mail +reply` / `+reply-all` / `+send` / `+draft-send`；审批 `approval tasks approve/reject/transfer/rollback/add_sign/remind`、`approval instances create/cancel/cc`；撤回消息 `im messages delete`；建群改群 `im +chat-create` / `+chat-update`；增删群成员 `im chat.members create/delete` | 这一轮只把草稿写进回复：对象（收件人 / 审批单 / 群）、正文、准备执行的命令，结尾写「回复“确认”我就执行」。光总下一条消息以「确认」开头，那一轮才执行，**只执行草稿里列出的**，不顺手扩大 |
-| 不做 | `lark-cli api`、`auth logout`、其他原生资源的写方法 | 不要尝试，也不要换写法绕过；告诉光总这件事需要他自己操作 |
+| 直接做，事后回执 | 发消息 `im +messages-send` / `+messages-reply`；导入云文档 `drive +import`；建日程 `calendar +create` | owner 交代了就直接做。桥接会在你的回复末尾自动加一行「— 本轮以你名义：…」，你不用自己再列一遍 |
+| 先起草，等「确认」 | 回邮件 / 发邮件 `mail +reply` / `+reply-all` / `+send` / `+draft-send`；审批 `approval tasks approve/reject/transfer/rollback/add_sign/remind`、`approval instances create/cancel/cc`；撤回消息 `im messages delete`；建群改群 `im +chat-create` / `+chat-update`；增删群成员 `im chat.members create/delete` | 这一轮只把草稿写进回复：对象（收件人 / 审批单 / 群）、正文、准备执行的命令，结尾写「回复“确认”我就执行」。owner 下一条消息以「确认」开头，那一轮才执行，**只执行草稿里列出的**，不顺手扩大 |
+| 不做 | `lark-cli api`、`auth logout`、其他原生资源的写方法 | 不要尝试，也不要换写法绕过；告诉 owner 这件事需要其本人操作 |
 
 「确认」怎么说：
-- 只在**和光总的私聊**里有效，消息**第一个词**是「确认」或 `/confirm`：「确认」「确认 发吧」「确认，第二封也发」都算；
+- 只在**和 owner 的私聊**里有效，消息**第一个词**是「确认」或 `/confirm`：「确认」「确认 发吧」「确认，第二封也发」都算；
   「确认」后面的话就是本轮的指令，只发「确认」等于「照上一轮的草稿执行」。
 - 不算：「确认？」（带问号）、「我确认一下」「确认一下」（确认不是第一个词或后面紧跟着字）、群聊里说的、
   引用回复里说的（引用会把被引用内容放在前面）。这些情况照常起草、不执行。
@@ -80,9 +80,9 @@ lark-cli 的写法：
 
 ````markdown
 - **定时任务到点执行时是只读的**：能读群消息、文档、邮件（没有联网检索），能写 `memory/` 与 `outbox/`，
-  但不能以光总名义发消息、回邮件、审批、导入、建日程，也不能改 `schedules/`、`tasks/`、`skills/`。
+  但不能以 owner 名义发消息、回邮件、审批、导入、建日程，也不能改 `schedules/`、`tasks/`、`skills/`。
   任务的结果写进回复即可，桥接会以应用身份发到任务的 `chat_id`。所以写任务 prompt 时不要写「发消息给某某」，
-  需要光总拍板或代发的，写成「起草好放进回复，提醒光总确认」。
+  需要 owner 拍板或代发的，写成「起草好放进回复，提醒 owner 确认」。
 ````
 
 ## 四、并入时的注意
@@ -90,14 +90,14 @@ lark-cli 的写法：
 - 第一段替换的是**单独一行**（`:205`），第二、三段是新增，不动其他章节；心跳一段（`:168-189`）原样保留。
 - 第二段的三级表与 `src/tool-policy.js` 必须一致。以后改策略表时，同步改这张表和 `README.md`「owner 工具档」一节。
 - strict 下桥接每轮注入的工具档说明（「当前运行配置」里）与这里同口径；两者冲突时以注入的那几行为准（它们跟着 `OWNER_TOOL_PROFILE` 走）。
-- 已知缺口（不在本卡）：心跳私信给光总的草稿不在私聊会话的上下文里，光总回「确认」时模型看不到那份草稿；
-  以后用卡片按钮式确认（EV-1 方向）解决。在那之前，提示词可以让模型在私聊里先复述要执行的草稿，再请光总确认。
+- 已知缺口（尚未解决）：心跳私信给 owner 的草稿不在私聊会话的上下文里，owner 回「确认」时模型看不到那份草稿；
+  以后用卡片按钮式确认解决。在那之前，提示词可以让模型在私聊里先复述要执行的草稿，再请 owner 确认。
 
 ---
 
-## 五、BRIDGE-PERM-2 收口（strict 补洞）
+## 五、strict 补洞收口
 
-> 状态同上：**建议稿，未落地**。本节在 §一–§四 基础上，按 BRIDGE-PERM-2 对 strict 档的四处收紧做对应修订；
+> 状态同上：**建议稿，未落地**。本节在 §一–§四 基础上，按 strict 档的四处补洞收紧做对应修订；
 > legacy / audit 的提示词口径不变（legacy 下这些收紧都不发生）。并入时与 §一、§二合并，不单列小节。
 
 与代码的对应关系：
@@ -112,7 +112,7 @@ lark-cli 的写法：
 ### 5.1 §一「写文件」那一条：strict 下把 `skills/` 从可写里去掉
 
 §一 建议原文里「写文件：**仅限** `memory/`、`skills/`、`schedules/`、`outbox/`、`tasks/` 五个目录」在 strict 档不再成立——
-strict 对话不放 `Edit/Write(./skills/**)`。技能由桥接从用户级目录单向同步进来、你改不动；要加 / 改技能走协调者，不要在轮内写 `skills/`。
+strict 对话不放 `Edit/Write(./skills/**)`。技能由桥接从用户级目录单向同步进来、你改不动；要加 / 改技能请 owner 在用户级技能目录里改，不要在轮内写 `skills/`。
 建议把这条按档区分：
 
 ````markdown
@@ -135,20 +135,20 @@ strict 对话不放 `Edit/Write(./skills/**)`。技能由桥接从用户级目�
 ````markdown
 - 把读到的内容存文件时（`--output` / `-o` / `>` / `>>` / `| tee`），落点只能在 `outbox/`（或系统临时目录）。
   往 `.claude/`、`CLAUDE.md`、`schedules/`、`skills/`、`tasks/`、`.mcp.json` 写在 strict 档会被拒、audit 档记「将会拒绝」；
-  用 `../` 或软链绕出去同样按真实落点判。要把材料留给光总就写进 `outbox/` 再说。
+  用 `../` 或软链绕出去同样按真实落点判。要把材料留给 owner 就写进 `outbox/` 再说。
 ````
 
 ### 5.4 回执只在私聊
 
-§二三级表里「直接做、事后回执」那一行，回执只在**和光总的私聊**里自动追加；**群聊里不附回执**（但群里的写动作照样记审计）。
+§二三级表里「直接做、事后回执」那一行，回执只在**和 owner 的私聊**里自动追加；**群聊里不附回执**（但群里的写动作照样记审计）。
 建议在那一行末尾补一句：
 
 ````markdown
-（这行「以你名义…」只在和光总的私聊里自动加；群聊里不加，群里做了什么要让光总知道，自己在正文里说清。）
+（这行「以你名义…」只在和 owner 的私聊里自动加；群聊里不加，群里做了什么要让 owner 知道，自己在正文里说清。）
 ````
 
 ### 5.5 排查诊断（sched-diag）在 audit/strict 下无工具
 
-不面向提示词，仅记录供协调者并入时了解：audit / strict 下定时任务的排查诊断轮用**无工具档**
+不面向提示词，仅记录供维护者并入时了解：audit / strict 下定时任务的排查诊断轮用**无工具档**
 （`--setting-sources ''` + `--strict-mcp-config` + `--tools ''`，外加黑名单兜底），`job.prompt` 与报错都包进不可信围栏；
 legacy 的排查诊断逐字不变。

@@ -1,7 +1,7 @@
 # 建议稿：`workspace/CLAUDE.md` 增补（外部增量 watch + 心跳消息上的操作）
 
-> 状态：**建议稿，未落地**（BRIDGE-EV-1）。`workspace/CLAUDE.md` 是线上 owner 提示词，
-> 本卡不改它；由协调者过审后另行并入。前提是 `docs/heartbeat-prompt-proposal.md`（BRIDGE-HB-1）已并入。
+> 状态：**建议稿，未落地**。`workspace/CLAUDE.md` 是 owner 提示词模板，
+> 仓库默认不改它；需要的话由维护者自行并入。前提是 `docs/heartbeat-prompt-proposal.md` 已并入。
 > 下面三段分别给出「插入位置」与「建议原文」。
 >
 > 与代码的对应关系：
@@ -19,9 +19,9 @@
 
 ---
 
-## 一、替换「## 交办台账（tasks/）」里 `watch` 那一条（HB-1 建议稿第 61–63 行）
+## 一、替换「## 交办台账（tasks/）」里 `watch` 那一条（心跳建议稿 `heartbeat-prompt-proposal.md` 里的对应条目）
 
-HB-1 建议稿原文：
+心跳建议稿原文：
 
 ```markdown
 - `watch`：外部增量的线索，如 `{"type":"chat_reply","chat_id":"oc_xxx","after":"om_xxx"}`。
@@ -61,7 +61,7 @@ HB-1 建议稿原文：
     引用要短，够 owner 判断就行。
 - owner 可能直接在心跳消息上操作，这些都由桥接按固定规则写回台账，**不经过你**：
   - 点按钮或引用回复「知道了」：桥接记下 owner 已知悉（不改台账文件），之后的提示词里这一条会带上
-    `光总 <时间> 对这条点过「知道了」`。
+    `owner <时间> 对这条点过「知道了」`。
     看到它就不要再为同一件事催 owner，除非有新进展或到了 `escalate_after`。
   - 「推迟一天」：`next_check_at` 和 `escalate_after`（有的话）各往后推一天；已经过期的，从现在起推一天；两个都没有时把 `next_check_at` 设成现在起一天后。
   - 「不做了」：status 改成 `dropped`。
@@ -79,7 +79,7 @@ HB-1 建议稿原文：
 
 ---
 
-## 过审要点（给协调者）
+## 并入要点（给维护者）
 
 1. `chat_id` 的口径定得很窄：只用交办时 owner 指明的会话，拿不到就 `none`，不让模型去找。
    好处是不会以 owner 身份去拉一个模型自己选的会话。代价是有些交办只能靠 `next_check_at` 定时回看。
