@@ -8,7 +8,7 @@
 // - 撤回：只计数
 // - 卡片按钮：校验（owner、消息在索引里、nonce 一致、台账存在且在跟进）不论开关都做；
 //   全部通过才排队回写并回「已记下」，否则回「已失效」、不改任何文件。回写异步执行，回调 3 秒内必返回
-import { ACTION_BY_PHRASE, LEDGER_ACTIONS } from './ledger-actions.js';
+import { ACTION_BY_PHRASE, actionLabel } from './ledger-actions.js';
 
 const MSG_ID_RE = /^om_[A-Za-z0-9_-]{1,64}$/;
 const TOAST_OK = Object.freeze({ toast: Object.freeze({ type: 'success', content: '已记下' }) });
@@ -194,7 +194,7 @@ export function createEventHandlers({ getOwner = () => '', heartbeat, log = cons
       }
       h.submitAction({ slug: r.slug, action: r.action, messageId: mid, source: 'button' });
       const n = count(h, 'card_ok');
-      safeLog(`[events] 卡片按钮：光总点了『${LEDGER_ACTIONS[r.action]}』（tasks/${r.slug}.json），已排队回写（今日第 ${n} 次）`);
+      safeLog(`[events] 卡片按钮：光总点了『${actionLabel(r.action) ?? r.action}』（tasks/${r.slug}.json），已排队回写（今日第 ${n} 次）`);
       return TOAST_OK;
     } catch (e) {
       safeLog(`[events] 卡片回调处理异常，按已失效处理（${e?.name ?? 'Error'}）`);
@@ -220,6 +220,7 @@ export function shortcutPhrase(message) {
 /**
  * owner 私聊里引用回复心跳消息（HEARTBEAT_REPLY_SHORTCUTS=true 才生效，关时恒返回 null＝逐字走原流程）：
  * - 正文恰好是「知道了」「推迟一天」「不做了」且那条消息只涉及一条台账 → 桥接确定性回写，返回 { reply }（不调模型）
+ *   （BRIDGE-VR-1：验收卡片是「验收」「没办完」「不做了」，升级阶梯消息多一个「办完了」；日结不认短语）
  * - 其余 → 返回 { hint }，照常进 owner 对话，提示词末尾加一行「（你在回复关于 tasks/<slug>.json 的心跳消息）」
  * 永不抛出。
  */
@@ -235,7 +236,10 @@ export async function heartbeatReplyShortcut({ message, isOwner, heartbeat }) {
     if (!slugs.length) return null;
     const hint = `（你在回复关于 ${slugs.map((s) => `tasks/${s}.json`).join('、')} 的心跳消息）`;
     const phrase = shortcutPhrase(message);
-    const action = Object.hasOwn(ACTION_BY_PHRASE, phrase) ? ACTION_BY_PHRASE[phrase] : null;
+    // BRIDGE-VR-1：验收卡片认「验收 / 没办完 / 不做了」，升级阶梯消息多认「办完了」，日结的撤销只认按钮（见 heartbeat.phraseAction）
+    const action = typeof h.phraseAction === 'function'
+      ? h.phraseAction(entry, phrase)
+      : (Object.hasOwn(ACTION_BY_PHRASE, phrase) ? ACTION_BY_PHRASE[phrase] : null);
     if (!action || slugs.length !== 1) return { hint };
     const slug = slugs[0];
     if (entry.acted?.[action]) return { reply: `这条心跳消息已经按『${phrase}』处理过了，不重复执行。` };

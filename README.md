@@ -136,6 +136,13 @@ workspace/
 | `HEARTBEAT_REPLY_SHORTCUTS` | `false` | 精确 `true` 时，引用回复心跳消息的三个固定短语由桥接直接处理 |
 | `HEARTBEAT_UNREAD_PAUSE` | `0` | 最近 N 条心跳消息都超过 24 小时未读就暂停发送；`0` 关闭（0–50） |
 | `LARK_CLI_BIN` | `lark-cli` | 外部增量用的 lark-cli 可执行文件（不在 PATH 里时填绝对路径） |
+| `HEARTBEAT_VERIFY` | `off` | 验收：`off` / `rule` / `rule+model`（见下）；不认识的值记日志后按 `off` |
+| `VERIFY_MODEL` | `claude-haiku-5-5` | `rule+model` 档审核用的模型（零工具的 verifier 档） |
+| `VERIFY_MAX_PER_DAY` | `10` | 每日最多调几次验收审核（0–200，按本地日期计，与心跳的次数分开） |
+| `HEARTBEAT_ESCALATE_LADDER` | `false` | 精确 `true` 时开升级阶梯（见下） |
+| `ESCALATE_MAX` | `2` | 升级阶梯最多几级（1–10），到顶后只进日结「卡住」 |
+| `HEARTBEAT_DIGEST_AT` | 空（关） | 每晚台账日结的时间 `HH:MM`（本地时间，例如 `21:30`）；写错或落在免打扰时段里记日志后按关 |
+| `SHUTDOWN_GRACE_SEC` | `120` | 优雅退出最多等几秒（0–3600，`0`＝不等，见下） |
 
 桥接自己的计数、去重、待发队列、退避状态、心跳消息索引放 `data/heartbeat-state.json`（原子写，与台账分开，模型改不到）。
 本机时钟回拨（本地日期比状态里记的早 1 天以内）时沿用原计数、每拍记一行「时钟回拨」日志，等本地日期真正越过记录日期才翻日；
@@ -181,6 +188,42 @@ workspace/
 - **watch 锁**：`watch` 决定桥接以 owner 身份去读哪个会话 / 审批，所以只认 owner 对话里改的。心跳轮里改动的 `watch` 不生效：
   沿用原值、记日志，下一条心跳消息末尾说明。
 - 需要本机已安装并以 owner 身份登录 `lark-cli`；`HEARTBEAT_WATCH` 不配时一次 lark-cli 都不跑。
+
+### 验收、升级阶梯与每晚日结（BRIDGE-VR-1，全部默认关闭）
+
+- **验收**（`HEARTBEAT_VERIFY=rule|rule+model`）：台账多一个状态 `verify`（等验收）和一个可选字段
+  `done_evidence: { "kind": "approval|message|owner|other", "ref": "…", "summary": "≤200 字" }`
+  （`approval` 的 ref 是审批实例码，`message` 的 ref 是 `om_…`，`owner` / `other` 不填 ref）。
+  心跳一拍里被写成 `done` 的台账，桥接在这一拍结束时改成 `verify`——模型说办完了不算数；owner 对话里、桥接自己写的 `done` 照旧。
+  之后每拍最多核对 3 条待验收：
+  1. **脚本规则**（只读，只用 EV-1 已有的 lark-cli 模板）：`approval` 要 ref 等于台账 `watch.instance_code`，且审批已是终态
+     （APPROVED / REJECTED / CANCELED / DELETED）；`message` 要那条消息在台账 `watch.chat_id` 的会话里、是对方真人发的
+     （不是 owner 本人、机器人、系统消息或已撤回）。通过 → 桥接写 `done`。`owner` 一律不算（owner 的确认只认按钮 / 引用回复），`other` 没有规则。
+  2. **规则没通过**：`rule` 档直接发验收卡片；`rule+model` 档再问一次 `VERIFY_MODEL`，只认一行严格 JSON
+     `{"verdict":"pass|fail|unsure","reason":"≤80 字"}`：`pass` → 写 `done`；`fail` / `unsure` / 没按格式 / 调用失败 → 发验收卡片。
+     审核用 verifier 档：没有任何工具，不加载 settings 来源与 MCP，cwd 是每次新建的系统临时目录（不是 `workspace/`），不续会话。
+     每日最多 `VERIFY_MAX_PER_DAY` 次，用满后直接发卡片。
+  3. **验收卡片**「🔍 待你验收」：助理写的标题 / 进展 / 依据在不可信围栏里，桥接的核对结论在围栏外。
+     按钮（`HEARTBEAT_BUTTONS=true`）［✅ 验收］［↩ 没办完］［🗑 不做了］，或引用回复「验收」「没办完」「不做了」（`HEARTBEAT_REPLY_SHORTCUTS=true`）。
+     「没办完」改回 `open`、`next_check_at` 推到明天，同一份依据以后不再自动通过（依据改了重新核对）。
+     同一份依据只发一张卡片；卡片不进待发队列，免打扰 / 未读暂停 / 本拍发满时下一拍再试。
+- **升级阶梯**（`HEARTBEAT_ESCALATE_LADDER=true`）：`escalate_after` 第一次越过那拍的心跳消息算第 1 级；之后按固定模板再提醒（不调模型）：
+  上一级读了满 24 小时、或没读满 48 小时才升一级（没读不叠发），owner 点过「知道了」就不再升；最多 `ESCALATE_MAX` 级，之后只进日结「卡住」。
+  模板消息带［知道了］［推迟一天］［不做了］［办完了］，引用回复也多认「办完了」；`escalate_after` 改了就从第 1 级重新来。
+- **每晚日结**（`HEARTBEAT_DIGEST_AT=HH:MM`）：到点私聊 owner 一份五栏日结——今天办完（注明规则验收 / 模型验收 / 心跳轮写的 / 光总确认 / 会话里改的）、
+  今天放弃、待你验收、卡住、明天到期。每栏最多列 5 条，整条消息不超过 15 行；**五栏都空不发**。
+  只读台账与桥接自己记的状态变化（`data/heartbeat-state.json` 的 `history`），不读 journal、不调模型。
+  自动判定办完的（规则 / 模型 / 心跳轮写的）带圈号，按钮开着时附［撤销①］…（改回 `open`、明天再看；撤销只认按钮）；发出后在当天 journal 记一段。
+  一天只发一次（重启不重发）；到点后 30 分钟内没发出去（心跳正忙、进程刚起）就不补发。
+- `/heartbeat status` 多三行：验收（档位、待验收条数、今日模型审核次数）、升级阶梯（级数、升级中的条数）、日结时间。
+- 状态文件新增顶层键 `verify` / `history` / `verify_runs` 与 `tasks.<slug>.esc`，缺了按空处理，不升版本号。
+- 心跳轮怎么写 `done_evidence` 的提示词约定见 [`docs/vr-prompt-proposal.md`](docs/vr-prompt-proposal.md)（建议稿，过审后并入 `workspace/CLAUDE.md`）。
+
+### 优雅退出（SIGTERM / SIGINT）
+
+收到 SIGTERM / SIGINT 后，桥接不再接新消息，停掉心跳与日结定时器，等进行中的对话做完再退出。进行中的对话包括刚收到、排队中和正在回答的对话轮，跑着的定时任务，以及正在跑的心跳一拍。
+最多等 `SHUTDOWN_GRACE_SEC` 秒（默认 120）。等待期间新来的消息回「正在重启，请稍后重发」；第二次信号立即退出。
+用 launchd 托管时，plist 的 `ExitTimeOut` 要不小于 `SHUTDOWN_GRACE_SEC` 再加 10 秒。默认的 `examples/launchd.example.plist` 和 `scripts/install-service.js` 没设这一项，launchd 会按系统默认值提前强杀。
 
 ## 快速开始 Quick Start
 
