@@ -13,11 +13,22 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fenceUntrusted } from './messages.js';
 import { redact } from './outbound.js';
-import { LEDGER_ACTIONS, ledgerButtons, checkActionable, applyLedgerAction, appendJournal } from './ledger-actions.js';
+import {
+  LEDGER_ACTIONS, ACTION_BY_PHRASE, ledgerButtons, checkActionable, applyLedgerAction, appendJournal,
+  VERIFY_PHRASES, LADDER_PHRASES, actionLabel, verifyButtons, ladderButtons, undoButtons,
+  checkVerifiable, applyVerifyAction, appendJournalBlock, readTaskRaw,
+} from './ledger-actions.js';
+// BRIDGE-VR-1：验收（verifier.js）与每晚台账日结（digest.js）；三项新开关默认关，全关时逐字 EV-1
+import {
+  VERIFY_KEY, DEFAULT_VERIFY_MODEL, EVIDENCE_KINDS, VERDICTS, parseVerifyMode, parseVerdict, evidenceKey,
+  ruleCheck, buildVerifyPrompt, buildVerifyCard,
+} from './verifier.js';
+import { parseDigestAt, msUntilNext, inDigestWindow, buildDigest, plain, UNDOABLE_VIA } from './digest.js';
 
 // 以 sched 开头：claude.js 的 isEphemeral 据此保证不 --resume、不落会话
 export const HEARTBEAT_KEY = 'sched:heartbeat';
-export const TASK_STATUSES = ['open', 'waiting', 'done', 'dropped'];
+// verify（BRIDGE-VR-1）：助理说办完了、等桥接 / 光总验收；不算在跟进中（不到期、不进心跳提示词）
+export const TASK_STATUSES = ['open', 'waiting', 'verify', 'done', 'dropped'];
 const ACTIVE_STATUSES = new Set(['open', 'waiting']);
 export const WATCH_TYPES = ['chat_reply', 'approval', 'calendar', 'none'];
 const DEFAULT_QUIET = '22-08';
@@ -25,6 +36,14 @@ const DAY_MS = 24 * 3600_000;
 const MAX_TASK_BYTES = 64 * 1024;
 const MAX_PENDING = 20; // 待发队列上限，超出丢最早的
 const MAX_DUE_IN_PROMPT = 15; // 一拍最多交给模型的到期条目，其余下拍再说
+// BRIDGE-VR-1：心跳消息索引里的消息种类（验收卡片 / 升级模板 / 日结也进索引，按钮与引用回复据此分流）
+const MSG_KINDS = ['heartbeat', 'pending', 'verify', 'escalate', 'digest'];
+// history.changes 的 via：rule / model＝自动验收，heartbeat＝心跳轮写的，owner＝光总按钮 / 引用回复，chat＝拍与拍之间（会话里）改的
+const CHANGE_VIA = ['rule', 'model', 'heartbeat', 'owner', 'chat'];
+const MAX_CHANGES = 200;
+const CHANGES_TTL_MS = 7 * DAY_MS;
+const MAX_VERIFY_PER_BEAT = 3; // 一拍最多处理几条待验收（其余下拍）
+const HEX16_RE = /^[0-9a-f]{16}$/;
 // 反复到期退避（BRIDGE-HB-1B）：同一条台账连续 BACKOFF_AFTER_RUNS 次被成功送进模型、文件一直没变，
 // 之后每再送一次就按 1 → 2 → 4 → 8 拍递增跳过（封顶 BACKOFF_MAX_SKIP 拍）；文件一变即清零
 const BACKOFF_AFTER_RUNS = 3;
@@ -118,7 +137,7 @@ export function parseWatch(raw, log = console.log) {
 /** 从 env 读心跳配置。只认精确的 HEARTBEAT_ENABLED=true；其余写错的值记一行日志后回落默认。 */
 export function heartbeatConfig(env = process.env, log = console.log) {
   const watchSources = parseWatch(env.HEARTBEAT_WATCH, log);
-  return {
+  const cfg = {
     enabled: env.HEARTBEAT_ENABLED === 'true',
     intervalMin: intEnv(env, 'HEARTBEAT_INTERVAL_MIN', 30, 1, 1440, log),
     maxRunsPerDay: intEnv(env, 'HEARTBEAT_MAX_RUNS_PER_DAY', 12, 0, 1000, log),
@@ -135,6 +154,15 @@ export function heartbeatConfig(env = process.env, log = console.log) {
     replyShortcuts: env.HEARTBEAT_REPLY_SHORTCUTS === 'true',
     unreadPause: intEnv(env, 'HEARTBEAT_UNREAD_PAUSE', 0, 0, 50, log),
   };
+  // BRIDGE-VR-1：验收 / 升级阶梯 / 每晚日结，一律默认关（verify=off、阶梯精确等于 true 才开、日结时间留空＝关）
+  cfg.verify = parseVerifyMode(env.HEARTBEAT_VERIFY, log);
+  cfg.verifyModel = String(env.VERIFY_MODEL ?? '').trim() || DEFAULT_VERIFY_MODEL;
+  cfg.verifyMaxPerDay = intEnv(env, 'VERIFY_MAX_PER_DAY', 10, 0, 200, log);
+  cfg.escalateLadder = env.HEARTBEAT_ESCALATE_LADDER === 'true';
+  cfg.escalateMax = intEnv(env, 'ESCALATE_MAX', 2, 1, 10, log);
+  // 日结时间不能落在免打扰时段里（落在里面记日志后按关）
+  cfg.digestAt = parseDigestAt(env.HEARTBEAT_DIGEST_AT, cfg.quietHours, log);
+  return cfg;
 }
 
 /**
@@ -204,7 +232,7 @@ export function validateTask(raw, slug) {
   const title = typeof raw.title === 'string' ? raw.title.trim() : '';
   if (!title) return bad('缺 title');
   if (title.length > 200) return bad('title 超过 200 字');
-  if (!TASK_STATUSES.includes(raw.status)) return bad('status 不是 open/waiting/done/dropped');
+  if (!TASK_STATUSES.includes(raw.status)) return bad('status 不是 open/waiting/verify/done/dropped');
   const task = { slug, title, status: raw.status, times: {} };
   for (const f of TIME_FIELDS) {
     if (raw[f] === undefined || raw[f] === null || raw[f] === '') continue;
@@ -254,7 +282,30 @@ export function validateTask(raw, slug) {
     if (raw.notes.length > 300) return bad('notes 超过 300 字');
     task.notes = raw.notes;
   }
+  // 办完的依据（BRIDGE-VR-1，可选）：kind 决定 ref 的格式；summary 是助理写的话，进任何提示词都要围栏。
+  // 依据写得不合规不让整条台账失效（R1）：台账照常有效、不带 done_evidence，原因记在 evidence_error（桥接自己的话），
+  // 验收时按「依据格式不合规」直接发卡片；文件不动
+  if (raw.done_evidence !== undefined && raw.done_evidence !== null) {
+    const r = checkEvidence(raw.done_evidence);
+    if (r.ok) task.done_evidence = r.evidence;
+    else task.evidence_error = r.reason;
+  }
   return { ok: true, task };
+}
+
+function checkEvidence(e) {
+  const bad = (reason) => ({ ok: false, reason });
+  if (typeof e !== 'object' || Array.isArray(e)) return bad('done_evidence 不是对象');
+  if (!EVIDENCE_KINDS.includes(e.kind)) return bad('done_evidence.kind 不是 approval/message/owner/other');
+  if (e.ref !== undefined && e.ref !== null && typeof e.ref !== 'string') return bad('done_evidence.ref 不是字符串');
+  if (e.summary !== undefined && e.summary !== null && typeof e.summary !== 'string') return bad('done_evidence.summary 不是字符串');
+  const ref = (e.ref ?? '').trim();
+  const summary = (e.summary ?? '').trim();
+  if (e.kind === 'approval' && !INSTANCE_RE.test(ref)) return bad('done_evidence.ref 不是审批实例码');
+  if (e.kind === 'message' && !MSG_ID_RE.test(ref)) return bad('done_evidence.ref 不是 om_ 开头的消息 ID');
+  if ((e.kind === 'owner' || e.kind === 'other') && ref) return bad('done_evidence.ref 只有 approval / message 才填');
+  if (summary.length > 200) return bad('done_evidence.summary 超过 200 字');
+  return { ok: true, evidence: { kind: e.kind, ref, summary } };
 }
 
 /**
@@ -441,11 +492,29 @@ function backoffVerdict(rec, { task, reasons }) {
   return 'ready';
 }
 
+// 状态文件里的一条待验收记录（BRIDGE-VR-1）：key＝依据指纹；其余是这次核对的结论与卡片发送记录。坏了整条丢掉
+function cleanVerifyEntry(e) {
+  if (!isObj(e) || typeof e.key !== 'string' || !HEX16_RE.test(e.key)) return null;
+  const out = { key: e.key };
+  if (typeof e.finding === 'string' && e.finding) out.finding = e.finding.slice(0, 300);
+  if (typeof e.note === 'string' && e.note) out.note = e.note.slice(0, 120);
+  if (VERDICTS.includes(e.verdict)) {
+    out.verdict = e.verdict;
+    out.reason = typeof e.reason === 'string' ? e.reason.slice(0, 80) : '';
+  }
+  if (typeof e.card_at === 'string' && Number.isFinite(Date.parse(e.card_at))) out.card_at = e.card_at;
+  if (typeof e.card_mid === 'string' && MSG_ID_RE.test(e.card_mid)) out.card_mid = e.card_mid;
+  return out;
+}
+
 /**
  * deps：config, tasksDir, stateFile, runClaude, send, isQuiet（必填，与定时任务共用同一判定），
  * 以及可选的 describeFailure, collectDeltas, deltaTimeoutMs, now, log, logError, timers, firstDelayMs，
  * signalsFile（事件信号，默认与状态文件同目录的 heartbeat-signals.json）、journalDir（回写时追加 journal；不给就不写）、
  * ledgerAction（确定性回写，默认 ledger-actions.js 的 applyLedgerAction）、defer（动作队列的调度，默认 setImmediate）。
+ * BRIDGE-VR-1 另有可选的 verifyAction（验收 / 阶梯 / 撤销的确定性回写，默认 applyVerifyAction）、
+ * getOwner（owner 的 open_id，规则核对时排除光总本人发的消息）、verifyRunner（只读 lark-cli 执行器，
+ * 规则核对用 EV-1 已有的 approvalGet / messageGet 模板；不给就只能按依据类型判，核不了的交光总）。
  * send(text[, { actions }]) 返回飞书 message_id（拿不到返回 undefined，只是不记索引）；没有按钮时只传一个参数。
  */
 export function createHeartbeat(deps) {
@@ -472,11 +541,29 @@ export function createHeartbeat(deps) {
   const unreadPauseN = () => (Number.isInteger(config.unreadPause) && config.unreadPause > 0 ? config.unreadPause : 0);
   const watchMax = () => (Number.isInteger(config.watchMax) && config.watchMax > 0 ? config.watchMax : 10);
   const watchSources = () => (Array.isArray(config.watchSources) ? config.watchSources.filter((s) => WATCH_SOURCES.includes(s)) : []);
+  // BRIDGE-VR-1：验收 / 升级阶梯 / 日结，三项都默认关；配置里没有就按关（直接传 config 的旧调用方逐字 EV-1）
+  const verifyAction = deps.verifyAction
+    ?? ((job) => applyVerifyAction({ tasksDir, journalDir, validate: validateTask, log, ...job }));
+  const ownerId = () => {
+    try {
+      const o = typeof deps.getOwner === 'function' ? deps.getOwner() : '';
+      return typeof o === 'string' ? o : '';
+    } catch {
+      return '';
+    }
+  };
+  const verifyRunner = typeof deps.verifyRunner === 'function' ? deps.verifyRunner : null;
+  const verifyOn = () => config.verify === 'rule' || config.verify === 'rule+model';
+  const historyOn = () => verifyOn() || Boolean(config.digestAt);
+  const ladderOn = () => config.escalateLadder === true;
+  const escalateMax = () => (Number.isInteger(config.escalateMax) && config.escalateMax > 0 ? config.escalateMax : 2);
+  const verifyMax = () => (Number.isInteger(config.verifyMaxPerDay) && config.verifyMaxPerDay >= 0 ? config.verifyMaxPerDay : 10);
 
   let active = config.enabled; // 运行时开关：/heartbeat on|off 只改它，不写 .env
   let inflight = false;
   let firstTimer = null;
   let interval = null;
+  let digestTimer = null; // 日结定时器（HEARTBEAT_DIGEST_AT 设了才有）
   const actionQueue = []; // 按钮 / 引用回复 / 恢复请求：心跳 inflight 时排队，这一拍结束后再执行
   const closedStates = new WeakSet(); // fail closed 得到的状态：动作队列不拿它覆盖状态文件
 
@@ -500,10 +587,14 @@ export function createHeartbeat(deps) {
     send_fails: {}, // 待发项 hash → 连续发送失败的拍数（单独一张表，不改待发项的形状）
     notices: {}, // 下一次成功发出的消息要附的说明（恢复 / 队满丢弃 / 多次失败放弃 / watch 锁定）
     unread_pause: null,
+    // BRIDGE-VR-1（开关关着时不出现这几个键；缺键＝空）
+    ...(verifyOn() ? { verify: {}, verify_runs: 0 } : {}), // slug → 待验收核对记录；今日模型审核次数
+    ...(historyOn() ? { history: { seen: {}, changes: [], digest_day: null } } : {}), // 状态变化记录与日结发送日
   });
   // 计数不可信时宁可今天不调（fail closed）：今日额度按已用完处理，明天自动恢复
   const failClosed = (d) => {
     const st = { ...freshState(d), runs: config.maxRunsPerDay };
+    if (verifyOn()) st.verify_runs = verifyMax(); // 模型审核同样按今日已用完
     closedStates.add(st);
     return st;
   };
@@ -535,6 +626,8 @@ export function createHeartbeat(deps) {
     }
     const st = freshState(d);
     const runsOf = (v) => (Number.isInteger(v) && v >= 0 ? v : config.maxRunsPerDay);
+    // 计数沿用（同一天、或记录日期比本地今天晚＝时钟回拨 / 曾被调快）；本地日期真正越过记录日期才清零
+    const carry = raw.day === st.day || (typeof raw.day === 'string' && DAY_RE.test(raw.day) && raw.day > st.day);
     if (raw.day === st.day) {
       st.runs = runsOf(raw.runs);
     } else if (typeof raw.day === 'string' && DAY_RE.test(raw.day) && raw.day > st.day) {
@@ -581,13 +674,14 @@ export function createHeartbeat(deps) {
         const entry = {
           slugs: [...new Set(e.slugs.filter((s) => typeof s === 'string' && SLUG_RE.test(s)))],
           nonce: typeof e.nonce === 'string' ? e.nonce : '',
-          kind: e.kind === 'pending' ? 'pending' : 'heartbeat',
+          kind: MSG_KINDS.includes(e.kind) ? e.kind : 'heartbeat',
           at: e.at,
         };
         if (e.buttons === true) entry.buttons = true;
+        if (e.ladder === true) entry.ladder = true; // 升级阶梯第一级（心跳消息带了阶梯按钮）
         for (const k of ['read_at', 'reacted_at']) if (typeof e[k] === 'string' && msOf(e[k]) !== null) entry[k] = e[k];
         if (isObj(e.acted)) {
-          const acted = Object.fromEntries(Object.entries(e.acted).filter(([a, v]) => Object.hasOwn(LEDGER_ACTIONS, a) && typeof v === 'string'));
+          const acted = Object.fromEntries(Object.entries(e.acted).filter(([a, v]) => actionLabel(a) !== null && typeof v === 'string'));
           if (Object.keys(acted).length) entry.acted = acted;
         }
         st.msg_index[mid] = entry;
@@ -615,6 +709,36 @@ export function createHeartbeat(deps) {
       for (const k of ['since', 'resumed_at']) if (typeof p[k] === 'string' && msOf(p[k]) !== null) u[k] = p[k];
       if (Number.isInteger(p.count) && p.count > 0) u.count = p.count;
       st.unread_pause = u;
+    }
+    // 以下是 BRIDGE-VR-1 新增的键（开关关着时不读也不写；缺键＝空）
+    if (verifyOn()) {
+      const v = raw.verify_runs;
+      // 与 runs 同口径：跨日清零；同日 / 时钟回拨沿用；值坏了按今日已用完（fail closed）
+      st.verify_runs = !carry || v === undefined ? 0 : (Number.isInteger(v) && v >= 0 ? v : verifyMax());
+      if (isObj(raw.verify)) {
+        for (const [s, e] of Object.entries(raw.verify)) {
+          const c = SLUG_RE.test(s) ? cleanVerifyEntry(e) : null;
+          if (c) st.verify[s] = c;
+        }
+      }
+    }
+    if (historyOn() && isObj(raw.history)) {
+      const h = raw.history;
+      if (isObj(h.seen)) {
+        for (const [s, v] of Object.entries(h.seen)) if (SLUG_RE.test(s) && TASK_STATUSES.includes(v)) st.history.seen[s] = v;
+      }
+      if (Array.isArray(h.changes)) {
+        const floor = d.getTime() - CHANGES_TTL_MS;
+        st.history.changes = h.changes
+          .filter((c) => isObj(c) && typeof c.at === 'string' && (msOf(c.at) ?? -Infinity) >= floor
+            && typeof c.slug === 'string' && SLUG_RE.test(c.slug)
+            && (c.from === null || TASK_STATUSES.includes(c.from)) && TASK_STATUSES.includes(c.to)
+            && CHANGE_VIA.includes(c.via))
+          .map((c) => ({ at: c.at, slug: c.slug, from: c.from, to: c.to, via: c.via }))
+          .slice(-MAX_CHANGES);
+      }
+      if (typeof h.digest_day === 'string' && DAY_RE.test(h.digest_day)) st.history.digest_day = h.digest_day;
+      if (typeof h.digest_at === 'string' && msOf(h.digest_at) !== null) st.history.digest_at = h.digest_at;
     }
     return st;
   }
@@ -723,15 +847,47 @@ export function createHeartbeat(deps) {
 
   // 发一条心跳消息并记索引。按钮只在开关打开、且这条消息只涉及一条台账时带上；没有按钮时 send 只收一个参数
   // （与改造前逐字相同）。send 拿不到 message_id（返回 undefined 等）就只是不记索引，照常算发出
-  async function sendIndexed(st, text, { slugs, kind, nowMs }) {
+  // BRIDGE-VR-1：buttons 不给＝EV-1 规则（只涉及一条台账时带三个按钮）；给函数＝(slugs, nonce) → 按钮列表（验收卡片 /
+  // 升级阶梯 / 日结撤销各用各的）；给 null＝不带。extra 并进索引条目（如阶梯第一级的 ladder: true）
+  async function sendIndexed(st, text, { slugs, kind, nowMs, buttons, extra }) {
     const uniq = [...new Set((slugs ?? []).filter((s) => typeof s === 'string' && SLUG_RE.test(s)))];
     const nonce = crypto.randomBytes(8).toString('hex');
-    const actions = buttonsOn() && uniq.length === 1 ? ledgerButtons(uniq[0], nonce) : null;
+    let actions = null;
+    if (buttonsOn()) {
+      if (buttons === undefined) actions = uniq.length === 1 ? ledgerButtons(uniq[0], nonce) : null;
+      else if (typeof buttons === 'function') actions = buttons(uniq, nonce);
+      if (!Array.isArray(actions) || !actions.length) actions = null;
+    }
     const mid = actions ? await send(text, { actions }) : await send(text);
     if (typeof mid !== 'string' || !MSG_ID_RE.test(mid)) return null;
-    st.msg_index[mid] = { slugs: uniq, nonce, kind, at: iso(nowMs), ...(actions ? { buttons: true } : {}) };
+    st.msg_index[mid] = { slugs: uniq, nonce, kind, at: iso(nowMs), ...(actions ? { buttons: true } : {}), ...(extra ?? {}) };
     pruneIndex(st, nowMs);
     return mid;
+  }
+
+  // ---------------------------------------------------------------- 台账状态变化记录（BRIDGE-VR-1，给日结用）
+
+  // 记一条状态变化（history 开着才记）：同一状态不记；seen 同步成新状态
+  function recordChange(st, slug, from, to, via, nowMs) {
+    const h = st.history;
+    if (!h || from === to || !TASK_STATUSES.includes(to) || !CHANGE_VIA.includes(via)) return;
+    if (from !== null && !TASK_STATUSES.includes(from)) return;
+    h.changes.push({ at: iso(nowMs), slug, from, to, via });
+    if (h.changes.length > MAX_CHANGES) h.changes.splice(0, h.changes.length - MAX_CHANGES);
+    h.seen[slug] = to;
+  }
+
+  // 拿当前台账跟上次见到的状态比，变了的按 via 记一条；之后 seen＝当前（第一次见到的只记下、不算变化）
+  function diffSeen(st, tasks, via, nowMs) {
+    const h = st.history;
+    if (!h) return;
+    const cur = {};
+    for (const t of tasks) {
+      cur[t.slug] = t.status;
+      const was = Object.hasOwn(h.seen, t.slug) ? h.seen[t.slug] : undefined;
+      if (was !== undefined && was !== t.status) recordChange(st, t.slug, was, t.status, via, nowMs);
+    }
+    h.seen = cur;
   }
 
   // 待说明事项 → 正文前后的说明行。恢复发送放开头，其余（watch 锁定、队满丢弃、多次失败放弃）放末尾
@@ -1024,13 +1180,52 @@ export function createHeartbeat(deps) {
     if (typeof messageId !== 'string' || !MSG_ID_RE.test(messageId)) return { ok: false, reason: 'message_id 不合规' };
     const entry = indexEntry(messageId);
     if (!entry) return { ok: false, reason: '消息不在心跳索引里' };
-    if (typeof action !== 'string' || !Object.hasOwn(LEDGER_ACTIONS, action)) return { ok: false, reason: '未知动作' };
+    if (typeof action !== 'string' || !allowedActions(entry).includes(action)) return { ok: false, reason: '未知动作' };
+    const digest = entry.kind === 'digest';
+    if (digest && !viaButton) return { ok: false, reason: '日结的撤销只认按钮' };
     if (viaButton && (entry.buttons !== true || !sameNonce(nonce, entry.nonce))) return { ok: false, reason: 'nonce 不符' };
     if (typeof slug !== 'string' || !entry.slugs.includes(slug)) return { ok: false, reason: '台账不属于这条消息' };
-    if (entry.acted?.[action]) return { ok: false, reason: `已经按『${LEDGER_ACTIONS[action]}』处理过了` };
-    const c = checkActionable(tasksDir, slug, validateTask);
+    if (digest) {
+      if (!undoable(slug)) return { ok: false, reason: '这条已经不是自动判定的办完了' };
+    } else if (entry.acted?.[action]) {
+      return { ok: false, reason: `已经按『${actionLabel(action)}』处理过了` };
+    }
+    const c = Object.hasOwn(LEDGER_ACTIONS, action)
+      ? checkActionable(tasksDir, slug, validateTask)
+      : checkVerifiable(tasksDir, slug, action, validateTask);
     if (!c.ok) return { ok: false, reason: c.reason };
     return { ok: true, slug, action };
+  }
+
+  // 每种消息认哪些动作（BRIDGE-VR-1）：验收卡片＝验收 / 没办完 / 不做了；日结＝撤销；升级阶梯＝EV-1 三个 + 办完了；
+  // 其余心跳消息＝EV-1 三个（逐字 EV-1）。桥接内部动作（demote / autodone）哪种消息都不认
+  function allowedActions(entry) {
+    if (entry?.kind === 'verify') return ['accept', 'reopen', 'vdrop'];
+    if (entry?.kind === 'digest') return ['undo'];
+    if (entry?.kind === 'escalate' || entry?.ladder === true) return [...Object.keys(LEDGER_ACTIONS), 'done'];
+    return Object.keys(LEDGER_ACTIONS);
+  }
+
+  // 日结的撤销只对「最后一次变化是桥接 / 模型 / 心跳轮自动判定的 done」有效（光总自己确认的、之后又改过的都不给撤）
+  function undoable(slug, st = loadState(now(), { repair: false })) {
+    const changes = st.history?.changes;
+    if (!Array.isArray(changes)) return false;
+    for (let i = changes.length - 1; i >= 0; i -= 1) {
+      const c = changes[i];
+      if (c.slug !== slug) continue;
+      return c.to === 'done' && UNDOABLE_VIA.includes(c.via);
+    }
+    return false;
+  }
+
+  /** 引用回复的短语 → 动作（按这条消息的种类分；不认识返回 null）。events.js 的 heartbeatReplyShortcut 用。 */
+  function phraseAction(entry, phrase) {
+    if (typeof phrase !== 'string' || !isObj(entry)) return null;
+    let table = ACTION_BY_PHRASE;
+    if (entry.kind === 'verify') table = VERIFY_PHRASES;
+    else if (entry.kind === 'digest') return null; // 日结的撤销只认按钮
+    else if (entry.kind === 'escalate' || entry.ladder === true) table = LADDER_PHRASES;
+    return Object.hasOwn(table, phrase) ? table[phrase] : null;
   }
 
   /** 卡片回调的 action.value（{ v:1, a, s, n }）校验。开关关着也照样校验。 */
@@ -1077,20 +1272,47 @@ export function createHeartbeat(deps) {
           }
           continue;
         }
-        const label = LEDGER_ACTIONS[job.action] ?? '未知动作';
+        const label = actionLabel(job.action) ?? '未知动作';
         const entry = typeof job.messageId === 'string' ? st.msg_index[job.messageId] : undefined;
-        if (entry?.acted?.[job.action]) {
+        const ev1 = Object.hasOwn(LEDGER_ACTIONS, job.action);
+        // 只认光总能做的动作（EV-1 三个 + VR-1 五个）；桥接内部动作（demote / autodone）不从这里进
+        if (!ev1 && !['done', 'accept', 'reopen', 'vdrop', 'undo'].includes(job.action)) {
+          log(`[heartbeat] tasks/${job.slug}.json：动作不认识，跳过`);
+          continue;
+        }
+        const isDigest = entry?.kind === 'digest';
+        if (!isDigest && entry?.acted?.[job.action]) {
           log(`[heartbeat] tasks/${job.slug}.json 的『${label}』已处理过，跳过重复回写`);
           continue;
         }
-        const r = ledgerAction({ slug: job.slug, action: job.action, source: job.source, now: d });
+        if (isDigest && !undoable(job.slug, st)) {
+          log(`[heartbeat] tasks/${job.slug}.json 已经不是自动判定的办完了，『${label}』跳过`);
+          continue;
+        }
+        const prev = historyOn() ? readTaskRaw(tasksDir, job.slug) : null;
+        const r = ev1
+          ? ledgerAction({ slug: job.slug, action: job.action, source: job.source, now: d })
+          : verifyAction({ slug: job.slug, action: job.action, source: job.source, now: d });
         if (!r?.ok) {
           log(`[heartbeat] 『${label}』没有写回 tasks/${job.slug}.json：${String(r?.reason ?? '未知原因').slice(0, 120)}`);
           continue;
         }
         if (job.action === 'ack') st.tasks[job.slug] = { ...(st.tasks[job.slug] ?? {}), acked_at: iso(ms) };
+        if (job.action === 'reopen' || job.action === 'undo') {
+          // 光总判过这条「没办完」：按台账记（不按依据指纹——模型改一个字就绕得过去）。
+          // 之后这条再被写成 done，不核对、不问模型，一律发卡片请光总确认；光总验收 / 点「办完了」或台账删掉才清
+          st.tasks[job.slug] = { ...(st.tasks[job.slug] ?? {}), rejected_at: iso(ms) };
+        } else if ((job.action === 'accept' || job.action === 'done') && st.tasks[job.slug]?.rejected_at) {
+          const { rejected_at: _cleared, ...rest } = st.tasks[job.slug];
+          st.tasks[job.slug] = rest;
+        }
+        if (!ev1 && st.verify) delete st.verify[job.slug]; // 光总处理过了：这条的验收卡片记录作废
+        if (historyOn() && prev?.ok) {
+          const after = readTaskRaw(tasksDir, job.slug);
+          if (after.ok) recordChange(st, job.slug, prev.raw?.status ?? null, after.raw?.status, 'owner', ms);
+        }
         if (entry) {
-          entry.acted = { ...(entry.acted ?? {}), [job.action]: iso(ms) };
+          if (!isDigest) entry.acted = { ...(entry.acted ?? {}), [job.action]: iso(ms) };
           if (!entry.read_at) {
             entry.read_at = iso(ms); // 点了按钮 / 回复了＝读过
             if (st.unread_pause?.active) resumeUnread(st, ms, '光总操作了心跳消息');
@@ -1107,7 +1329,10 @@ export function createHeartbeat(deps) {
 
   // 同样的正文 24 小时内只发一次；免打扰时段、待发队列还没发完、本拍已发满或发送失败都进待发队列。
   // quota：本拍还能发几条（补发的包与新消息合计，见 MAX_SENDS_PER_BEAT）
-  async function deliver(st, body, slugs, nowMs, quota) {
+  // opts（BRIDGE-VR-1，不给＝逐字 EV-1）：kind / title（null＝正文自带标题、不拼说明行）/ buttons / extra 见 sendIndexed；
+  // indexSlugs＝记进索引的台账（默认同 slugs）；onSent(mid)＝真正发出后回调（排进待发队列的不回调）
+  async function deliver(st, body, slugs, nowMs, quota, opts = {}) {
+    const { kind = 'heartbeat', title = '💓 **心跳**', buttons, extra, onSent, indexSlugs } = opts;
     const text = String(body).trim();
     const hash = sha256(text).slice(0, 32);
     const sentAt = st.sent[hash];
@@ -1148,9 +1373,10 @@ export function createHeartbeat(deps) {
       log(`[heartbeat] 本拍已发满 ${MAX_SENDS_PER_BEAT} 条，新消息进待发队列，下一拍再发`);
       return 'queued';
     }
-    const { text: full, used } = compose(st, '💓 **心跳**', text, { cutBody: true });
+    const { text: full, used } = title === null ? { text, used: {} } : compose(st, title, text, { cutBody: true });
+    let mid;
     try {
-      await sendIndexed(st, full, { slugs, kind: 'heartbeat', nowMs });
+      mid = await sendIndexed(st, full, { slugs: indexSlugs ?? slugs, kind, nowMs, buttons, extra });
     } catch (e) {
       enqueue(st, item);
       st.send_fails[hash] = 1; // 队首阻塞计数从这一次算起
@@ -1161,7 +1387,192 @@ export function createHeartbeat(deps) {
     quota.left -= 1;
     markSent(st, [item], nowMs);
     log('[heartbeat] 已私聊 owner');
+    if (typeof onSent === 'function') onSent(mid);
     return 'sent';
+  }
+
+  // ---------------------------------------------------------------- 验收卡片 / 阶梯模板（BRIDGE-VR-1）
+
+  // 卡片与阶梯模板现在能不能发：免打扰、未读暂停、待发队列没清、本拍发送失败过或发满了都不发——
+  // 也不进待发队列（按钮要对得上当下的台账状态），下一拍再试
+  const canSendNow = (st, quota) => !inQuietHours(now(), config.quietHours)
+    && !quota.paused && !quota.failed && quota.left > 0 && !st.pending.length;
+
+  async function sendCard(st, text, { slugs, kind, nowMs, quota, buttons, extra }) {
+    if (!canSendNow(st, quota)) return { ok: false };
+    try {
+      const mid = await sendIndexed(st, text, { slugs, kind, nowMs, buttons, extra });
+      quota.left -= 1;
+      for (const slug of slugs) if (st.tasks[slug]) st.tasks[slug].last_notified_at = iso(nowMs);
+      st.last_notified_at = iso(nowMs);
+      return { ok: true, mid };
+    } catch (e) {
+      logError(`[heartbeat] 私聊 owner 失败（${kind === 'verify' ? '验收卡片' : '升级提醒'}），下一拍再发：${redact(errText(e)).slice(0, 200)}`);
+      return { ok: false };
+    }
+  }
+
+  // 自动验收通过：桥接写 done（guard：核对期间依据被改过就不写）。成功返回 true
+  function autoDone(st, t, key, via, d) {
+    const r = verifyAction({
+      slug: t.slug, action: 'autodone', via, now: d, source: 'bridge',
+      guard: (raw) => (evidenceKey(raw?.done_evidence) === key ? null : '核对期间依据被改过'),
+    });
+    if (!r?.ok) {
+      log(`[heartbeat] 自动验收没有写回 tasks/${t.slug}.json：${String(r?.reason ?? '未知原因').slice(0, 120)}`);
+      return false;
+    }
+    delete st.verify[t.slug];
+    recordChange(st, t.slug, 'verify', 'done', via, d.getTime());
+    log(`[heartbeat] tasks/${t.slug}.json 自动验收通过（${via === 'model' ? '模型' : '规则'}），已改成 done`);
+    return true;
+  }
+
+  // 验收卡片：每条待验收（同一份依据）只发一张；发不出去（免打扰 / 暂停 / 队列没清 / 发满）下一拍再试
+  async function sendVerifyCard(st, t, e, nowMs, quota) {
+    const text = `🔍 **待你验收**\n\n${buildVerifyCard({
+      slug: t.slug,
+      task: t,
+      finding: e.finding,
+      verdict: e.verdict ? { verdict: e.verdict, reason: e.reason ?? '' } : undefined,
+      note: e.note,
+      buttons: buttonsOn(),
+      shortcuts: config.replyShortcuts === true,
+    })}`;
+    const r = await sendCard(st, text, {
+      slugs: [t.slug], kind: 'verify', nowMs, quota, buttons: (u, n) => (u.length === 1 ? verifyButtons(u[0], n) : null),
+    });
+    if (!r.ok) return false;
+    e.card_at = iso(nowMs);
+    if (r.mid) e.card_mid = r.mid;
+    log(`[heartbeat] 已私聊 owner：tasks/${t.slug}.json 待验收`);
+    return true;
+  }
+
+  // 验收（HEARTBEAT_VERIFY=rule|rule+model）：每条 verify 台账按依据核对一次——规则 pass 桥接直接写 done；
+  // 规则 fail 直接发验收卡片；规则 unknown（没写依据 / other / 模型写的 owner）：rule 档发卡片，
+  // rule+model 档再问一次 Haiku（每日 VERIFY_MAX_PER_DAY 次），pass 写 done，unsure / fail / 没按格式 / 调用失败都发卡片。
+  // 依据改了（指纹变了）重新核对；光总判过这条没办完（rejected_at）之后一律发卡片
+  async function verifyStep(st, tasks, d, quota) {
+    const nowMs = d.getTime();
+    const pending = tasks.filter((t) => t.status === 'verify').sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    const live = new Set(pending.map((t) => t.slug));
+    for (const s of Object.keys(st.verify)) if (!live.has(s)) delete st.verify[s];
+    let handled = 0;
+    for (const t of pending) {
+      const key = evidenceKey(t.done_evidence);
+      if (st.verify[t.slug]?.key !== key) st.verify[t.slug] = { key };
+      const e = st.verify[t.slug];
+      if (e.card_at) continue; // 卡片已发：等光总
+      if (handled >= MAX_VERIFY_PER_BEAT) break;
+      handled += 1;
+      if (e.finding) { // 上一拍已核对完、卡片没发出去：只补发卡片，不重新核对
+        await sendVerifyCard(st, t, e, nowMs, quota);
+        continue;
+      }
+      if (st.tasks[t.slug]?.rejected_at) { // 光总判过这条没办完：不核对、不问模型
+        e.finding = '光总之前判过这条没办完，这次请你确认';
+        await sendVerifyCard(st, t, e, nowMs, quota);
+        continue;
+      }
+      const rc = await ruleCheck({ task: t, runner: verifyRunner, owner: ownerId() });
+      if (rc.outcome === 'pass') {
+        if (autoDone(st, t, key, 'rule', d)) continue;
+        e.finding = rc.finding;
+        e.note = '桥接自动写回台账没成功，请你直接验收';
+        await sendVerifyCard(st, t, e, nowMs, quota);
+        continue;
+      }
+      // 规则判 fail 的直接发卡片（模型推翻不了）；只有 unknown 且 rule+model 档才问模型
+      if (rc.outcome !== 'unknown' || config.verify !== 'rule+model') {
+        e.finding = rc.finding;
+        await sendVerifyCard(st, t, e, nowMs, quota);
+        continue;
+      }
+      const max = verifyMax();
+      const n = Number.isInteger(st.verify_runs) ? st.verify_runs : max;
+      if (n >= max) {
+        log(`[heartbeat] 今日验收审核已到上限 ${n}/${max}，tasks/${t.slug}.json 直接请光总验收`);
+        e.finding = `${rc.finding}；今日模型审核已到上限（${n}/${max}），请你直接验收`;
+        await sendVerifyCard(st, t, e, nowMs, quota);
+        continue;
+      }
+      // 先把审核计数落盘再调模型（与心跳的每日上限同口径）：写不进去就不调
+      st.verify_runs = n + 1;
+      if (!persist(st)) {
+        e.finding = rc.finding;
+        e.note = '模型审核：审核计数无法落盘，这次没调模型';
+        await sendVerifyCard(st, t, e, nowMs, quota);
+        continue;
+      }
+      let verdict;
+      let note;
+      try {
+        const out = await runClaude(VERIFY_KEY, buildVerifyPrompt({ slug: t.slug, task: t, finding: rc.finding, raw: rc.raw, nowMs }), true, [], null, {
+          toolProfile: 'verifier',
+          model: config.verifyModel ?? DEFAULT_VERIFY_MODEL,
+          effort: 'low',
+        });
+        verdict = parseVerdict(out);
+        if (verdict.malformed) note = '模型审核：没按格式回答，按 unsure 处理';
+      } catch (err) {
+        logError(`[heartbeat] 验收审核调用模型失败（tasks/${t.slug}.json，按 unsure 处理）：${redact(errText(err)).slice(0, 200)}`);
+        verdict = { verdict: 'unsure', reason: '' };
+        note = '模型审核：调用失败，按 unsure 处理';
+      }
+      log(`[heartbeat] 验收审核 tasks/${t.slug}.json：${verdict.verdict}（今日第 ${st.verify_runs}/${max} 次）`);
+      if (verdict.verdict === 'pass' && !verdict.malformed) {
+        if (autoDone(st, t, key, 'model', d)) continue;
+        note = '桥接自动写回台账没成功，请你直接验收';
+      }
+      e.finding = rc.finding;
+      e.verdict = verdict.verdict;
+      e.reason = String(verdict.reason ?? '').slice(0, 80);
+      if (note) e.note = note;
+      await sendVerifyCard(st, t, e, nowMs, quota);
+    }
+  }
+
+  // 升级阶梯（HEARTBEAT_ESCALATE_LADDER=true）：st.tasks[slug].esc＝{ for: 这一轮的 escalate_after, level, last_at, mid }。
+  // 第一级＝escalate_after 第一次越过那拍的心跳消息（照 HB-1B 调模型）；之后每级是固定模板（不调模型）：
+  // 上一级读了满 24 小时、或没读满 48 小时，且光总没点「知道了」，才升一级；到 ESCALATE_MAX 级后只进日结「卡住」。
+  // escalate_after 改了（或台账不在跟进中、阶梯关了）就清掉，下一次越过重新从第一级来
+  function resetLadders(st, tasks) {
+    const bySlug = new Map(tasks.map((t) => [t.slug, t]));
+    for (const [slug, rec] of Object.entries(st.tasks)) {
+      if (!rec?.esc) continue;
+      const t = bySlug.get(slug);
+      if (!ladderOn() || !t || !ACTIVE_STATUSES.has(t.status) || rec.esc.for !== t.escalate_after) delete rec.esc;
+    }
+  }
+
+  async function ladderStep(st, tasks, d, quota) {
+    const nowMs = d.getTime();
+    const max = escalateMax();
+    for (const t of [...tasks].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))) {
+      const rec = st.tasks[t.slug];
+      const esc = rec?.esc;
+      if (!esc || esc.for !== t.escalate_after || !ACTIVE_STATUSES.has(t.status)) continue;
+      if (!Number.isInteger(esc.level) || esc.level < 1 || esc.level >= max) continue;
+      const lastMs = msOf(esc.last_at);
+      if (lastMs === null) continue;
+      const acked = msOf(rec.acked_at);
+      if (acked !== null && acked >= lastMs) continue; // 光总点过「知道了」：不再升级
+      const read = typeof esc.mid === 'string' ? st.msg_index[esc.mid]?.read_at : undefined;
+      if (nowMs - lastMs < (read ? DAY_MS : 2 * DAY_MS)) continue; // 读了等满 24 小时；没读等满 48 小时（未读不叠发）
+      if (!canSendNow(st, quota)) return;
+      const ea = t.times?.escalate_after;
+      const days = Math.max(1, Math.floor((nowMs - (Number.isFinite(ea) ? ea : nowMs)) / DAY_MS));
+      const text = `⏰『${plain(t.title)}』过了提醒时间 ${days} 天，状态 ${t.status}；上次进展：${plain(t.notes, 80) || '（无）'}`;
+      const r = await sendCard(st, text, {
+        slugs: [t.slug], kind: 'escalate', nowMs, quota,
+        buttons: (u, n) => (u.length === 1 ? ladderButtons(u[0], n) : null), extra: { ladder: true },
+      });
+      if (!r.ok) return;
+      // 拿不到 message_id 就不记 mid：下一级按「没读」等满 48 小时
+      rec.esc = { for: esc.for, level: esc.level + 1, last_at: iso(nowMs), ...(r.mid ? { mid: r.mid } : {}) };
+      log(`[heartbeat] tasks/${t.slug}.json 升级提醒第 ${rec.esc.level}/${max} 级（模板，不调模型）`);
+    }
   }
 
   // 合并补发的体量控制：sendMarkdown 截在 20,000 字，每包（含标题行）压在 18,000 以内留余量
@@ -1297,7 +1708,23 @@ export function createHeartbeat(deps) {
     const { tasks, invalid } = loadTasks(tasksDir, { log });
     prune(st, new Set([...tasks.map((t) => t.slug), ...invalid.map((i) => i.file.replace(/\.json$/i, ''))]), nowMs);
     applyWatchLocks(st, tasks); // 心跳轮里改过的 watch 按原值（不看外部增量也算原值）
-    const due = dueTasks(tasks, d);
+    // BRIDGE-VR-1（开关全关时这一段什么都不做）：拍与拍之间台账的状态变化记作 chat；待验收的先核对、发卡片；
+    // 升级阶梯到点发模板。都在心跳的每日次数之外（验收审核有自己的 VERIFY_MAX_PER_DAY）
+    if (historyOn()) diffSeen(st, tasks, 'chat', nowMs);
+    resetLadders(st, tasks);
+    if (verifyOn()) await verifyStep(st, tasks, d, quota);
+    if (ladderOn()) await ladderStep(st, tasks, d, quota);
+    if (verifyOn() || ladderOn() || historyOn()) persist(st);
+    let due = dueTasks(tasks, d);
+    if (ladderOn()) {
+      // 已登梯（第一级发过）的这一轮 escalate_after 不再算到期理由：之后的提醒走模板，不再为它调模型
+      due = due.map((it) => {
+        const esc = st.tasks[it.task.slug]?.esc;
+        if (!esc || !(esc.level >= 1) || esc.for !== it.task.escalate_after) return it;
+        const reasons = it.reasons.filter((r) => r !== 'escalate_after');
+        return reasons.length ? { ...it, reasons, since: Math.min(...reasons.map((f) => it.task.times[f])) } : null;
+      }).filter(Boolean).sort((a, b) => a.since - b.since || a.task.slug.localeCompare(b.task.slug));
+    }
     const pulled = await fetchDeltas(tasks, d, st);
     const { deltas } = pulled;
     const fp = fingerprint(deltas);
@@ -1350,6 +1777,13 @@ export function createHeartbeat(deps) {
       return { action: 'state-error' };
     }
     const watchBefore = snapshotWatch(); // watch 锁：调模型前后各拍一次，心跳轮里的改动不生效
+    // BRIDGE-VR-1：调模型前记下各台账状态（调模型期间写成 done 的才降级；拍与拍之间写的不动）
+    let statusBefore = null;
+    if (historyOn()) {
+      const snapTasks = loadTasks(tasksDir, { log: () => {} }).tasks;
+      statusBefore = new Map(snapTasks.map((t) => [t.slug, t.status]));
+      diffSeen(st, snapTasks, 'chat', nowMs);
+    }
 
     const prompt = buildHeartbeatPrompt({ due: shown, omitted: ready.length - shown.length, deltas, now: d, stats });
     log(`[heartbeat] ${shown.length} 条到期${deltas.length ? `、${deltas.length} 条外部增量` : ''}，调模型（今日第 ${st.runs}/${config.maxRunsPerDay} 次）`
@@ -1364,6 +1798,7 @@ export function createHeartbeat(deps) {
       });
     } catch (e) {
       if (lockWatchChanges(st, watchBefore, nowMs)) persist(st); // 模型失败前也可能改过文件；锁一加上就落盘
+      afterModel(st, statusBefore, d); // 失败前写成的 done 同样降级
       settle(false);
       const msg = errText(e);
       st.consecutive_failures += 1;
@@ -1382,6 +1817,7 @@ export function createHeartbeat(deps) {
       return { action: 'error' };
     }
     if (lockWatchChanges(st, watchBefore, nowMs)) persist(st);
+    afterModel(st, statusBefore, d);
     settle(true);
     st.consecutive_failures = 0;
     st.last_error = null;
@@ -1395,9 +1831,45 @@ export function createHeartbeat(deps) {
     }
     // 这条消息涉及的台账：送进提示词的到期项 + 带外部增量的条目（按钮、引用回复提示行据此判断「只涉及一条」）
     const involved = [...new Set([...shown.map((x) => x.task.slug), ...deltas.map((x) => x.slug).filter(Boolean)])];
-    const action = await deliver(st, body, involved, nowMs, quota);
+    // 升级阶梯第一级（BRIDGE-VR-1）：这拍因 escalate_after 到期的每一条，消息发出 / 进待发队列 / 24 小时内发过同样的，
+    // 都登上第一级（R1：不再只认「只涉及一条」）。阶梯四个按钮仍只给只涉及一条的消息；
+    // mid 只在真发出且只涉及一条时记——没有 mid 的下一级按「没读」等满 48 小时
+    const crossings = ladderOn() ? shown.filter((x) => x.reasons.includes('escalate_after')) : [];
+    let sentMid;
+    const action = !crossings.length
+      ? await deliver(st, body, involved, nowMs, quota)
+      : await deliver(st, body, involved, nowMs, quota, {
+        ...(involved.length === 1 ? {
+          buttons: (u, n) => (u.length === 1 ? ladderButtons(u[0], n) : null),
+          extra: { ladder: true },
+        } : {}),
+        onSent: (mid) => { sentMid = mid; },
+      });
+    if (crossings.length && (action === 'sent' || action === 'queued' || action === 'dup')) {
+      const mid = action === 'sent' && involved.length === 1 && typeof sentMid === 'string' ? sentMid : null;
+      for (const { task } of crossings) {
+        const esc = { for: task.escalate_after, level: 1, last_at: iso(nowMs), ...(mid ? { mid } : {}) };
+        st.tasks[task.slug] = { ...(st.tasks[task.slug] ?? {}), esc };
+        log(`[heartbeat] tasks/${task.slug}.json 越过 escalate_after，升级提醒第 1/${escalateMax()} 级`);
+      }
+    }
     persist(st);
     return { action };
+  }
+
+  // 调模型之后（成功或失败）：HEARTBEAT_VERIFY 开着时，这一拍里新写成 done 的台账改成 verify 等验收
+  // （模型说办完了不算数，要桥接核对或光总确认）；然后把这一拍的状态变化记作 heartbeat
+  function afterModel(st, statusBefore, d) {
+    if (!statusBefore) return;
+    if (verifyOn()) {
+      for (const t of loadTasks(tasksDir, { log: () => {} }).tasks) {
+        if (t.status !== 'done' || statusBefore.get(t.slug) === 'done') continue;
+        const r = verifyAction({ slug: t.slug, action: 'demote', now: d, source: 'bridge' });
+        if (r?.ok) log(`[heartbeat] 心跳这一拍把 tasks/${t.slug}.json 写成了 done，已改成 verify 等验收`);
+        else logError(`[heartbeat] 心跳这一拍把 tasks/${t.slug}.json 写成了 done，没能改成 verify：${String(r?.reason ?? '未知原因').slice(0, 120)}`);
+      }
+    }
+    diffSeen(st, loadTasks(tasksDir, { log: () => {} }).tasks, 'heartbeat', d.getTime());
   }
 
   /** 跑一拍。永不抛出；上一拍没结束时直接跳过（自带互斥锁，不占定时任务的并发名额）。 */
@@ -1420,6 +1892,98 @@ export function createHeartbeat(deps) {
     }
   }
 
+  // ---------------------------------------------------------------- 每晚台账日结（BRIDGE-VR-1）
+  // HEARTBEAT_DIGEST_AT=HH:MM：到点发一份五栏日结，五栏全空不发；一天只发一次（history.digest_day，重启不重发）；
+  // 不调模型、不读 journal。发出或排进待发队列后，在当天 journal 记一段。和心跳共用 inflight 互斥：
+  // 心跳正在跑就返回 busy（定时器 60 秒后再试）。「今天办完 / 今天放弃」从上一份日结的时刻（history.digest_at：
+  // 发出 / 进队列 / 重复不发 / 五栏全空都记）往后数，没有就从当天 0 点起（R1：日结之后、没发日结那天的变化不漏）
+
+  /** 现在发日结（定时器到点调；测试直接调）。永不抛出。 */
+  async function digestNow() {
+    if (!config.enabled || !config.digestAt) return { action: 'off' };
+    if (!active) return { action: 'paused' };
+    if (inflight) return { action: 'busy' };
+    inflight = true;
+    try {
+      const d = now();
+      const ms = d.getTime();
+      const st = loadState(d);
+      if (!st.history) st.history = { seen: {}, changes: [], digest_day: null };
+      const today = localDay(d);
+      if (st.history.digest_day === today) return { action: 'already' };
+      const { tasks } = loadTasks(tasksDir, { log: () => {} });
+      diffSeen(st, tasks, 'chat', ms); // 上一拍之后在对话里改的，记作「会话里改的」
+      const paused = checkUnreadPause(st, ms);
+      // 发不出去（排进待发队列）的日结不带按钮：撤销提示改成「在对话里说一声」
+      const willQueue = st.pending.length > 0 || paused || inQuietHours(d, config.quietHours);
+      const dg = buildDigest({
+        tasks,
+        changes: st.history.changes,
+        taskState: st.tasks,
+        now: d,
+        since: msOf(st.history.digest_at), // 上一份日结之后的变化（R1：日结发完后的、没发日结那天的都进这一份）
+        ladder: ladderOn(),
+        escalateMax: escalateMax(),
+        buttons: buttonsOn() && !willQueue,
+      });
+      if (dg.empty) {
+        st.history.digest_at = iso(ms);
+        persist(st);
+        log('[heartbeat] 台账日结：五栏都空，今天不发');
+        return { action: 'empty' };
+      }
+      const res = await deliver(st, `${dg.title}\n\n${dg.body}`, [], ms, { left: 1, paused, failed: false }, {
+        kind: 'digest',
+        title: null,
+        indexSlugs: dg.undo,
+        buttons: dg.undo.length ? (u, n) => undoButtons(dg.undo, n) : null,
+      });
+      if (res === 'sent' || res === 'queued' || res === 'dup') {
+        st.history.digest_day = today;
+        st.history.digest_at = iso(ms); // 下一份从这里往后算
+      }
+      if ((res === 'sent' || res === 'queued') && !appendJournalBlock(journalDir, d, dg.journal)) {
+        logError('[heartbeat] 台账日结没能写进当天 journal');
+      }
+      persist(st);
+      const what = { sent: '已私聊 owner', queued: '进了待发队列', dup: '同样的正文 24 小时内发过，不重发' }[res] ?? res;
+      log(`[heartbeat] 台账日结：${what}`);
+      return { action: res };
+    } catch (e) {
+      logError(`[heartbeat] 台账日结异常（已拦下）：${redact(errText(e)).slice(0, 300)}`);
+      return { action: 'exception' };
+    } finally {
+      inflight = false;
+      drainActions();
+    }
+  }
+
+  function armDigest(ms) {
+    const T = timers();
+    digestTimer = T.setTimeout(() => digestTick(), ms);
+    digestTimer?.unref?.();
+  }
+
+  // 日结定时器到点：窗口（到点后 30 分钟）内才发，晚到不补发；心跳正在跑 60 秒后再试；其余排到明天同一时间
+  async function digestTick() {
+    digestTimer = null;
+    if (!interval || !config.digestAt) return;
+    let next;
+    try {
+      const at = config.digestAt;
+      if (!inDigestWindow(now(), at)) {
+        next = msUntilNext(now(), at);
+      } else {
+        const r = await digestNow();
+        next = r.action === 'busy' ? 60_000 : msUntilNext(now(), at);
+      }
+    } catch (e) {
+      logError(`[heartbeat] 日结定时器异常（已拦下）：${redact(errText(e)).slice(0, 200)}`);
+      next = msUntilNext(now(), config.digestAt);
+    }
+    if (interval && !digestTimer) armDigest(next);
+  }
+
   function start() {
     if (!config.enabled) {
       log('[heartbeat] 未启用（HEARTBEAT_ENABLED 不是 true），不启动');
@@ -1432,6 +1996,7 @@ export function createHeartbeat(deps) {
     firstTimer?.unref?.();
     interval = T.setInterval(tick, config.intervalMin * 60_000);
     interval?.unref?.();
+    if (config.digestAt) armDigest(msUntilNext(now(), config.digestAt)); // BRIDGE-VR-1：日结没设不建
     log(
       `[heartbeat] 已启动：每 ${config.intervalMin} 分钟一拍，每日最多调模型 ${config.maxRunsPerDay} 次，`
         + `免打扰 ${config.quietHours ? config.quietHours.label : '关闭'}，模型 ${config.model}/${config.effort}`,
@@ -1443,8 +2008,10 @@ export function createHeartbeat(deps) {
     const T = timers();
     if (firstTimer) T.clearTimeout(firstTimer);
     if (interval) T.clearInterval(interval);
+    if (digestTimer) T.clearTimeout(digestTimer);
     firstTimer = null;
     interval = null;
+    digestTimer = null;
   }
 
   function setActive(on) {
@@ -1498,6 +2065,18 @@ export function createHeartbeat(deps) {
     const other = c('reaction_not_owner') + c('reaction_not_heartbeat') + c('read_not_heartbeat') + c('read_other')
       + c('recalled');
     const onOff = (v) => (v ? '开' : '关');
+    // BRIDGE-VR-1：验收 / 升级阶梯 / 日结三个开关（全关时这三行显示 off / 关，其余行逐字 EV-1）
+    let verifyLine = 'off';
+    if (config.verify === 'rule+model') {
+      verifyLine = `rule+model（模型 ${config.verifyModel ?? DEFAULT_VERIFY_MODEL}）· 待验收 ${counts.verify} 条`
+        + ` · 今日模型审核 ${Number.isInteger(st.verify_runs) ? st.verify_runs : 0}/${verifyMax()}`;
+    } else if (config.verify === 'rule') {
+      verifyLine = `rule · 待验收 ${counts.verify} 条`;
+    }
+    const climbing = scan.tasks.filter((t) => ACTIVE_STATUSES.has(t.status) && t.escalate_after
+      && st.tasks[t.slug]?.esc?.for === t.escalate_after).length;
+    const ladderLine = ladderOn() ? `开（最多 ${escalateMax()} 级）· 升级中 ${climbing} 条` : '关';
+    const verifyCol = verifyOn() || counts.verify > 0 ? ` · verify ${counts.verify}` : '';
     return [
       '💓 **心跳状态**',
       `- 配置开关 HEARTBEAT_ENABLED：${config.enabled ? 'true（已启用）' : '未启用（不是 true）'}`,
@@ -1509,9 +2088,12 @@ export function createHeartbeat(deps) {
       `- watch：在看 ${watching} 条 · 锁定 ${locked} 条（心跳轮里改的 watch 不生效）`,
       `- 按钮 HEARTBEAT_BUTTONS：${onOff(buttonsOn())} · 引用回复快捷 HEARTBEAT_REPLY_SHORTCUTS：${onOff(config.replyShortcuts === true)}`,
       `- 未读暂停：${pause}`,
+      `- 验收 HEARTBEAT_VERIFY：${verifyLine}`,
+      `- 升级阶梯 HEARTBEAT_ESCALATE_LADDER：${ladderLine}`,
+      `- 日结 HEARTBEAT_DIGEST_AT：${config.digestAt ? config.digestAt.label : '关'}`,
       `- 今日事件：owner 有效 ${ownerOk}（表情 ${c('reaction_owner')} · 已读 ${c('read_owner')} · 按钮 ${c('card_ok')}）`
         + ` · app 回显 ${c('reaction_app')} · 其他 ${other}`,
-      `- 台账：open ${counts.open} · waiting ${counts.waiting} · done ${counts.done} · dropped ${counts.dropped}`
+      `- 台账：open ${counts.open} · waiting ${counts.waiting}${verifyCol} · done ${counts.done} · dropped ${counts.dropped}`
         + ` · 无效 ${scan.invalid.length}${names ? `（${names}${more}）` : ''}`,
       `- 当前到期 ${dueNow.length} 条${backingOff ? `（退避中 ${backingOff} 条）` : ''} · 待发 ${st.pending.length} 条`,
       `- 上一拍 ${at(st.last_beat_at)} · 上次调模型 ${at(st.last_run_at)} · 连续失败 ${st.consecutive_failures} 次`,
@@ -1536,6 +2118,9 @@ export function createHeartbeat(deps) {
     drainActions,
     requestResume,
     isInflight: () => inflight,
+    // BRIDGE-VR-1：日结（定时器之外也可直接触发）；引用回复短语按消息类型查动作
+    digestNow,
+    phraseAction,
   };
 }
 

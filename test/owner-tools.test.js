@@ -211,3 +211,126 @@ describe('回归：普通 owner 与定时任务参数除新增 Edit(./tasks/**) 
     }
   });
 });
+
+const { existsSync } = await import('node:fs');
+const { default: os } = await import('node:os');
+const { default: path } = await import('node:path');
+const { fileURLToPath } = await import('node:url');
+
+describe('验收工具档 toolProfile=verifier（BRIDGE-VR-1 测试 5）', () => {
+  const V_OPTS = { toolProfile: 'verifier', model: 'claude-haiku-5-5', effort: 'low' };
+  // env 开到最宽：放宽的 ALLOWED_TOOLS、LARK_CLI、飞书 MCP、strict owner 档都不得渗进验收档
+  const WIDE = {
+    ALLOWED_TOOLS: 'Read,Grep,Glob,Bash,WebFetch,WebSearch,Edit(./schedules/**),Edit(./skills/**)',
+    LARK_CLI: 'true',
+    FEISHU_TOOLS: undefined,
+    OWNER_TOOL_PROFILE: 'strict',
+  };
+  const REPO = fileURLToPath(new URL('..', import.meta.url));
+  const vr = (m, extra = [], opts = {}) => m.buildClaudeArgs('sched:verify', true, extra, { ...V_OPTS, ...opts });
+
+  test('没有任何工具：--tools 为空串；--setting-sources 为空 + --strict-mcp-config；无 --allowedTools / --mcp-config', () =>
+    withEnv(WIDE, (m) => {
+      const r = vr(m);
+      r.cleanup();
+      assert.equal(argVal(r.args, '--tools'), '', '--tools 必须是空串（一个工具都没有）');
+      assert.equal(argVal(r.args, '--setting-sources'), '', '不加载任何 settings 来源');
+      assert.ok(r.args.includes('--strict-mcp-config'), '不加载用户级 MCP');
+      assert.ok(!r.args.includes('--allowedTools'), '验收档不得有 --allowedTools');
+      assert.ok(!r.args.includes('--mcp-config'), '验收档不得挂 MCP');
+      assert.ok(!r.args.includes('--resume'));
+      assert.equal(argVal(r.args, '--settings'), JSON.stringify({ autoMemoryEnabled: false }));
+    }));
+
+  test('argv 逐项：-p stream-json --verbose --tools "" --setting-sources "" --strict-mcp-config --settings --model --effort low --append-system-prompt', () =>
+    withEnv(WIDE, (m) => {
+      const r = vr(m, [], { effort: 'max' });
+      r.cleanup();
+      assert.equal(r.args[0], '-p');
+      assert.deepEqual(r.args.filter((x) => x.startsWith('--')), [
+        '--output-format', '--verbose', '--tools', '--setting-sources', '--strict-mcp-config',
+        '--settings', '--model', '--effort', '--append-system-prompt',
+      ]);
+      assert.equal(argVal(r.args, '--output-format'), 'stream-json');
+      assert.equal(argVal(r.args, '--model'), 'claude-haiku-5-5');
+      assert.equal(argVal(r.args, '--effort'), 'low', '验收档固定 low');
+      const sys = argVal(r.args, '--append-system-prompt');
+      assert.match(sys, /只输出/);
+      assert.match(sys, /JSON/);
+      assert.match(sys, /不调用任何工具/);
+    }));
+
+  test('cwd 每次新建在 os.tmpdir() 下、不在仓库内、不是工作区；cleanup 后目录消失', () =>
+    withEnv(WIDE, (m) => {
+      const a = vr(m);
+      const b = vr(m);
+      try {
+        for (const r of [a, b]) {
+          assert.ok(r.cwd.startsWith(path.join(os.tmpdir(), 'feishu-verifier-')), `cwd 不在临时目录：${r.cwd}`);
+          assert.ok(!r.cwd.startsWith(REPO), 'cwd 不得在仓库内');
+          assert.ok(!r.cwd.startsWith(m.WORKSPACE_DIR), 'cwd 不得是 workspace/');
+          assert.ok(existsSync(r.cwd), '调用前目录必须存在');
+        }
+        assert.notEqual(a.cwd, b.cwd, '每次调用都是全新的临时目录');
+      } finally {
+        a.cleanup();
+        b.cleanup();
+      }
+      assert.ok(!existsSync(a.cwd) && !existsSync(b.cwd), 'cleanup 后临时目录必须删除');
+    }));
+
+  test('不吃 extraTools、不续会话；模型取调用方给的值', () =>
+    withEnv(WIDE, (m) => {
+      const r = vr(m, ['Read(./incoming/**)', 'Bash(curl:*)'], { resumeId: 'sess-1', model: 'claude-sonnet-5-5' });
+      r.cleanup();
+      const all = r.args.join('\n');
+      assert.ok(!all.includes('curl') && !all.includes('incoming'), 'extraTools 不得混进验收档');
+      assert.ok(!r.args.includes('--resume'));
+      assert.equal(argVal(r.args, '--model'), 'claude-sonnet-5-5');
+    }));
+
+  test('只对 owner 生效：非 owner 带 verifier 档时参数与不带时完全一致', () =>
+    withEnv(WIDE, (m) => {
+      const a = m.buildClaudeArgs('guest:oc:ou', false, [], { toolProfile: 'verifier' });
+      const b = m.buildClaudeArgs('guest:oc:ou', false, [], {});
+      a.cleanup();
+      b.cleanup();
+      assert.deepEqual(a.args, b.args);
+      assert.equal(a.cwd, b.cwd);
+    }));
+
+  // 只用一次性目录（os.tmpdir() 下新建），绝不把仓库 / workspace 交给 cleanup：防护被改坏时也只删到这些临时目录
+  test('cleanup 只删自己建的、os.tmpdir() 正下方的 feishu-verifier- 目录：cwd 被改到别处时不删（R1 L3）', () =>
+    withEnv(WIDE, (m) => {
+      const fs = process.getBuiltinModule('node:fs');
+      const r = vr(m);
+      const own = r.cwd;
+      const other = fs.mkdtempSync(path.join(os.tmpdir(), 'vr-l3-'));
+      const nested = fs.mkdtempSync(path.join(other, 'feishu-verifier-')); // 名字像，但不在 os.tmpdir() 正下方
+      try {
+        for (const dir of [nested, other]) {
+          r.cwd = dir;
+          r.cleanup();
+          assert.ok(fs.existsSync(dir), `cwd 被改成 ${dir}：cleanup 不得删`);
+        }
+        r.cwd = own;
+        r.cleanup();
+        assert.ok(!fs.existsSync(own), '自己建的临时目录照常删');
+      } finally {
+        fs.rmSync(other, { recursive: true, force: true });
+        fs.rmSync(own, { recursive: true, force: true });
+      }
+    }));
+});
+
+describe('验收工具档：调用方没给模型或给了非法模型名时兜底 claude-haiku-5-5（BRIDGE-VR-1 测试 5 补）', () => {
+  test('toolProfile=verifier 不带 model / 空串 / 非法名 → --model claude-haiku-5-5（不回落全局 CLAUDE_MODEL）', () =>
+    withEnv({ CLAUDE_MODEL: 'claude-sonnet-5-5', OWNER_TOOL_PROFILE: 'strict' }, (m) => {
+      for (const model of [undefined, '', 'bad name;rm']) {
+        const r = m.buildClaudeArgs('sched:verify', true, [], { toolProfile: 'verifier', model });
+        r.cleanup();
+        assert.equal(argVal(r.args, '--model'), 'claude-haiku-5-5', `model=${JSON.stringify(model)}`);
+        assert.equal(argVal(r.args, '--tools'), '');
+      }
+    }));
+});

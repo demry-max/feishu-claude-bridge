@@ -6,7 +6,9 @@ import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeys
 import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
-import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand } from './heartbeat.js';
+import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY } from './heartbeat.js';
+import { VERIFY_KEY } from './verifier.js';
+import { createShutdown, shutdownGraceSec, replyIfDraining } from './shutdown.js';
 import { createEventHandlers, heartbeatReplyShortcut, sendCardWithFallback } from './events.js'; import { createWatchSources, createLarkRunner } from './watch-sources.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
@@ -152,11 +154,18 @@ function isDuplicate(messageId) {
 
 // ---- 每个会话串行处理，避免并发 resume 冲突 ----
 const chatQueues = new Map();
+let turnsInFlight = 0; // 刚收到还没排队 + 排队中 + 进行中的对话轮（BRIDGE-VR-1：优雅退出等它们做完）
 function enqueue(chatId, task) {
+  turnsInFlight += 1;
   const prev = chatQueues.get(chatId) ?? Promise.resolve();
-  const next = prev.then(task).catch((e) => console.error('[queue]', e));
+  const next = prev.then(task).catch((e) => console.error('[queue]', e)).finally(() => { turnsInFlight -= 1; });
   chatQueues.set(chatId, next);
   return next;
+}
+// 收到的消息从进 handleMessage 起就算进行中（下载附件、拼提示词时还没进队列），优雅退出也等它（BRIDGE-VR-1）
+function trackedHandleMessage(data) {
+  turnsInFlight += 1;
+  return handleMessage(data).finally(() => { turnsInFlight -= 1; });
 }
 
 async function reply(messageId, text) {
@@ -230,6 +239,8 @@ async function handleMessage(data) {
     console.log(`[deny] ${senderOpenId} @ ${message.chat_id} 不在白名单`);
     return;
   }
+  // 优雅退出中（BRIDGE-VR-1）：不再接新消息，回一句让对方稍后重发
+  if (await replyIfDraining({ shutdown, reply, messageId: message.message_id, log: console.error })) return;
 
   // ---- owner：首个私聊者自动认领，owner 享有本机工具，其他人仅联网工具 ----
   let owner = OWNER_OPEN_ID || loadOwner();
@@ -564,7 +575,7 @@ async function handleMessage(data) {
 }
 
 const eventDispatcher = new lark.EventDispatcher({}).register({
-  'im.message.receive_v1': handleMessage,
+  'im.message.receive_v1': trackedHandleMessage,
   // 机器人事件 → 「光总对心跳消息的操作」信号（BRIDGE-EV-1）：表情 / 已读 / 撤回原本到达即丢，卡片按钮回调是新增的。
   // 全部由桥接按确定规则处理：不调模型、永不抛出；按钮回调同步校验后立即回 toast，回写异步排队
   ...(() => {
@@ -817,7 +828,24 @@ const heartbeat = startHeartbeat({
   collectDeltas: createWatchSources({ runner: createLarkRunner(), getOwner: () => OWNER_OPEN_ID || loadOwner(), log: console.log }),
   // 按钮 / 引用回复回写后在当天 journal 记一行（与提示词里的 memory/journal/ 同一目录）
   journalDir: path.join(WORKSPACE_DIR, 'memory', 'journal'),
+  // BRIDGE-VR-1：验收的规则核对复用 EV-1 的只读 lark-cli（同一份白名单，HEARTBEAT_VERIFY=off 时一次都不跑）；
+  // getOwner 用来认出「光总本人发的」不算对方回复
+  verifyRunner: createLarkRunner(),
+  getOwner: () => OWNER_OPEN_ID || loadOwner(),
 });
+
+// ---- 优雅退出（BRIDGE-VR-1）：SIGTERM / SIGINT 先停接新消息、停心跳，等进行中的对话做完再退出 ----
+// 最多等 SHUTDOWN_GRACE_SEC 秒（默认 120）；等待期间新来的消息回「正在重启，请稍后重发」；第二次信号立即退出。
+// 进行中＝刚收到 / 排队 / 进行中的对话轮 + 跑着的定时任务 + 正在跑的心跳一拍（含验收审核）
+const shutdown = createShutdown({
+  graceSec: shutdownGraceSec(process.env, console.error),
+  inflight: () => turnsInFlight
+    + runningKeysWithPrefix('sched:').filter((k) => k !== HEARTBEAT_KEY && k !== VERIFY_KEY).length
+    + (heartbeat.isInflight() ? 1 : 0),
+  onDrain: () => heartbeat.stop(),
+  log: console.log,
+});
+shutdown.install(process);
 
 console.log('启动飞书长连接…');
 wsClient.start({ eventDispatcher });

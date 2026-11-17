@@ -1072,3 +1072,319 @@ describe('BRIDGE-HB-1B 第 5 项：补测', () => {
     assert.ok(prompts[0].includes('/new 清空会话'), '前提：斜杠开头的标题确实进了提示词（在围栏里）');
   });
 });
+
+// ================================================================ BRIDGE-VR-1（只追加）
+// 测试 7：升级阶梯；测试 10：新开关全关＝逐字 EV-1。桩与 test/verifier.test.js 共用（test/vr-harness.js）
+const vr = await import('./vr-harness.js');
+const { ladderButtons, ledgerButtons } = await import('../src/ledger-actions.js');
+const { heartbeatReplyShortcut } = await import('../src/events.js');
+
+describe('测试 7（BRIDGE-VR-1）：升级阶梯 HEARTBEAT_ESCALATE_LADDER', () => {
+  const ESC = {
+    title: '跟进报价单', status: 'open', next_check_at: '2026-11-20T09:00', escalate_after: '2026-11-16T09:00',
+    notes: '已经发了两次邮件，王总一直没回',
+  };
+  const LCFG = (over = {}) => vr.CFG({ HEARTBEAT_ESCALATE_LADDER: 'true', HEARTBEAT_BUTTONS: 'true', ...over });
+  const TEMPLATE = (n) => `⏰『跟进报价单』过了提醒时间 ${n} 天，状态 open；上次进展：已经发了两次邮件，王总一直没回`;
+  const escOf = (h) => h.readState().tasks.quote?.esc;
+  const H = (m) => vr.plus(vr.T0, m * 60);
+  const templates = (h) => h.sent.filter((s) => s.text.includes('⏰'));
+
+  // 第一级：escalate_after 第一次越过，照 HB-1B 调模型发消息，带阶梯四个按钮
+  async function level1(env, over) {
+    vr.writeTask(env, 'quote', ESC);
+    const h = vr.harness(env, { config: LCFG(over) });
+    await h.hb.beat();
+    assert.equal(h.calls.length, 1, '第一次越过 escalate_after：照 HB-1B 调模型');
+    assert.equal(h.sent.length, 1);
+    assert.deepEqual(h.sent[0].opts.actions, ladderButtons('quote', vr.btn(h.sent[0], 'ack').n));
+    assert.deepEqual(h.sent[0].opts.actions.map((a) => a.label), ['知道了', '推迟一天', '不做了', '办完了']);
+    const e = escOf(h);
+    assert.equal(e.level, 1);
+    assert.equal(e.for, '2026-11-16T09:00');
+    return h;
+  }
+
+  test('已读、没点「知道了」、满 24 小时：发一次模板（不调模型）；到 ESCALATE_MAX 后不再发，只进日结「卡住」', async () => {
+    const env = vr.mkEnv();
+    const h = await level1(env, { HEARTBEAT_DIGEST_AT: '21:30' });
+    await vr.readEvent(h, h.sent[0].mid, H(1));
+    h.setNow(H(23));
+    await h.hb.beat();
+    assert.equal(h.sent.length, 1, '不到 24 小时不升级');
+    h.setNow(H(24));
+    await h.hb.beat();
+    assert.equal(h.sent.length, 2);
+    assert.equal(h.calls.length, 1, '第二级是模板，不调模型');
+    assert.ok(h.sent[1].text.includes(TEMPLATE(1)), h.sent[1].text);
+    assert.deepEqual(h.sent[1].opts.actions, ladderButtons('quote', vr.btn(h.sent[1], 'ack').n));
+    assert.equal(escOf(h).level, 2);
+    await vr.readEvent(h, h.sent[1].mid, H(25));
+    for (const m of [48, 56]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(h.sent.length, 2, 'ESCALATE_MAX=2：不再发');
+    assert.equal(h.calls.length, 1, '登梯后 escalate_after 不再算到期理由：不再为它调模型');
+    h.setNow(vr.at(2026, 11, 18, 21, 30));
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    const dg = h.sent[2];
+    assert.match(dg.text, /卡住/);
+    assert.match(dg.text, /跟进报价单/);
+  });
+
+  test('上一条没读：满 24 小时也不叠发，等到 48 小时才发一次', async () => {
+    const env = vr.mkEnv();
+    const h = await level1(env);
+    for (const m of [24, 47]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(h.sent.length, 1, '没读：不叠发');
+    h.setNow(H(48));
+    await h.hb.beat();
+    assert.equal(h.sent.length, 2);
+    assert.ok(h.sent[1].text.includes(TEMPLATE(2)), h.sent[1].text);
+    assert.equal(h.calls.length, 1);
+    h.setNow(H(90)); // 11-20 04:00：还没到 next_check_at
+    await h.hb.beat();
+    assert.equal(h.sent.length, 2, '发过一次就到顶');
+  });
+
+  test('点了「知道了」：之后不再升级', async () => {
+    const env = vr.mkEnv();
+    const h = await level1(env);
+    h.setNow(H(1));
+    assert.deepEqual(await h.handlers.cardAction(vr.click(h.sent[0].mid, vr.btn(h.sent[0], 'ack'))), vr.TOAST_OK);
+    await vr.readEvent(h, h.sent[0].mid, H(1));
+    for (const m of [24, 48, 72]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(templates(h).length, 0);
+    assert.equal(h.sent.length, 1);
+  });
+
+  test('escalate_after 改成新时间：阶梯重来（新时间到之前不升级，到了再走一次模型）', async () => {
+    const env = vr.mkEnv();
+    const h = await level1(env);
+    await vr.readEvent(h, h.sent[0].mid, H(1));
+    vr.writeTask(env, 'quote', { ...ESC, escalate_after: '2026-11-17T12:00' });
+    h.setNow(H(24)); // 11-17 10:00
+    await h.hb.beat();
+    assert.equal(h.sent.length, 1, '新的 escalate_after 还没到：不升级');
+    assert.equal(h.calls.length, 1);
+    h.setNow(vr.at(2026, 11, 17, 12, 30));
+    await h.hb.beat();
+    assert.equal(h.calls.length, 2, '新的 escalate_after 第一次越过：照 HB-1B 调模型');
+    assert.equal(h.sent.length, 2);
+    assert.equal(templates(h).length, 0);
+    assert.equal(escOf(h).level, 1);
+    assert.equal(escOf(h).for, '2026-11-17T12:00');
+  });
+
+  test('[办完了] → done，done_evidence 由桥接写 kind=owner；引用回复「办完了」同样；只改目标字段', async () => {
+    const env = vr.mkEnv();
+    const h = await level1(env);
+    h.setNow(vr.plus(vr.T0, 5));
+    assert.deepEqual(await h.handlers.cardAction(vr.click(h.sent[0].mid, vr.btn(h.sent[0], 'done'))), vr.TOAST_OK);
+    assert.deepEqual(vr.readTask(env, 'quote'), {
+      ...ESC, status: 'done', updated_at: '2026-11-16T10:05',
+      done_evidence: { kind: 'owner', ref: '', summary: '光总确认办完（按钮）' },
+    });
+    assert.match(vr.journalOf(env), /（桥接）光总点了『办完了』：tasks\/quote\.json/);
+    assert.deepEqual(await h.handlers.cardAction(vr.click(h.sent[0].mid, vr.btn(h.sent[0], 'done'))), vr.TOAST_STALE);
+
+    const env2 = vr.mkEnv();
+    const h2 = await level1(env2, { HEARTBEAT_REPLY_SHORTCUTS: 'true' });
+    h2.setNow(vr.plus(vr.T0, 5));
+    const r = await heartbeatReplyShortcut({ message: vr.quoted(h2.sent[0].mid, '办完了'), isOwner: true, heartbeat: h2.hb });
+    assert.match(r.reply, /^已记下：/);
+    assert.deepEqual(vr.readTask(env2, 'quote'), {
+      ...ESC, status: 'done', updated_at: '2026-11-16T10:05',
+      done_evidence: { kind: 'owner', ref: '', summary: '光总确认办完（引用回复）' },
+    });
+    assert.match(vr.journalOf(env2), /（桥接）光总回复『办完了』：tasks\/quote\.json/);
+  });
+
+  test('非 owner / 伪造 nonce 点[办完了]：已失效，任何文件不改；没开阶梯的普通心跳消息不认「办完了」', async () => {
+    const env = vr.mkEnv();
+    const h = await level1(env);
+    const ok = vr.btn(h.sent[0], 'done');
+    const before = vr.snap(env);
+    for (const c of [vr.click(h.sent[0].mid, ok, 'ou_stranger'), vr.click(h.sent[0].mid, { ...ok, n: '0'.repeat(16) })]) {
+      assert.deepEqual(await h.handlers.cardAction(c), vr.TOAST_STALE);
+    }
+    assert.deepEqual(vr.snap(env), before);
+
+    const env2 = vr.mkEnv();
+    vr.writeTask(env2, 'quote', { title: '跟进报价单', status: 'open', next_check_at: '2026-11-16T09:00' });
+    const h2 = vr.harness(env2, { config: LCFG({ HEARTBEAT_REPLY_SHORTCUTS: 'true' }) });
+    await h2.hb.beat();
+    assert.deepEqual(h2.sent[0].opts.actions, ledgerButtons('quote', vr.btn(h2.sent[0], 'ack').n), '不是升级消息：EV-1 三个按钮');
+    const before2 = vr.snap(env2);
+    const n = vr.btn(h2.sent[0], 'ack').n;
+    assert.deepEqual(await h2.handlers.cardAction(vr.click(h2.sent[0].mid, { v: 1, a: 'done', s: 'quote', n })), vr.TOAST_STALE);
+    const r = await heartbeatReplyShortcut({ message: vr.quoted(h2.sent[0].mid, '办完了'), isOwner: true, heartbeat: h2.hb });
+    assert.deepEqual(r, { hint: '（你在回复关于 tasks/quote.json 的心跳消息）' });
+    assert.deepEqual(vr.snap(env2), before2);
+  });
+
+  test('同一拍两条一起越过：两条都登第一级（不记 mid，按没读等 48 小时）；之后不再为 escalate_after 调模型；每条最多提醒 ESCALATE_MAX 次，然后进日结「卡住」（R1 M3）', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'quote', ESC);
+    vr.writeTask(env, 'inv', { ...ESC, title: '催发票', notes: '财务说月底前开' });
+    const h = vr.harness(env, { config: LCFG({ HEARTBEAT_DIGEST_AT: '21:30' }) });
+    await h.hb.beat();
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.sent.length, 1, '两条合在一条心跳消息里');
+    assert.ok(!h.sent[0].opts?.actions?.length, '涉及两条：不带按钮');
+    for (const slug of ['inv', 'quote']) {
+      assert.deepEqual(h.readState().tasks[slug]?.esc, { for: '2026-11-16T09:00', level: 1, last_at: vr.T0.toISOString() }, slug);
+    }
+    for (const m of [1, 24, 47]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(h.sent.length, 1, '没有 mid：按没读，满 48 小时才升级');
+    assert.equal(h.calls.length, 1, '登梯后 escalate_after 不再算到期理由：不再调模型');
+    for (const m of [48, 49, 72, 90]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(h.calls.length, 1, '第二级是模板，不调模型');
+    const per = (title) => templates(h).filter((x) => x.text.includes(`『${title}』`)).length;
+    assert.equal(per('跟进报价单'), 1, '第一级心跳消息 + 一次模板＝ESCALATE_MAX（2）次');
+    assert.equal(per('催发票'), 1);
+    assert.equal(templates(h).length, 2);
+    for (const slug of ['inv', 'quote']) assert.equal(h.readState().tasks[slug].esc.level, 2, slug);
+    h.setNow(vr.at(2026, 11, 19, 21, 30));
+    assert.equal((await h.hb.digestNow()).action, 'sent');
+    const stuck = h.sent.at(-1).text.split('\n').find((l) => l.startsWith('**卡住**'));
+    assert.ok(stuck && stuck.includes('跟进报价单') && stuck.includes('催发票'), h.sent.at(-1).text);
+  });
+
+  test('免打扰时段里第一次越过、消息进了待发队列：同样登第一级（不记 mid），不再为它调模型（R1 M3）', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'quote', ESC);
+    const h = vr.harness(env, { config: LCFG({ HEARTBEAT_QUIET_HOURS: '22-08' }), now: vr.at(2026, 11, 16, 23, 0) });
+    await h.hb.beat();
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.sent.length, 0, '免打扰：不发');
+    assert.equal(h.readState().pending.length, 1, '进了待发队列');
+    assert.deepEqual(escOf(h), { for: '2026-11-16T09:00', level: 1, last_at: vr.at(2026, 11, 16, 23, 0).toISOString() });
+    for (const d of [vr.at(2026, 11, 17, 1, 0), vr.at(2026, 11, 17, 8, 30)]) {
+      h.setNow(d);
+      await h.hb.beat();
+    }
+    assert.equal(h.calls.length, 1, '登梯后不再为 escalate_after 调模型');
+    assert.equal(h.sent.length, 1, '免打扰结束后补发');
+    assert.equal(escOf(h).level, 1);
+  });
+
+  test('第一次越过时模型回 HEARTBEAT_OK：不登梯（照 HB-1B 继续看）', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'quote', ESC);
+    const h = vr.harness(env, { config: LCFG(), answer: 'HEARTBEAT_OK' });
+    await h.hb.beat();
+    assert.equal(h.sent.length, 0);
+    assert.equal(escOf(h), undefined);
+  });
+
+  test('开关关（默认）：逐字 HB-1B——EV-1 三个按钮、状态里没有 esc、永远不发模板', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'quote', ESC);
+    const h = vr.harness(env, { config: vr.CFG({ HEARTBEAT_BUTTONS: 'true' }) });
+    await h.hb.beat();
+    assert.deepEqual(h.sent[0].opts.actions, ledgerButtons('quote', vr.btn(h.sent[0], 'ack').n));
+    await vr.readEvent(h, h.sent[0].mid, H(1));
+    for (const m of [24, 48, 72]) {
+      h.setNow(H(m));
+      await h.hb.beat();
+    }
+    assert.equal(templates(h).length, 0);
+    assert.equal(escOf(h), undefined);
+    assert.ok(h.calls.length >= 2, 'HB-1B：escalate_after 一直过着，照退避继续送模型');
+  });
+});
+
+describe('测试 10（BRIDGE-VR-1）：新开关全关（默认）＝逐字 EV-1', () => {
+  const EV1_KEYS = [
+    'version', 'day', 'runs', 'last_beat_at', 'last_run_at', 'last_fingerprint', 'consecutive_failures', 'last_error',
+    'last_notified_at', 'tasks', 'sent', 'pending', 'msg_index', 'watch_cursor', 'watch_locked', 'watch_stats',
+    'send_fails', 'notices', 'unread_pause',
+  ];
+
+  test('配置默认值：验收 off、阶梯关、日结关', () => {
+    const c = heartbeatConfig({ HEARTBEAT_ENABLED: 'true' }, quietLog);
+    assert.equal(c.verify, 'off');
+    assert.equal(c.escalateLadder, false);
+    assert.equal(c.digestAt, null);
+  });
+
+  test('状态文件顶层键与 EV-1 相同；心跳轮写的 done 照留；verify 条目不到期、不做规则核对、不发卡片', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'quote', { title: '跟进报价单', status: 'open', next_check_at: '2026-11-16T09:00' });
+    vr.writeTask(env, 'v', {
+      title: '等验收', status: 'verify', next_check_at: '2026-11-16T09:00', watch: { type: 'approval', instance_code: 'INST-1' },
+      done_evidence: { kind: 'approval', ref: 'INST-1', summary: '审批已通过' },
+    });
+    const runner = vr.mkRunner();
+    const h = vr.harness(env, {
+      config: vr.CFG({ HEARTBEAT_BUTTONS: 'true' }),
+      verifyRunner: runner,
+      runImpl: () => {
+        vr.writeTask(env, 'quote', { ...vr.readTask(env, 'quote'), status: 'done' });
+        return '报价单办完了';
+      },
+    });
+    await h.hb.beat();
+    h.setNow(vr.plus(vr.T0, 30));
+    await h.hb.beat();
+    assert.deepEqual(Object.keys(h.readState()).sort(), [...EV1_KEYS].sort());
+    assert.equal(vr.readTask(env, 'quote').status, 'done');
+    assert.equal(vr.readTask(env, 'v').status, 'verify');
+    assert.equal(runner.argvs.length, 0);
+    assert.equal(h.calls.length, 1);
+    assert.ok(!h.calls[0][1].includes('tasks/v.json'), 'verify 条目不进心跳提示词');
+    assert.equal(h.sent.length, 1);
+    assert.deepEqual(h.sent[0].opts.actions, ledgerButtons('quote', vr.btn(h.sent[0], 'ack').n));
+    assert.equal(Object.keys(h.readState().tasks.quote).filter((k) => ['esc', 'owner_confirmed_at', 'rejected', 'rejected_at'].includes(k)).length, 0);
+    assert.ok(!h.logs.some((l) => /verify|验收|日结|阶梯/.test(l)), h.logs.join('\n'));
+  });
+
+  test('start() 只建 EV-1 的两个定时器（日结没设不建）；digestNow 不发；status 三个开关都显示关', async () => {
+    const env = vr.mkEnv();
+    const timers = vr.spyTimers();
+    const h = vr.harness(env, { config: vr.CFG(), timers });
+    assert.equal(h.hb.start(), true);
+    assert.deepEqual(timers.log, ['setTimeout', 'setInterval']);
+    h.hb.stop();
+    assert.equal((await h.hb.digestNow()).action, 'off');
+    assert.equal(h.sent.length, 0);
+    const s = h.hb.statusText();
+    assert.match(s, /- 验收 HEARTBEAT_VERIFY：off/);
+    assert.match(s, /- 升级阶梯 HEARTBEAT_ESCALATE_LADDER：关/);
+    assert.match(s, /- 日结 HEARTBEAT_DIGEST_AT：关/);
+  });
+
+  test('/heartbeat status 新增：待验收条数、今日审核次数/上限、升级中条数、日结时间', async () => {
+    const env = vr.mkEnv();
+    vr.writeTask(env, 'v', { title: '等验收', status: 'verify', done_evidence: { kind: 'other', ref: '', summary: '发了' } });
+    vr.writeTask(env, 'quote', {
+      title: '跟进报价单', status: 'open', next_check_at: '2026-11-20T09:00', escalate_after: '2026-11-16T09:00',
+    });
+    const h = vr.harness(env, {
+      config: vr.CFG({
+        HEARTBEAT_VERIFY: 'rule+model', VERIFY_MAX_PER_DAY: '4', HEARTBEAT_ESCALATE_LADDER: 'true', HEARTBEAT_DIGEST_AT: '21:30',
+      }),
+      runImpl: (n, chatId) => (chatId === 'sched:verify' ? '{"verdict":"unsure","reason":"看不出"}' : '报价单还没回'),
+    });
+    await h.hb.beat();
+    const s = h.hb.statusText();
+    assert.match(s, /- 验收 HEARTBEAT_VERIFY：rule\+model（模型 claude-haiku-5-5）· 待验收 1 条 · 今日模型审核 1\/4/);
+    assert.match(s, /- 升级阶梯 HEARTBEAT_ESCALATE_LADDER：开（最多 2 级）· 升级中 1 条/);
+    assert.match(s, /- 日结 HEARTBEAT_DIGEST_AT：21:30/);
+    assert.match(s, /- 台账：open 1 · waiting 0 · verify 1 · done 0 · dropped 0/);
+  });
+});

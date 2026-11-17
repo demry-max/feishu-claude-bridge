@@ -74,6 +74,38 @@
 - 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md`（本版不改 `workspace/CLAUDE.md`）。
 - 测试：新增 `test/tool-policy.test.js`、`test/owner-profiles.test.js`、`test/tool-audit.test.js` 与两个夹具；既有测试一个未改。
 
+### BRIDGE-VR-1
+
+- **验收（`HEARTBEAT_VERIFY=off|rule|rule+model`，默认 `off`）**：台账新增状态 `verify` 与可选字段 `done_evidence`
+  （`kind` ∈ approval / message / owner / other，`ref` 按 kind 校验，`summary` ≤200 字；不合规时台账照常有效，记下原因、核对时直接发卡片）。
+  开着时，心跳一拍里新写成 `done` 的台账在这一拍结束时改成 `verify`；owner 对话与桥接写的 `done` 不动。
+  脚本规则（只读，只调 EV-1 已有的 `approvalGet` / `messageGet`）分通过 / 不通过 / 核对不了三种：只有审批状态 `APPROVED`、
+  或对方真人在交办（`created_at` 与数字 `watch.after` 中晚的那个）之后在 watch 的会话里回了消息才算通过，由桥接写 `done`；
+  审批被拒绝 / 撤回 / 删除、还没通过、ref 对不上、owner 本人发的、早于交办、查询失败、依据格式不合规都算不通过，直接发卡片、不问模型。
+  只有核对不了的（没写依据、`kind=other`、模型写的 `kind=owner`）在 `rule+model` 档用 `VERIFY_MODEL`
+  （默认 `claude-haiku-5-5`，每日 `VERIFY_MAX_PER_DAY` 次，默认 10）审核一次，只认一行严格 JSON。`pass` 写 `done`，
+  `fail` / `unsure` / 格式不对 / 调用失败一律发「🔍 待你验收」卡片：［验收］［没办完］［不做了］或引用回复同名短语。
+  光总点过「没办完」或在日结里撤销过的台账按台账记下（`tasks.<slug>.rejected_at`），之后再写 `done` 不论依据改没改一律发卡片，
+  光总验收或点［办完了］后清掉。
+- **verifier 工具档**（`toolProfile:'verifier'`，仅 owner 调用生效）：`--tools ''`、`--setting-sources ''`、`--strict-mcp-config`，
+  不续会话、`--effort low`，cwd 为每次新建、用完即删的系统临时目录（只删 `os.tmpdir()` 正下方 `feishu-verifier-` 开头的那个）；
+  owner / 定时 / 心跳 / 访客四类 argv 逐字不变。
+- **升级阶梯（`HEARTBEAT_ESCALATE_LADDER=true`，默认关；`ESCALATE_MAX` 默认 2）**：`escalate_after` 越过后第 1 级照旧是心跳消息
+  （同一拍一起越过的几条、进了待发队列或 24 小时内发过同样的，都登第 1 级；不记消息 ID 的按没读等 48 小时），
+  之后按固定模板（不调模型）再提醒。上一级读了满 24 小时、或没读满 48 小时才升一级（没读不叠发），点过「知道了」就不再升；
+  到顶后只进日结「卡住」。模板消息多一个［办完了］按钮 / 短语，由桥接写 `done` 与 `kind=owner` 依据。
+- **每晚台账日结（`HEARTBEAT_DIGEST_AT=HH:MM`，默认空＝关）**：五栏（今天办完并注明方式 / 今天放弃 / 待你验收 / 卡住 / 明天到期），
+  每栏最多 5 条、整条不超过 15 行，五栏全空不发；只读台账与桥接自己记的状态变化（状态文件新增 `history`），不读 journal、不调模型。
+  「今天办完 / 今天放弃」从上一份日结的时刻（`history.digest_at`）往后数，日结发完之后或没发日结那天关的单进下一份。
+  自动判定办完的带圈号与［撤销］按钮，撤销后改回 `open`、明天再看；一天一次、重启不重发、晚到 30 分钟不补发，发出后 journal 记一段。
+- **`/heartbeat status`** 增加验收、升级阶梯、日结三行，台账分布在验收开着或有待验收时多一栏 `verify`。
+- **优雅退出**：SIGTERM / SIGINT 后不再接新消息（新消息回「正在重启，请稍后重发」）、停心跳与日结定时器，等进行中的对话轮、
+  定时任务与心跳一拍做完再退出，最多 `SHUTDOWN_GRACE_SEC` 秒（默认 120）；第二次信号立即退出。
+- 状态文件 `data/heartbeat-state.json` 新增顶层键 `verify` / `history` / `verify_runs` 与 `tasks.<slug>.esc`，缺了当空，不升版本号。
+- 提示词改动另见建议稿 `docs/vr-prompt-proposal.md`（本版不改 `workspace/CLAUDE.md`）。
+- 测试：新增 `test/verifier.test.js`、`test/digest.test.js`、`test/shutdown.test.js` 与共用夹具 `test/vr-harness.js`；
+  `test/heartbeat.test.js`、`test/owner-tools.test.js` 只在本卡的 describe 块里加用例与断言，EV-1 / HB-1B 既有断言一条未改。
+
 ## [2.3.0] - 2026-09-14
 
 ### 新增
