@@ -106,6 +106,46 @@
 - 测试：新增 `test/verifier.test.js`、`test/digest.test.js`、`test/shutdown.test.js` 与共用夹具 `test/vr-harness.js`；
   `test/heartbeat.test.js`、`test/owner-tools.test.js` 只在本卡的 describe 块里加用例与断言，EV-1 / HB-1B 既有断言一条未改。
 
+### BRIDGE-PERM-2
+
+> strict 档补洞：技能 / `.claude` 提权路、写文件落点、排查诊断工具面、群聊回执。全部只在 `audit` / `strict` 下生效，`legacy` 逐字不变。
+
+- **技能提权封堵（audit / strict）**：同步技能时，`SKILL.md` 的 frontmatter 顶层键若是 `allowed-tools` / `hooks`
+  （含 `"allowed-tools"` 引号写法、`allowed_tools` 下划线变体、`disallowed-tools`）连同其缩进续行一起剥掉，正文一字不动、无 frontmatter 原样保留；
+  技能树里的符号链接（含指向目录的）整棵跳过。用户级 `lark-*` 技能（`syncExtraSkills`）同样剥。
+- **`.claude` 外来文件隔离（audit / strict）**：工作区 `.claude/` 下除桥接自己同步的真目录 `skills/` 外，
+  `settings*.json` / `hooks/` / `commands/` / `agents/` / `CLAUDE.md` 等一律移进 `workspace/.claude-quarantine/`（带时间戳改名、不加载也不删）。
+  strict 下隔离失败即 fail closed——抛「claude CLI 启动失败」（命中 `NEVER_RETRY`，不重试、宁可本轮不跑）；audit 兜底继续并记「无法隔离」日志。
+  `skills/` 被换成软链或文件时同样隔离。legacy 仍是逐字节 `cpSync`，不隔离、不剥 frontmatter、不同步用户级技能。
+- **strict 对话去掉 `skills/` 写权（Q1-B）**：strict 对话档 `--allowedTools` 不再含 `Edit(./skills/**)` / `Write(./skills/**)`，
+  仍保留 `memory/` / `schedules/` / `outbox/` / `tasks/` 的写权。技能只能由桥接单向同步进来。
+- **写文件落点闸（audit / strict）**：`lark-cli` 读类子命令若带 `--output` / `-o` / `>` / `>>` / `| tee`，落点必须在工作区 `outbox/`
+  或系统临时目录，否则 strict 拒绝、audit 记「将会拒绝」；`.claude/`、`CLAUDE.md`、`schedules/`、`skills/`、`tasks/`、`.mcp.json`
+  永不是合法落点；`cd` 进保护区后的相对落点、`../` 与符号链接逃逸都按物理路径判。纯函数 `checkOutputTargets` / `outputTargets`
+  （`src/tool-policy.js`）可注入 `realpath`/`readlink`；内联 PreToolUse 钩子 `src/hooks/output-guard.js` 一律 fail closed（坏输入 / 缺 workspace / 缺命令都 `exit 2`，任何分支都不输出 `allow`）。
+- **排查诊断（sched-diag）无工具档（audit / strict，Q2）**：定时任务排查诊断轮用 `--setting-sources ''` + `--strict-mcp-config` + `--tools ''`
+  （外加 `--disallowedTools` 黑名单兜底、`autoMemoryEnabled:false`），`job.prompt` 与报错包进随机 nonce 的不可信围栏；legacy 的排查诊断逐字不变。
+- **群聊不附回执（Q3）**：owner 以名义对外的动作，回执「— 本轮以你名义：…」只在 owner 私聊（`p2p`）末尾追加；
+  群聊轮不附回执（群里的写动作仍照常记审计）。
+- 提示词改动另见建议稿 `docs/owner-tools-prompt-proposal.md` §五（本版不改 `workspace/CLAUDE.md`）。本卡未引入新 `.env` 项。
+- 测试：新增 `test/owner-profiles-perm2.test.js`（legacy 全矩阵回归、同步树、隔离 + 剥键、fail-closed、Q1-B、sched-diag）、
+  `test/tool-policy-output.test.js`（落点闸纯函数 / 真实软链逃逸 / 审计 judge 闸 / 钩子子进程 / 词法分类对基线逐字回归）与两个夹具；
+  既有 `test/owner-profiles.test.js`、`test/tool-audit.test.js` 各补测。
+- **R1 返工（审查 §9）**：
+  - `.claude/skills` 改为整树重建（`.claude-staging/<pid>-<序号>-<8 位随机 hex>/` 暂存后整体换上），存量外来技能 / 软链进
+    `.claude-quarantine/skills-<名>.<时间戳>`；拷贝目的地一律 `wx` / `COPYFILE_EXCL` 新建，不再跟随软链写穿。
+  - `SKILL.md` frontmatter 从「黑名单剥键」改为「白名单重建」（只留 `name` / `description` / `version` / `metadata`）；开头分隔行带空白、
+    或与 CLI 截取不一致时整个技能不拷。
+  - 用户级 `lark-*` 顶层软链按 realpath 解引用，只认 `~/.agents/skills` 的直接子目录（`~/.claude/skills` 根暂不认，见停卡项）。
+  - `.claude` 本身是软链 / 文件时只挪链接本身；`.claude-quarantine` / `.claude-staging` 不是真目录算隔离失败。
+  - 落点闸新增隐式落点：`drive +download`、`im +messages-resource(s)-download` 不带输出参数按写当前目录判，`--download-resources`
+    按写 `./lark-im-resources/` 判；钩子拒绝文案提示显式写 `--output`。
+  - 钩子只静态 import `node:*`，判定模块动态加载，加载失败 / 未捕获异常都 `exit 2`。
+  - 新增导出 `usesEqAsPrefix`：`lark-cli --as=user …` 在审计判定里一律 deny（`classifyCommand` / strict argv 不变）。
+  - sched-diag（audit / strict）任务名单行化、限 80 字。
+  - 测试：新增 `test/skills-sync-perm2.test.js`，`test/tool-policy-output.test.js` / `test/owner-profiles-perm2.test.js` 补 `测PERM2-R1-*`。
+- **R2 返工**：隐式落点所在那一段自己用 `env -C` / `--chdir` / 嵌套 `sh -c` 的 `cd` 改了目录时不按 `cd` 链判、退回全部 base；用户级技能软链只认 `~/.agents/skills`（协调者裁定，删去被跳过的 R1-4b）；补测 `测PERM2-R2-1..5`。
+
 ## [2.3.0] - 2026-09-14
 
 ### 新增

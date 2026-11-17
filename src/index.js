@@ -14,7 +14,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
-import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummary } from './claude.js';
+import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -772,15 +772,8 @@ startScheduler({
         send: (text) => sendToChat(chatId, text),
         runDiagnosis: () => runClaude(
           `sched-diag:${job._file}`,
-          // 自诊断是模板化的短任务，没必要用旗舰模型
-          [
-            '你是定时任务的诊断助手。以下任务执行失败，请判断原因并给出结论。',
-            `任务名：${job.name ?? job._file}`,
-            `任务指令：${job.prompt}`,
-            `报错：${err}`,
-            '',
-            '请用三行回答：1) 失败类别（权限/网络/额度/任务本身写错/其他）；2) 根因判断；3) 建议动作（能自行修复就说明怎么改任务定义，需要人工就明确说要做什么）。不要重试该任务。',
-          ].join('\n'),
+          // 自诊断是模板化的短任务，没必要用旗舰模型；提示词按工具档拼（audit/strict 把任务指令/报错围栏起来）
+          schedDiagPrompt(job, err),
           true,
           [],
           null,
