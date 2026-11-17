@@ -227,7 +227,7 @@
 - **启动自检**：显式配置 `ALLOWED_TOOLS` 且缺默认 owner 工具里的 `Edit(./…/**)` 写入项时，打一行 `[config] ⚠️` 列出缺的项名（不打整行配置、不改权限）。
 - **回放对比脚本** `scripts/daily-session-replay.js`（只读两臂、盲评、产物只写 `--out`、`--dry-run` 只打 argv）与占位题目 `scripts/daily-session-replay.questions.example.txt`。
 - **提示词**：新增 `docs/ds-prompt-proposal.md`（「接续材料」「交接轮」两节与「新写入的记忆当天写全」一句）；本版不改 `workspace/CLAUDE.md`，把 `DAILY_SESSION` 改成 `on` 的当天再并入。README 中英、AGENTS.md 可选功能表补一行。
-- 测试：新增 `test/daily-session.test.js`、`test/daily-session-replay.test.js`；既有测试与夹具一条未改。
+- 测试：新增 `test/daily-session.test.js`、`test/daily-session-replay.test.js`；夹具一个未改。既有测试只改了一处：合入 main 时为适配交接档必须带会话 id，`test/biz-profiles.test.js` 用例 11 的两项 handoff 调用补了 `resumeId`，断言不变。
 
 ### 业务系统只读查询（bms / ias）
 
