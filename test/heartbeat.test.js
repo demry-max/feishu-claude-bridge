@@ -2,6 +2,7 @@
 // 全部用桩时钟、注入的 runClaude / 发送函数 / 定时器，不起子进程、不联网。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { ownerText, OWNER as O_NAME, YOU as O_YOU } from '../src/owner-name.js'; // BRIDGE-PUB-1：称呼按配置（测试里未设：owner / 你）
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1190,9 +1191,9 @@ describe('测试 7（BRIDGE-VR-1）：升级阶梯 HEARTBEAT_ESCALATE_LADDER', (
     assert.deepEqual(await h.handlers.cardAction(vr.click(h.sent[0].mid, vr.btn(h.sent[0], 'done'))), vr.TOAST_OK);
     assert.deepEqual(vr.readTask(env, 'quote'), {
       ...ESC, status: 'done', updated_at: '2026-11-16T10:05',
-      done_evidence: { kind: 'owner', ref: '', summary: '光总确认办完（按钮）' },
+      done_evidence: { kind: 'owner', ref: '', summary: ownerText`${O_NAME}确认办完（按钮）` },
     });
-    assert.match(vr.journalOf(env), /（桥接）光总点了『办完了』：tasks\/quote\.json/);
+    assert.ok(vr.journalOf(env).includes(ownerText`（桥接）${O_NAME}点了『办完了』：tasks/quote.json`), vr.journalOf(env));
     assert.deepEqual(await h.handlers.cardAction(vr.click(h.sent[0].mid, vr.btn(h.sent[0], 'done'))), vr.TOAST_STALE);
 
     const env2 = vr.mkEnv();
@@ -1202,9 +1203,9 @@ describe('测试 7（BRIDGE-VR-1）：升级阶梯 HEARTBEAT_ESCALATE_LADDER', (
     assert.match(r.reply, /^已记下：/);
     assert.deepEqual(vr.readTask(env2, 'quote'), {
       ...ESC, status: 'done', updated_at: '2026-11-16T10:05',
-      done_evidence: { kind: 'owner', ref: '', summary: '光总确认办完（引用回复）' },
+      done_evidence: { kind: 'owner', ref: '', summary: ownerText`${O_NAME}确认办完（引用回复）` },
     });
-    assert.match(vr.journalOf(env2), /（桥接）光总回复『办完了』：tasks\/quote\.json/);
+    assert.ok(vr.journalOf(env2).includes(ownerText`（桥接）${O_NAME}回复『办完了』：tasks/quote.json`), vr.journalOf(env2));
   });
 
   test('非 owner / 伪造 nonce 点[办完了]：已失效，任何文件不改；没开阶梯的普通心跳消息不认「办完了」', async () => {

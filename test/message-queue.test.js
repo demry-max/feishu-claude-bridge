@@ -3,6 +3,7 @@
 // 依赖全部注入桩：不连飞书、不起 claude 子进程、不碰 workspace、不读 .env。纯逻辑另测 src/message-queue.js。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { ownerText, OWNER as O_NAME, YOU as O_YOU } from '../src/owner-name.js'; // BRIDGE-PUB-1：称呼按配置（测试里未设：owner / 你）
 import fs from 'node:fs';
 import { routeTurn } from '../src/lanes.js';
 import { detectConfirm, CONFIRM_DEFAULT_PROMPT } from '../src/tool-policy.js';
@@ -219,7 +220,7 @@ describe('BRIDGE-MQ-1 纯逻辑（src/message-queue.js）', () => {
     assert.equal(mq.QUEUE_FULL_REPLY, '排队已满（10 条），等手头的办完再发');
     assert.equal(mq.QUEUE_SHUTDOWN_REPLY, '助理正在重启，这条没处理，请稍后重发');
     assert.equal(mq.QUEUED_FALLBACK_REPLY, '收到，办完手头的接着办这条');
-    assert.equal(mq.MERGED_PREFACE, '以下是你忙的时候光总连续发来的消息，按顺序一并处理；后面的消息可能是对前面的补充或更正');
+    assert.equal(mq.MERGED_PREFACE, ownerText`以下是你忙的时候${O_NAME}连续发来的消息，按顺序一并处理；后面的消息可能是对前面的补充或更正`);
     assert.equal(mq.MERGED_NO_CONFIRM.confirmed, false);
     assert.ok(Object.isFrozen(mq.MERGED_NO_CONFIRM));
   });

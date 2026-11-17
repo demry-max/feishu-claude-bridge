@@ -346,7 +346,46 @@ export function plistExitTimeout(xml) {
   return m ? Number(m[1]) : null;
 }
 
-/** 在 plist 的顶层 dict 末尾补 ExitTimeOut（已有则替换）。launchd 默认约 20 秒就强杀，优雅退出等不完。 */
+// BRIDGE-PUB-1：macOS 用户级 LaunchAgent 的 ExitTimeOut 实际有上限。本机 launchctl print 只读核对（user / system 域共约一千个已加载服务）：
+// 写 130 的显示 exit timeout = 60，没写的显示 5（不是以前以为的约 20 秒），没有任何服务超过 60。
+// 所以 macOS 下优雅等待最多 60 − 10 = 50 秒，留 10 秒给收尾（回「请稍后重发」、落盘）；systemd / 前台没有这个上限。
+export const LAUNCHD_EXIT_TIMEOUT_CAP = 60;
+export const LAUNCHD_EXIT_TIMEOUT_DEFAULT = 5;
+export const RESEND_MARGIN_SEC = 10;
+
+/**
+ * 由 SHUTDOWN_GRACE_SEC 算 launchd 服务的等待时间：serviceGrace＝服务里实际用的优雅等待（≤ 上限 − 余量），
+ * exitTimeout＝写进 plist 的 ExitTimeOut（serviceGrace + 余量，≤ 上限）；clamped＝配置值超过了 launchd 能等的时间。
+ */
+export function launchdShutdownTiming(graceSec) {
+  const g = Math.max(0, Math.floor(Number(graceSec) || 0));
+  const serviceGrace = Math.min(g, LAUNCHD_EXIT_TIMEOUT_CAP - RESEND_MARGIN_SEC);
+  return { serviceGrace, exitTimeout: serviceGrace + RESEND_MARGIN_SEC, clamped: serviceGrace < g };
+}
+
+const escXml = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const reKey = (k) => String(k).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const ENV_DICT_RE = /(<key>EnvironmentVariables<\/key>\s*<dict>)([\s\S]*?)(\n?\s*<\/dict>)/;
+
+/** plist EnvironmentVariables 里某个键的值（没有返回 null） */
+export function plistEnvValue(xml, key) {
+  const d = String(xml ?? '').match(ENV_DICT_RE);
+  if (!d) return null;
+  const m = d[2].match(new RegExp(`<key>${reKey(key)}</key>\\s*<string>([^<]*)</string>`));
+  return m ? unescapeXml(m[1]) : null;
+}
+
+/** 在 plist 的 EnvironmentVariables 里设一个键（已有则替换；没有这个 dict 就原样返回） */
+export function withPlistEnv(xml, key, value) {
+  const d = String(xml ?? '').match(ENV_DICT_RE);
+  if (!d) return xml;
+  const line = `<key>${escXml(key)}</key><string>${escXml(value)}</string>`;
+  const keyRe = new RegExp(`<key>${reKey(key)}</key>\\s*<string>[^<]*</string>`);
+  const body = keyRe.test(d[2]) ? d[2].replace(keyRe, line) : `${d[2]}\n    ${line}`;
+  return xml.replace(ENV_DICT_RE, `$1${body.replace(/\$/g, '$$$$')}$3`);
+}
+
+/** 在 plist 的顶层 dict 末尾补 ExitTimeOut（已有则替换）。launchd 不写时只等 5 秒就强杀，优雅退出等不完。 */
 export function withExitTimeout(xml, seconds) {
   const s = Math.max(0, Math.floor(Number(seconds) || 0));
   if (/<key>ExitTimeOut<\/key>/.test(xml)) {
@@ -388,9 +427,12 @@ export function checkService({ platform = process.platform, home, label, uid, gr
         '确认 which claude 有输出后重跑 npm run install-service（它会把 claude 所在目录写进 PATH）'));
     }
     const exitTimeout = plistExitTimeout(xml);
-    if (graceSec > 0 && (exitTimeout === null || exitTimeout < graceSec + 10)) {
+    // install-service 在 macOS 下会把 SHUTDOWN_GRACE_SEC 钉进 plist（launchd 等不了那么久时）：服务实际用的是那个值
+    const pinned = plistEnvValue(xml, 'SHUTDOWN_GRACE_SEC');
+    const grace = pinned !== null && /^\d{1,4}$/.test(pinned.trim()) ? Number(pinned.trim()) : graceSec;
+    if (grace > 0 && (exitTimeout === null || exitTimeout < grace + 10)) {
       out.push(item('service_exit_timeout', 'warn', '服务 ExitTimeOut',
-        `${exitTimeout === null ? '未设置（launchd 默认约 20 秒）' : `${exitTimeout} 秒`}，小于 SHUTDOWN_GRACE_SEC+10=${graceSec + 10}：重启时进行中的对话会被强杀`,
+        `${exitTimeout === null ? `未设置（launchd 默认只等 ${LAUNCHD_EXIT_TIMEOUT_DEFAULT} 秒）` : `${exitTimeout} 秒`}，小于 SHUTDOWN_GRACE_SEC+10=${grace + 10}：重启时进行中的对话会被强杀`,
         '重跑 npm run install-service（新版会写入 ExitTimeOut）'));
     }
     return out;

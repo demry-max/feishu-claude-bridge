@@ -2,6 +2,7 @@
 // 只改目标字段、未知字段保留、原子写（同目录临时文件 + rename）、拒绝时不改任何文件。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { ownerText, OWNER as O_NAME, YOU as O_YOU } from '../src/owner-name.js'; // BRIDGE-PUB-1：称呼按配置（测试里未设：owner / 你）
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -63,7 +64,7 @@ describe('测试 7（单元）：合法的 ack / snooze1d / drop 只改目标字
     assert.deepEqual(act(env, 'quote', 'ack'), { ok: true, changed: [] });
     assert.equal(sha(f), before);
     assert.equal(fs.statSync(f).mtimeMs, mtime);
-    assert.equal(journalText(env), '（桥接）光总点了『知道了』：tasks/quote.json\n');
+    assert.equal(journalText(env), ownerText`（桥接）${O_NAME}点了『知道了』：tasks/quote.json\n`);
   });
 
   test('snooze1d：next_check_at 与 escalate_after 各加一天、updated_at 更新，未知字段保留，原子写、保留权限位', () => {
@@ -80,7 +81,7 @@ describe('测试 7（单元）：合法的 ack / snooze1d / drop 只改目标字
     assert.equal(fs.statSync(f).mode & 0o777, 0o600, '权限位沿用原文件');
     assert.deepEqual(leftovers(env), [], '不留临时文件');
     assert.equal(validateTask(after, 'quote').ok, true, '写回的仍是合法台账');
-    assert.equal(journalText(env), '（桥接）光总回复『推迟一天』：tasks/quote.json\n');
+    assert.equal(journalText(env), ownerText`（桥接）${O_NAME}回复『推迟一天』：tasks/quote.json\n`);
   });
 
   test('snooze1d：只有 next_check_at 时只改它；两个都没有时按现在加一天写 next_check_at', () => {
@@ -101,7 +102,7 @@ describe('测试 7（单元）：合法的 ack / snooze1d / drop 只改目标字
     assert.deepEqual(act(env, 'quote', 'drop'), { ok: true, changed: ['status', 'updated_at'] });
     assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { ...TASK, status: 'dropped', updated_at: '2026-11-16T10:05' });
     assert.deepEqual(leftovers(env), []);
-    assert.equal(journalText(env), '（桥接）光总点了『不做了』：tasks/quote.json\n');
+    assert.equal(journalText(env), ownerText`（桥接）${O_NAME}点了『不做了』：tasks/quote.json\n`);
   });
 
   test('journal 写不进去不影响回写本身，只记日志', () => {

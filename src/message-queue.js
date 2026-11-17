@@ -13,6 +13,8 @@
 //   arrivalSettled(seq)；出队前排着的里最晚到的那条之前还有没接收完的（附件下载慢），先等它们（最多 ARRIVAL_HOLD_MS），
 //   免得后到的先办、先到的落到下一轮；到点就先办已排好的，迟到的照常进下一轮，不丢。
 
+import { ownerText, OWNER } from './owner-name.js';
+
 export const OWNER_QUEUE_LIMIT = 10;
 /** 入队成功的表情回应（飞书 emoji_type）：沿用 index.js runTurn 开轮时 react(message.message_id, 'OnIt') 那个——线上一直加得上；
  *  加不上时退回 QUEUED_FALLBACK_REPLY，每个忙碌期只回一次 */
@@ -20,10 +22,10 @@ export const QUEUED_REACTION = 'OnIt';
 export const QUEUED_FALLBACK_REPLY = '收到，办完手头的接着办这条';
 export const QUEUE_SHUTDOWN_REPLY = '助理正在重启，这条没处理，请稍后重发';
 export const QUEUE_FAILED_REPLY = '⚠️ 这条排队的消息没能开始处理，请重发。';
-export const MERGED_PREFACE = '以下是你忙的时候光总连续发来的消息，按顺序一并处理；后面的消息可能是对前面的补充或更正';
-export const MERGED_CONFIRM_NOTE = '（这批消息里出现的「确认」不算确认：合并处理的这一轮不放行需要确认的操作，等光总单独回「确认」。）';
+export const MERGED_PREFACE = ownerText`以下是你忙的时候${OWNER}连续发来的消息，按顺序一并处理；后面的消息可能是对前面的补充或更正`;
+export const MERGED_CONFIRM_NOTE = ownerText`（这批消息里出现的「确认」不算确认：合并处理的这一轮不放行需要确认的操作，等${OWNER}单独回「确认」。）`;
 export const MERGED_CONFIRM_NOTICE = '这几条是合并处理的，其中的「确认」这一轮不算数；需要放行确认级操作的话，请单独再回一次「确认」。';
-/** strict 下单独排队的「确认」：排队期间上一轮可能又出了新草稿，这条不放行（原样交给模型），并单独提示光总看完再回 */
+/** strict 下单独排队的「确认」：排队期间上一轮可能又出了新草稿，这条不放行（原样交给模型），并单独提示 owner 看完再回 */
 export const QUEUED_CONFIRM_NOTICE = '这条「确认」是在上一轮还没办完时发的，排队期间可能已有新结果，这次不算数；看完最新回复后需要放行的话，请单独再回一次「确认」。';
 /** 合并轮 / 排队单条交给 createToolTurn 的 confirm：恒不放行（多条里夹着的、排队等着的「确认」都不算确认） */
 export const MERGED_NO_CONFIRM = Object.freeze({ confirmed: false });
@@ -73,7 +75,7 @@ export function buildMergedPrompt(sections, { confirmNote = false } = {}) {
  * - 每条照平时先过车道判定（/do 前缀照剥），任一条要执行就整轮走执行车道；
  * - 每条到达时算好的台账提示（引用回复心跳消息）跟在它那条后面，整轮不再挂；
  * - 附件取并集（整轮照平时放行 incoming 只读）；
- * - 有确认通道（strict）时，夹在里面的「确认」不算数：prompt 里注明，并提示光总单独再回一次。
+ * - 有确认通道（strict）时，夹在里面的「确认」不算数：prompt 里注明，并提示 owner 单独再回一次。
  * @param {{ spec: object, messageId: string, seq: number, at: number }[]} entries
  * @param {{ routeTurn: Function, detectConfirm: Function, confirmChannel?: boolean }} deps
  */
@@ -252,7 +254,7 @@ export function createOwnerMessageQueue({
       const taken = s.items.splice(0).sort((a, b) => a.seq - b.seq);
       s.period = { fallbackSent: false };
       for (const it of taken) say(it.messageId, QUEUE_SHUTDOWN_REPLY);
-      info(`[queue] ${key} 退出中：${taken.length} 条排队消息没处理，已逐条请光总稍后重发`);
+      info(ownerText`[queue] ${key} 退出中：${taken.length} 条排队消息没处理，已逐条请${OWNER}稍后重发`);
       gc(key);
       return;
     }
@@ -263,7 +265,7 @@ export function createOwnerMessageQueue({
     s.period = { fallbackSent: false }; // 出队那一轮是新的忙碌期
     let spec;
     if (taken.length === 1) {
-      // 只有 1 条：照平时路径走（同一份内容）；标 queued——strict 下排队的「确认」不放行（排队期间可能已出新草稿），并提示光总看完再单独回
+      // 只有 1 条：照平时路径走（同一份内容）；标 queued——strict 下排队的「确认」不放行（排队期间可能已出新草稿），并提示 owner 看完再单独回
       const one = taken[0];
       let isConfirm = false;
       try { isConfirm = !!confirmProbe(one.spec); } catch { isConfirm = false; }
@@ -367,7 +369,7 @@ export function createOwnerMessageQueue({
       const taken = s.items.splice(0).sort((a, b) => a.seq - b.seq);
       total += taken.length;
       for (const it of taken) say(it.messageId, QUEUE_SHUTDOWN_REPLY);
-      info(`[queue] ${key} 退出：${taken.length} 条排队消息没处理，已逐条请光总稍后重发`);
+      info(ownerText`[queue] ${key} 退出：${taken.length} 条排队消息没处理，已逐条请${OWNER}稍后重发`);
       gc(key);
     }
     return total;

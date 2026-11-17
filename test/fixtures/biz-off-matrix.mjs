@@ -75,7 +75,11 @@ export function makeHarness(repoDir, prefix = 'biz-off-') {
   const p = { ws: path.join(tmp, 'ws'), gws: path.join(tmp, 'gws'), data: path.join(tmp, 'data'), home: path.join(tmp, 'home'), repo, tmp };
   for (const d of [p.ws, p.gws, p.data, p.home]) fs.mkdirSync(d, { recursive: true });
   const norm = makeNorm(p);
-  setEnv({ WORKSPACE_DIR: p.ws, GUEST_WORKSPACE_DIR: p.gws, DATA_DIR: p.data, HOME: p.home });
+  // 夹具按基线生成：基线里写死的称呼与 strict 拒写目录，在这里用配置项设回同样的值
+  setEnv({
+    WORKSPACE_DIR: p.ws, GUEST_WORKSPACE_DIR: p.gws, DATA_DIR: p.data, HOME: p.home,
+    OWNER_NAME: '光总', OWNER_STRICT_DENY_WRITE_DIRS: path.join(p.home, 'code', 'ias-ops'),
+  });
   const fake = path.join(tmp, 'fake-claude.sh');
   fs.writeFileSync(fake, '#!/bin/sh\ncat > /dev/null\ncat "$FAKE_STREAM"\n', { mode: 0o755 });
   process.env.CLAUDE_BIN = fake;

@@ -318,7 +318,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
   - 想先看一眼：`npm run install-service -- --dry-run`。
   - 它用当前 node、本仓库目录、`which claude` 的结果生成 `~/Library/LaunchAgents/<label>.plist`，并立即启动。
   - label 默认是 `com.<用户名>.feishu-claude-bridge`，可用 `LAUNCHD_LABEL` 改。
-  - plist 带 `ExitTimeOut`（= `SHUTDOWN_GRACE_SEC` + 10），重启时不会被提前强杀。
+  - plist 带 `ExitTimeOut`（= 优雅等待 + 10）。用户级 launchd 服务最多只等 60 秒，所以 `SHUTDOWN_GRACE_SEC` 大于 50 时，plist 会把服务里的它钉成 50、`ExitTimeOut` 写 60，并在终端提示一行。
 - **失败**：
   - 退出码 `1`，提示「label <x> 已被 <dir> 的桥接占用」：这台机器上另一个目录已经用这个 label 装了桥接（重装、第二份克隆）。**不要加 `--force`**，那会把别人的服务改成指向本目录。在 `.env` 设 `LAUNCHD_LABEL=<x>-2` 后重跑。确定那个目录已经不用了、要改指向本目录，才加 `--force`。
   - doctor 的 `service` 报「这个 label 属于另一个目录」是同一个原因，处理同上。
@@ -367,7 +367,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 业务系统只读查询（bms / ias） | 关 | `BMS_TOOL_ENABLED=1` | 仅 macOS。`[需要人]` owner 在本机终端把每个系统的只读 Key 写进钥匙串：命令模板由 `npm run -s biz-check` 在缺条目时打印，你不要经手 Key。写完再跑一次，每个系统一行 `HTTP 200` 即可 |
 | 备用账号（主用额度用完 / 登录失效时自动切换） | 关 | `CLAUDE_FALLBACK_BIN=<备用 claude 路径>`；冷却 `CLAUDE_FALLBACK_COOLDOWN_MIN`（默认 30，1–720） | 备用 claude 能跑 `--version`（doctor 项 `claude_fallback_cli`）；两个 claude 最好共用同一个 CLI 配置目录，否则换账号时两边都会自动开新会话；备用账号的登录是 `[需要人]` |
 | 语音兜底转写 | 自动 | — | `ffmpeg` 在 PATH 里（常驻服务的 PATH 也要有） |
-| 优雅退出等待 | `120` 秒 | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |
+| 优雅退出等待 | `120` 秒（macOS launchd 下最多 50） | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |
 
 细节见 [README.md](README.md)。`docs/*-prompt-proposal.md` 是这些功能可选的提示词补充，人想用时再并入 `workspace/CLAUDE.md`。
 

@@ -1,4 +1,4 @@
-// 机器人事件 → 「光总对心跳消息的操作」信号（BRIDGE-EV-1）。
+// 机器人事件 → 「owner 对心跳消息的操作」信号（BRIDGE-EV-1）。
 //
 // 表情、已读、撤回三类事件原本到达后被丢掉；卡片按钮回调是新增的。这里全部由桥接按确定规则处理：
 // 不调模型、永不抛出；日志只记类型和计数，不记消息内容。缺字段一律当作「不匹配」，不报错。
@@ -9,6 +9,7 @@
 // - 卡片按钮：校验（owner、消息在索引里、nonce 一致、台账存在且在跟进）不论开关都做；
 //   全部通过才排队回写并回「已记下」，否则回「已失效」、不改任何文件。回写异步执行，回调 3 秒内必返回
 import { ACTION_BY_PHRASE, actionLabel } from './ledger-actions.js';
+import { ownerText, OWNER } from './owner-name.js';
 
 const MSG_ID_RE = /^om_[A-Za-z0-9_-]{1,64}$/;
 const TOAST_OK = Object.freeze({ toast: Object.freeze({ type: 'success', content: '已记下' }) });
@@ -194,7 +195,7 @@ export function createEventHandlers({ getOwner = () => '', heartbeat, log = cons
       }
       h.submitAction({ slug: r.slug, action: r.action, messageId: mid, source: 'button' });
       const n = count(h, 'card_ok');
-      safeLog(`[events] 卡片按钮：光总点了『${actionLabel(r.action) ?? r.action}』（tasks/${r.slug}.json），已排队回写（今日第 ${n} 次）`);
+      safeLog(ownerText`[events] 卡片按钮：${OWNER}点了『${actionLabel(r.action) ?? r.action}』（tasks/${r.slug}.json），已排队回写（今日第 ${n} 次）`);
       return TOAST_OK;
     } catch (e) {
       safeLog(`[events] 卡片回调处理异常，按已失效处理（${e?.name ?? 'Error'}）`);

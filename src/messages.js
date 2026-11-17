@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
+import { promptFileName, diskFileName } from './file-names.js';
 
 const FFMPEG = process.env.FFMPEG_BIN || 'ffmpeg';
 
@@ -158,7 +159,7 @@ function stripMentions(text) {
 
 async function download(client, messageId, fileKey, type, incomingDir, fileName) {
   fs.mkdirSync(incomingDir, { recursive: true });
-  const dest = path.join(incomingDir, path.basename(fileName));
+  const dest = path.join(incomingDir, diskFileName(fileName, `${fileKey}.bin`)); // BRIDGE-PUB-1：落盘名单行、无路径分隔符
   return withRetry('download', async () => {
     const res = await client.im.v1.messageResource.get({
       path: { message_id: messageId, file_key: fileKey },
@@ -272,7 +273,7 @@ export async function buildPrompt(client, message, workspaceDir, senderOpenId = 
     case 'file': {
       const name = content.file_name || `${content.file_key}.bin`;
       // 文件名由发送方任意指定，可能被塞进换行+伪指令来撑破提示词结构
-      const shownName = name.replace(/[\r\n]+/g, ' ').slice(0, 200);
+      const shownName = promptFileName(name);
       const p = await download(
         client, message.message_id, content.file_key, 'file', incomingDir, name
       );

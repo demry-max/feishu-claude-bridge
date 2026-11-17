@@ -198,7 +198,11 @@ describe('回归：普通 owner 与定时任务参数除新增 Edit(./tasks/**) 
       withEnv({ ...PINNED, ...env }, (m) => {
         const r = call(m);
         r.cleanup();
-        assert.deepEqual(norm(r.args), plusTasks(baseline[name]));
+        // BRIDGE-PUB-1：schedJob 用的是 haiku 别名，别名改指 claude-haiku-5-5（夹具里是旧型号）；schedDiag 传的是全名，不受影响
+        const want = name === 'schedJob'
+          ? plusTasks(baseline[name]).map((x) => x.replaceAll('claude-haiku-4-5-20251001', 'claude-haiku-5-5'))
+          : plusTasks(baseline[name]);
+        assert.deepEqual(norm(r.args), want);
         assert.equal(r.cwd, m.WORKSPACE_DIR);
       }));
   }
