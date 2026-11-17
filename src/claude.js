@@ -1237,7 +1237,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         // （且永远收不到固化提醒）；/new 期间跑完的任务也不该把刚删掉的会话写回来。
         const ephemeral = ephemeralChat;
         const revoked = (resetGeneration.get(chatId) ?? 0) !== startedGeneration;
-        if (d.session_id && !ephemeral && !revoked && !skipErrorSession(d)) {
+        if (d.session_id && !ephemeral && !revoked && !skipErrorSession(d, acted)) {
           sessions[chatId] = d.session_id;
           saveSessions(sessions);
         } else if (revoked) {

@@ -6,7 +6,7 @@ import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeys
 import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler } from './scheduler.js';
-import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY } from './heartbeat.js';
+import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY, inQuietHours } from './heartbeat.js';
 import { VERIFY_KEY } from './verifier.js';
 import { createShutdown, shutdownGraceSec, replyIfDraining } from './shutdown.js';
 import { createEventHandlers, heartbeatReplyShortcut, sendCardWithFallback } from './events.js'; import { createWatchSources, createLarkRunner } from './watch-sources.js';
@@ -851,8 +851,9 @@ async function describeHeartbeatFailure(msg) {
     .replace(/(修好|恢复)后重发这条消息。$/, '$1后不用重发，心跳下一拍会自动重试。')
     .replace(/过半分钟再发一次。$/, '心跳下一拍会自动重试。');
 }
+const heartbeatSettings = heartbeatConfig(process.env); // 心跳与备用账号切换通知共用（免打扰时段只解析一次）
 const heartbeat = startHeartbeat({
-  config: heartbeatConfig(process.env),
+  config: heartbeatSettings,
   tasksDir: path.join(WORKSPACE_DIR, 'tasks'),
   stateFile: path.join(DATA_DIR, 'heartbeat-state.json'),
   runClaude,
@@ -940,7 +941,7 @@ async function scopeSelfCheck() {
   }
   // BRIDGE-ACCT-1：配置了备用账号时自检备用 bin；失败只告警、本次视为未配置。未配置时什么也不打
   verifyFallbackAtStartup({ log: console.log, warn: console.error });
-  setAccountNotifier((text) => sendToOwner(text)); // 切到备用时私信 owner（一次备用期一条；失败不影响对话）
+  setAccountNotifier((text) => sendToOwner(text), { isQuiet: () => inQuietHours(new Date(), heartbeatSettings.quietHours) }); // 切到备用时私信 owner（一次备用期一条；免打扰时段延后；失败不影响对话）
   if (shadowed.length) {
     console.error(`[config] ⚠️ 以下变量被 shell 环境覆盖，.env 里的值未生效：${shadowed.join(', ')}`);
   }

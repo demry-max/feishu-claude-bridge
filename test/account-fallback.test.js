@@ -102,6 +102,10 @@ const calls = () => {
     return fs.readFileSync(path.join(STUB_DIR, 'calls.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
   } catch { return []; }
 };
+const resumeOf = (args) => {
+  const i = args.indexOf('--resume');
+  return i === -1 ? null : args[i + 1];
+};
 const sessionsFile = () => {
   try { return JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, 'sessions.json'), 'utf8')); } catch { return {}; }
 };
@@ -388,12 +392,20 @@ describe('A8 备用报会话不存在', () => {
     assert.equal(sessionsFile()[id], 'old-sess', 'quota-sess / fb-err-sess 都不得写回');
   });
 
-  test('A8 主用报会话不存在不走这条（只对备用 bin）', async () => {
+  test('F2 主用报会话不存在 → 不带 --resume 重试一次成功', async () => {
     fresh();
-    setScript('primary', [sessionNotFound]);
+    const id = chat();
+    setScript('primary', [okTurn('seed', 'old-sess'), sessionNotFound, okTurn('fresh primary', 'new-sess')]);
     setScript('fallback', [okTurn()]);
-    await assert.rejects(claude.runClaude(chat(), 'hi', true), /No conversation found/);
-    assert.deepEqual(calls().map((c) => c.name), ['primary']);
+    await claude.runClaude(id, 'seed', true);
+    fs.rmSync(path.join(STUB_DIR, 'calls.log'), { force: true });
+    assert.equal(await claude.runClaude(id, 'hi', true), 'fresh primary');
+    const c = calls();
+    assert.deepEqual(c.map((x) => x.name), ['primary', 'primary']);
+    assert.equal(resumeOf(c[0].args), 'old-sess');
+    assert.equal(resumeOf(c[1].args), null);
+    assert.equal(sessionsFile()[id], 'new-sess');
+    assert.equal(logs.length, 0, '会话不存在不是账号问题，不切换');
   });
 });
 
@@ -425,7 +437,7 @@ describe('A9 通知', () => {
     setScript('primary', [errorTurn(WEEKLY)]);
     setScript('fallback', [errorTurn(LOGIN)]);
     await assert.rejects(claude.runClaude(chat(), 'hi', true));
-    const allowed = /^\[account\] (主用不可用\((quota|auth)\)，切到备用，冷却 \d+ 分钟|冷却到期，试主用|回到主用|备用也不可用\((quota|auth)\))$/;
+    const allowed = /^\[account\] (主用不可用\((quota|auth)\)，切到备用，冷却 \d+ 分钟|冷却到期，试主用|回到主用|备用也不可用\((quota|auth)\)|备用启动失败，回到主用路径)$|^\[account-notice\] 免打扰时段，切换通知延后到时段结束$/;
     for (const l of logs) assert.match(l, allowed);
   });
 });
@@ -513,5 +525,186 @@ describe('A10 /status 接线', () => {
     assert.match(claude.sessionInfo(id, true), /\n- 当前账号: 备用（\d{2}:\d{2} 后再试主用）$/);
     fresh({ fallbackBin: '' });
     assert.doesNotMatch(claude.sessionInfo(id, true), /当前账号/);
+  });
+});
+
+const ALLOWED_LOG = /^\[account\] (主用不可用\((quota|auth)\)，切到备用，冷却 \d+ 分钟|冷却到期，试主用|回到主用|备用也不可用\((quota|auth)\)|备用启动失败，回到主用路径)$|^\[account-notice\] 免打扰时段，切换通知延后到时段结束$/;
+const turnCalls = async (fn) => {
+  fs.rmSync(path.join(STUB_DIR, 'calls.log'), { force: true });
+  await fn();
+  return calls();
+};
+
+describe('F1 备用不可用 → 清冷却、下一轮先试主用', () => {
+  test('F1 备用登录失效、主用已恢复：第 2 轮只起主用并成功，打「回到主用」，通知 1 条', async () => {
+    fresh();
+    setScript('primary', [errorTurn(WEEKLY), okTurn('primary back')]);
+    setScript('fallback', [errorTurn(LOGIN)]);
+    await assert.rejects(claude.runClaude(chat(), '1', true), (e) => e.message === LOGIN);
+    assert.ok(logs.includes('[account] 备用也不可用(auth)'));
+    let answer;
+    const c = await turnCalls(async () => { answer = await claude.runClaude(chat(), '2', true); });
+    assert.equal(answer, 'primary back');
+    assert.deepEqual(c.map((x) => x.name), ['primary']);
+    assert.ok(logs.includes('[account] 回到主用'), logs.join('\n'));
+    assert.match(acct.accountStatusLine(), /当前账号: 主用$/);
+    await settle();
+    assert.equal(notices.length, 1);
+    for (const l of logs) assert.match(l, ALLOWED_LOG);
+  });
+
+  test('F1 运行期备用 bin 不存在：第 1 轮抛启动失败，第 2 轮起主用', async () => {
+    fresh({ fallbackBin: path.join(TMP, 'no-such-claude-at-runtime') });
+    setScript('primary', [errorTurn(WEEKLY), okTurn('primary again')]);
+    await assert.rejects(claude.runClaude(chat(), '1', true), (e) => e.message.startsWith('claude CLI 启动失败'));
+    assert.ok(logs.includes('[account] 备用启动失败，回到主用路径'), logs.join('\n'));
+    assert.ok(!logs.some((l) => l.includes('no-such-claude')), '日志不带路径');
+    let answer;
+    const c = await turnCalls(async () => { answer = await claude.runClaude(chat(), '2', true); });
+    assert.equal(answer, 'primary again');
+    assert.deepEqual(c.map((x) => x.name), ['primary']);
+    for (const l of logs) assert.match(l, ALLOWED_LOG);
+  });
+
+  test('F1 两账号都坏连跑 3 轮：每轮恰好主用 1 + 备用 1，通知只 1 条', async () => {
+    fresh();
+    setScript('primary', [errorTurn(WEEKLY)]);
+    setScript('fallback', [errorTurn(LOGIN)]);
+    for (let i = 0; i < 3; i++) {
+      const c = await turnCalls(() => assert.rejects(claude.runClaude(chat(), `r${i}`, true), (e) => e.message === LOGIN));
+      assert.deepEqual(c.map((x) => x.name), ['primary', 'fallback'], `第 ${i + 1} 轮`);
+    }
+    await settle();
+    assert.equal(notices.length, 1);
+  });
+});
+
+describe('F2 会话不存在对称处理（配置了备用时）', () => {
+  test('F2 不共用配置目录全流程：两边各自开新会话，冷却到期回到主用', async () => {
+    fresh();
+    const id = chat();
+    setScript('primary', [okTurn('seed', 'old-sess'), errorTurn(WEEKLY, 'quota-sess'), sessionNotFound, okTurn('primary fresh', 'pri-sess')]);
+    setScript('fallback', [sessionNotFound, okTurn('fallback fresh', 'fb-sess')]);
+    await claude.runClaude(id, 'seed', true);
+    fs.rmSync(path.join(STUB_DIR, 'calls.log'), { force: true });
+    assert.equal(await claude.runClaude(id, 'a', true), 'fallback fresh');
+    assert.equal(sessionsFile()[id], 'fb-sess');
+    clock += 31 * 60_000;
+    assert.equal(await claude.runClaude(id, 'b', true), 'primary fresh');
+    const c = calls();
+    assert.deepEqual(c.map((x) => [x.name, resumeOf(x.args)]), [
+      ['primary', 'old-sess'],
+      ['fallback', 'old-sess'],
+      ['fallback', null],
+      ['primary', 'fb-sess'],
+      ['primary', null],
+    ]);
+    assert.ok(logs.includes('[account] 回到主用'), logs.join('\n'));
+    assert.equal(sessionsFile()[id], 'pri-sess');
+  });
+
+  test('F2 上界：主用会话不存在 → 主用新会话报额度 → 备用（无 --resume）报额度 → 抛错，子进程恰好 3 个', async () => {
+    fresh();
+    const id = chat();
+    setScript('primary', [okTurn('seed', 'old-sess'), sessionNotFound, errorTurn(WEEKLY)]);
+    setScript('fallback', [errorTurn(WEEKLY)]);
+    await claude.runClaude(id, 'seed', true);
+    fs.rmSync(path.join(STUB_DIR, 'calls.log'), { force: true });
+    await assert.rejects(claude.runClaude(id, 'hi', true), (e) => e.message === WEEKLY);
+    const c = calls();
+    assert.deepEqual(c.map((x) => [x.name, resumeOf(x.args)]), [['primary', 'old-sess'], ['primary', null], ['fallback', null]]);
+  });
+});
+
+describe('F3 动过手的出错结果照常回写会话', () => {
+  test('F3 新会话第一轮调过工具后报额度 → 会话表保存该轮 session_id，下一轮（备用）带 --resume 它', async () => {
+    fresh();
+    const id = chat();
+    setScript('primary', [errorAfterTool(WEEKLY)]);
+    setScript('fallback', [okTurn('continued', 'fb-sess')]);
+    await assert.rejects(claude.runClaude(id, 'hi', true), /已切到备用账号/);
+    assert.equal(sessionsFile()[id], 'err-sess');
+    let answer;
+    const c = await turnCalls(async () => { answer = await claude.runClaude(id, '继续', true); });
+    assert.equal(answer, 'continued');
+    assert.deepEqual(c.map((x) => [x.name, resumeOf(x.args)]), [['fallback', 'err-sess']]);
+  });
+});
+
+describe('F4 切换通知沿用心跳免打扰', () => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  test('F4 免打扰内进入备用 → 当时不发；时段结束后发且只发 1 条', async () => {
+    fresh();
+    let quiet = true;
+    acct.setAccountNotifier(async (t) => { notices.push(t); }, { isQuiet: () => quiet, recheckMs: 20 });
+    setScript('primary', [errorTurn(WEEKLY)]);
+    setScript('fallback', [okTurn()]);
+    await claude.runClaude(chat(), 'hi', true);
+    await wait(80);
+    assert.equal(notices.length, 0);
+    assert.ok(logs.includes('[account-notice] 免打扰时段，切换通知延后到时段结束'), logs.join('\n'));
+    await claude.runClaude(chat(), 'again', true); // 同一备用期：不再登记第二条
+    quiet = false;
+    await wait(80);
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0], acct.accountNoticeText('quota', 30));
+    await wait(80);
+    assert.equal(notices.length, 1, '只发一条');
+    for (const l of logs) assert.match(l, ALLOWED_LOG);
+  });
+
+  test('F4 免打扰期间已回到主用 → 不发', async () => {
+    fresh();
+    let quiet = true;
+    acct.setAccountNotifier(async (t) => { notices.push(t); }, { isQuiet: () => quiet, recheckMs: 20 });
+    setScript('primary', [errorTurn(WEEKLY), okTurn('back')]);
+    setScript('fallback', [okTurn()]);
+    await claude.runClaude(chat(), '1', true);
+    clock += 31 * 60_000;
+    assert.equal(await claude.runClaude(chat(), '2', true), 'back');
+    assert.ok(logs.includes('[account] 回到主用'));
+    quiet = false;
+    await wait(100);
+    assert.equal(notices.length, 0);
+  });
+
+  test('F4 不在免打扰时段：照旧立即发', async () => {
+    fresh();
+    acct.setAccountNotifier(async (t) => { notices.push(t); }, { isQuiet: () => false, recheckMs: 20 });
+    setScript('primary', [errorTurn(WEEKLY)]);
+    setScript('fallback', [okTurn()]);
+    await claude.runClaude(chat(), 'hi', true);
+    await settle();
+    assert.equal(notices.length, 1);
+    assert.ok(!logs.some((l) => l.startsWith('[account-notice]')));
+  });
+});
+
+describe('补测', () => {
+  test('M9 冷却前在主用起跑、冷却到期后才成功的非试探轮，不算回到主用', async () => {
+    fresh();
+    setScript('primary', [{ ...okTurn('slow'), delayMs: 400 }, errorTurn(WEEKLY)]);
+    setScript('fallback', [okTurn()]);
+    const slow = claude.runClaude(chat(), 'slow', true);
+    await new Promise((r) => setTimeout(r, 100));
+    await claude.runClaude(chat(), 'fast', true); // 进冷却
+    clock += 31 * 60_000; // 慢轮成功之前冷却已到期
+    assert.equal(await slow, 'slow');
+    assert.ok(!logs.includes('[account] 回到主用'), logs.join('\n'));
+    assert.match(acct.accountStatusLine(), /当前账号: 备用（下一轮先试主用）$/);
+  });
+
+  test('M15 结果文本无账号字样、stderr 才有周额度 → 仍判 quota 并在备用上成功', async () => {
+    fresh();
+    setScript('primary', [{
+      lines: [{ type: 'result', is_error: true, result: 'Execution error', session_id: 'e' }],
+      code: 1,
+      stderr: WEEKLY,
+    }]);
+    setScript('fallback', [okTurn('via fallback')]);
+    assert.equal(await claude.runClaude(chat(), 'hi', true), 'via fallback');
+    assert.deepEqual(calls().map((c) => c.name), ['primary', 'fallback']);
+    assert.ok(logs.includes('[account] 主用不可用(quota)，切到备用，冷却 30 分钟'), logs.join('\n'));
   });
 });

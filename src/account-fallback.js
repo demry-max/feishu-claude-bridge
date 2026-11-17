@@ -8,16 +8,23 @@
 //   - 主用报「账号不可用」（额度用完 / 登录失效）→ 进入冷却，冷却期内所有新起的 CLI 子进程都用备用 bin；
 //     选 bin 只在起子进程那一处（runClaudeOnce → spawnBinFor），所以私聊、执行道、群聊、访客、定时任务、心跳、复核、自诊断一视同仁。
 //   - 冷却到期后下一轮先试主用：成功＝回到主用；仍不可用＝再次冷却，这一轮自动落到备用。
-//   - 备用自己也报「账号不可用」→ 不来回切，照现有路径抛错。
+//   - 备用自己也报「账号不可用」或备用 bin 起不来 → 本轮不来回切、照现有路径抛错；同时清掉冷却，
+//     下一轮先试主用（仍算同一次备用期，不重发通知）。
 //   - 本轮还没有副作用（没调过工具、没发过进度消息）→ 立即用备用重试一次，不 sleep、不占网络重试名额；
 //     已有副作用 → 不重放，提示「已切到备用账号，请再发一次 / 说“继续”」。
-//   - 备用报会话不存在 → 只对这一次不带 --resume 再试（两个 bin 最好共用同一个 CLI 配置目录，否则换账号会开新会话）。
+//   - 配置了备用时，主用或备用报会话不存在 → 每轮只一次不带 --resume 再试（两个 bin 最好共用同一个 CLI 配置目录，
+//     否则换账号两边都会开新会话）。
 //   - 进入备用时私信 owner 一条固定文案，同一次连续的备用期只发一次；回到主用只打日志。
+//     注入了免打扰判断且当时在免打扰时段 → 延后到时段结束再发；那之前已回到主用就不发。
+//   - 状态只在内存：重启后从主用起，主用仍不可用会再收到一条通知。
 // 日志闭集（不含消息内容、姓名、id、令牌、原始错误串）：
 //   [account] 主用不可用(quota|auth)，切到备用，冷却 N 分钟
 //   [account] 冷却到期，试主用
 //   [account] 回到主用
 //   [account] 备用也不可用(quota|auth)
+//   [account] 备用启动失败，回到主用路径
+//   [account-notice] 免打扰时段，切换通知延后到时段结束
+//   [account-notice] 切换通知发送失败
 import spawn from 'cross-spawn';
 
 // 两条正则与同作者另一个桥接的实现一致（经真实 CLI 报错核对），改动要两边一起改
@@ -28,7 +35,9 @@ export const ACCOUNT_UNAVAILABLE = /usage limit|limit reached|rate[ _]limit|\b42
 export const DEFAULT_COOLDOWN_MIN = 30;
 const MIN_COOLDOWN_MIN = 1;
 const MAX_COOLDOWN_MIN = 720;
-const MAX_SPAWNS_PER_TURN = 3; // 主用 1 + 备用 1 + 备用无 --resume 1
+const MAX_SPAWNS_PER_TURN = 3; // 主用 1 + 备用 1 + 无 --resume 1
+const DEFAULT_NOTICE_RECHECK_MS = 5 * 60_000;
+const SPAWN_FAILED_PREFIX = 'claude CLI 启动失败'; // claude.js 起子进程失败时的报错开头
 
 /** 本轮用哪个账号：由 runWithAccount 写进 opts，runClaudeOnce 起子进程时读 */
 export const ACCOUNT = Symbol('claude-account');
@@ -64,9 +73,18 @@ const midTurnMessage = (kind) =>
 // ---- 进程内状态（单例；configureAccountFallback 整体替换，测试与启动自检用） ----
 let cfg;
 let state;
+let noticeTimer = null; // 免打扰时段延后发送的复查定时器（同时最多一个）
+function clearNoticeTimer() {
+  if (noticeTimer) clearInterval(noticeTimer);
+  noticeTimer = null;
+}
 function configure({ fallbackBin, cooldownMin, now = Date.now, log = console.log, notify = null } = {}) {
+  clearNoticeTimer();
   const bin = String(fallbackBin ?? '').trim();
-  cfg = { fallbackBin: bin, cooldownMin: cooldownMin ?? DEFAULT_COOLDOWN_MIN, now, log, notify };
+  cfg = {
+    fallbackBin: bin, cooldownMin: cooldownMin ?? DEFAULT_COOLDOWN_MIN, now, log, notify,
+    isQuiet: () => false, noticeRecheckMs: DEFAULT_NOTICE_RECHECK_MS, pendingKind: null,
+  };
   // episode：一次连续的备用期（进入时通知一次，主用试探成功才结束）
   state = { enabled: bin !== '', fallbackUntil: 0, episode: false, probeLogged: false };
 }
@@ -81,9 +99,14 @@ configure({
 
 export const isAccountFallbackEnabled = () => state.enabled;
 
-/** owner 私信通道由 index.js 注入（本模块不认识飞书） */
-export function setAccountNotifier(fn) {
+/**
+ * owner 私信通道由 index.js 注入（本模块不认识飞书）。
+ * isQuiet：此刻是否在免打扰时段（沿用心跳的设置）；为真时切换通知延后，每 recheckMs 复查一次。
+ */
+export function setAccountNotifier(fn, { isQuiet = () => false, recheckMs = DEFAULT_NOTICE_RECHECK_MS } = {}) {
   cfg.notify = typeof fn === 'function' ? fn : null;
+  cfg.isQuiet = typeof isQuiet === 'function' ? isQuiet : () => false;
+  cfg.noticeRecheckMs = recheckMs;
 }
 
 /** 起子进程那一处调用：未配置时原样返回主用 bin */
@@ -93,8 +116,11 @@ export function spawnBinFor(primaryBin, opts = {}) {
   return account === 'fallback' ? cfg.fallbackBin : primaryBin;
 }
 
-/** 配置了备用时，出错结果里的 session_id 不回写会话表（会话不存在 / 额度错误时带回来的可能是空会话） */
-export const skipErrorSession = (d) => state.enabled && Boolean(d?.is_error);
+/**
+ * 配置了备用时，没动过手的出错结果里的 session_id 不回写会话表（会话不存在 / 额度错误时带回来的可能是空会话）；
+ * 本轮已调过工具或发过进度（acted）的照常回写，下一轮才能接着这段会话。
+ */
+export const skipErrorSession = (d, acted = false) => state.enabled && Boolean(d?.is_error) && !acted;
 
 function chooseAccount() {
   if (cfg.now() < state.fallbackUntil) return { account: 'fallback', probe: false };
@@ -118,6 +144,45 @@ function primarySucceeded(probe) {
   cfg.log('[account] 回到主用');
 }
 
+// 备用不可用 / 起不来：清冷却，下一轮先试主用；episode 保留（不重发通知）
+function resetCooldownAfterFallbackFailure() {
+  state.fallbackUntil = 0;
+  state.probeLogged = false;
+}
+
+function quietNow() {
+  try {
+    return Boolean(cfg.isQuiet());
+  } catch {
+    return false; // 判断出错按非免打扰处理：宁可发，不丢
+  }
+}
+
+function sendNotice(kind) {
+  const notify = cfg.notify;
+  if (!notify) return;
+  // 不 await：发通知失败或慢都不影响这一轮对话
+  Promise.resolve()
+    .then(() => notify(accountNoticeText(kind, cfg.cooldownMin)))
+    .catch(() => console.error('[account-notice] 切换通知发送失败'));
+}
+
+function deferNotice(kind) {
+  cfg.pendingKind = kind;
+  cfg.log('[account-notice] 免打扰时段，切换通知延后到时段结束');
+  if (noticeTimer) return;
+  noticeTimer = setInterval(() => {
+    if (!state.episode) {
+      clearNoticeTimer(); // 免打扰期间已回到主用：丢弃不发
+      return;
+    }
+    if (quietNow()) return;
+    clearNoticeTimer();
+    sendNotice(cfg.pendingKind);
+  }, cfg.noticeRecheckMs);
+  noticeTimer.unref?.();
+}
+
 function enterFallback(kind) {
   const t = cfg.now();
   if (t < state.fallbackUntil) return; // 并发：另一轮刚切过，状态已一致，不续期、不重复日志与通知
@@ -126,12 +191,13 @@ function enterFallback(kind) {
   cfg.log(`[account] 主用不可用(${kind})，切到备用，冷却 ${cfg.cooldownMin} 分钟`);
   if (state.episode) return; // 同一次连续备用期（冷却到期试探失败）不重复通知
   state.episode = true;
-  const notify = cfg.notify;
-  if (!notify) return;
-  // 不 await：发通知失败或慢都不影响这一轮对话
-  Promise.resolve()
-    .then(() => notify(accountNoticeText(kind, cfg.cooldownMin)))
-    .catch(() => console.error('[account-notice] 切换通知发送失败'));
+  if (!cfg.notify) return;
+  if (quietNow()) {
+    deferNotice(kind);
+    return;
+  }
+  clearNoticeTimer(); // 上一次备用期延后的那条作废，只发这一条
+  sendNotice(kind);
 }
 
 /**
@@ -153,16 +219,22 @@ export async function runWithAccount(once, opts = {}) {
       if (e?.cancelled) throw e; // /cancel、/new、优雅退出：不切换、不重试
       const text = errorText(e);
       const room = spawns < MAX_SPAWNS_PER_TURN; // 硬上界：一轮最多起 3 个子进程
-      if (room && account === 'fallback' && !freshSession && !e?.acted && SESSION_NOT_FOUND.test(text)) {
-        freshSession = true; // 只这一次不带 --resume
+      if (room && !freshSession && !e?.acted && SESSION_NOT_FOUND.test(text)) {
+        freshSession = true; // 每轮只这一次不带 --resume（主用、备用都适用）
         continue;
       }
       const kind = classifyAccountError(text);
-      if (!kind) throw e;
       if (account === 'fallback') {
-        cfg.log(`[account] 备用也不可用(${kind})`);
+        if (kind) {
+          cfg.log(`[account] 备用也不可用(${kind})`);
+          resetCooldownAfterFallbackFailure();
+        } else if (String(e?.message ?? '').startsWith(SPAWN_FAILED_PREFIX)) {
+          cfg.log('[account] 备用启动失败，回到主用路径');
+          resetCooldownAfterFallbackFailure();
+        }
         throw e;
       }
+      if (!kind) throw e;
       enterFallback(kind);
       if (e?.acted) {
         e.message = midTurnMessage(kind);
