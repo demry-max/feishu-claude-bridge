@@ -19,6 +19,7 @@ import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummar
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 import { schedDestOf } from './biz-wiring.js';
 import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.js';
+import { OWNER_DM_FILE_NAME, loadOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -112,8 +113,13 @@ const ALLOW_USERS = parseList(process.env.ALLOW_USERS); // open_id 白名单
 const ALLOW_CHATS = parseList(process.env.ALLOW_CHATS); // chat_id 白名单（群）
 // owner 身份的权威来源：配了它，owner.json 丢失/损坏也能直接恢复，无需认领流程
 const OWNER_OPEN_ID = (process.env.OWNER_OPEN_ID ?? '').trim();
-// owner 私聊的 chat_id：只记在内存（owner 在私聊发过消息才知道，重启后未知）；定时任务据此判断结果是否发往 owner 私聊
-let ownerDmChatId = null;
+// owner 私聊的 chat_id：owner 在私聊发过消息才知道；定时任务据此判断结果是否发往 owner 私聊。
+// BRIDGE-DMID-1：学到时落盘 data/owner-dm.json（绑定 owner open_id），启动时读回——重启后不用等 owner 再私聊一次。
+// 读回失败 / owner 不一致一律按未知（＝落盘之前的行为）
+const OWNER_DM_FILE = path.join(DATA_DIR, OWNER_DM_FILE_NAME);
+const ownerDmBoot = loadOwnerDm(OWNER_DM_FILE, OWNER_OPEN_ID || loadOwner(), { log: console.error });
+let ownerDmChatId = ownerDmBoot.chatId;
+console.log(ownerDmBootLine(ownerDmBoot));
 const voiceChats = new Set(); // 开启语音回复的会话
 
 function isAllowed(openId, chatId, isP2p) {
@@ -193,6 +199,8 @@ const ownerQueue = createOwnerMessageQueue({
 });
 // 每日新会话（DAILY_SESSION 默认 off）：真实实例在启动时建（见下方 createLiveDailySession）；建好之前按 off 处理，原样放行
 let dailySession = { beforeTurn: ({ prompt }) => prompt, failureNote: () => '', onManualNew: () => {}, command: async () => undefined, statusLine: () => '' };
+// owner 私聊目的地落盘（BRIDGE-DMID-1）：真实实例在启动段建（见下方 createOwnerDmRecorder）；建好之前不写盘、/status 不多一行
+let ownerDm = { remember: () => {}, statusLine: () => '' };
 
 async function reply(messageId, text) {
   const safe = redact(text);
@@ -307,6 +315,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   }
   const isOwner = senderOpenId === owner;
   if (isOwner && message.chat_type === 'p2p') ownerDmChatId = message.chat_id;
+  if (isOwner && message.chat_type === 'p2p') ownerDm.remember(message.chat_id, owner); // BRIDGE-DMID-1：同一条件下落盘（值没变不写；失败只记日志）
 
   // 会话键必须区分身份：群里 owner 与访客共用一个 chat_id，但现在两者的 cwd 不同
   // （workspace vs workspace-guest）。若共用同一个 session，访客一次 --resume 就能
@@ -407,7 +416,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   }
   if (text === '/status') {
     // 每日新会话开着时（owner 私聊）末尾再多一行：本会话从何时起、下次何时换新；off 时为空串
-    await reply(message.message_id, sessionInfo(sessionKey, isOwner) + ownerQueue.statusLine(sessionKey, isOwner, message.chat_type) + dailySession.statusLine(sessionKey, { isOwner, chatType: message.chat_type })); // BRIDGE-MQ-1：owner 私聊且开关开时多一行排队条数，其余为空串
+    await reply(message.message_id, sessionInfo(sessionKey, isOwner) + ownerQueue.statusLine(sessionKey, isOwner, message.chat_type) + dailySession.statusLine(sessionKey, { isOwner, chatType: message.chat_type }) + ownerDm.statusLine({ isOwner, chatType: message.chat_type })); // BRIDGE-DMID-1：owner 私聊多一行目的地已知 / 未知（不显示 id）；BRIDGE-MQ-1：owner 私聊且开关开时多一行排队条数，其余为空串
     return;
   }
   if (text === '/help' || text === '帮助') {
@@ -894,6 +903,7 @@ const heartbeat = startHeartbeat({
 // 预交接走同一个 enqueue 队列（和 owner 轮串行，turnsInFlight 已经 +1，优雅退出会等它）；进入退出流程后不再起新的交接
 dailySession = createLiveDailySession({ dataDir: DATA_DIR, workspaceDir: WORKSPACE_DIR, enqueue, redact, isDraining: () => shutdown.isDraining() });
 dailySession.start();
+ownerDm = createOwnerDmRecorder({ file: OWNER_DM_FILE, boot: ownerDmBoot, log: console.error });
 
 // ---- 优雅退出（BRIDGE-VR-1）：SIGTERM / SIGINT 先停接新消息、停心跳，等进行中的对话做完再退出 ----
 // 最多等 SHUTDOWN_GRACE_SEC 秒（默认 120）；等待期间新来的消息回「正在重启，请稍后重发」；第二次信号立即退出。
