@@ -214,7 +214,10 @@ Hosts, path prefixes and Keychain entry names are hard-coded in `src/biz-targets
 |---|---|
 | owner DMs, scheduled jobs whose results go to the owner's DM (including strict's read-only jobs), heartbeat | group chats (even the owner's turns there), scheduled jobs whose results go to a group or another chat, scheduled jobs whose destination can't be determined, guests, sched-diag self-diagnosis, verification, handoff |
 
-- **Scheduled jobs depend on the destination**: the bridge keeps the owner's DM chat ID in memory only (it learns it once the owner sends a DM). A scheduled job gets the tool only when its `chat_id` equals that ID; after a restart, and until the owner sends a DM, no scheduled job has it.
+- **Scheduled jobs depend on the destination**: a scheduled job gets the tool only when its `chat_id` equals the owner's DM chat ID. The bridge learns that ID the first time the owner DMs the bot and saves it to `data/owner-dm.json` (0600, together with the owner's open_id); after a restart it is read back, so no new DM is needed. Only **right after a fresh install**, until the owner sends a first DM, does no scheduled job have the tool.
+  - If the saved owner doesn't match the current one (`OWNER_OPEN_ID` or `data/owner.json`), or the file is damaged or malformed, it is treated as unknown until the owner DMs again.
+  - The startup log has a line `[biz] owner 私聊目的地：已从落盘恢复` (restored) or `未知（等 owner 私聊一次）` (unknown); `/status` in the owner's DM adds a line saying whether the destination is known (from disk / this session) or unknown. Neither shows the ID itself.
+  - The file doesn't depend on `BMS_TOOL_ENABLED`; it is written even when the switch is off.
 - **Switch**: `BMS_TOOL_ENABLED=1` in `.env`, exactly `1`, then restart. It works under all three tool profiles. When off, every turn's arguments are byte-for-byte the same as without the feature.
 - **GET only**, and redirects are not followed.
   - The path is normalized before its prefix is checked. `..`, `//`, `\`, `@`, `%`-encoding and full URLs are rejected.
