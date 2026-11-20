@@ -96,6 +96,9 @@ const invalidSlug = (i) => i.file.replace(/\.json$/i, ''); // 与 prune 同一�
 const invalidSlugs = (invalid) => new Set((invalid ?? []).map(invalidSlug));
 // 「文件名 + 指纹 + 原因」→ 键；文件名太长的（不合规文件名可到 255 字）用其 hash 当状态里的键名
 const invalidKey = (i) => sha256(`${i.file}\n${i.fp}\n${i.reason}`).slice(0, 32);
+// 截断条目的键：文件名 + 固定原因，不含内容指纹（模型每拍往 notes 里追加，指纹每拍变）；前缀与 invalidKey 的算法区分开
+const TRUNCATED_REASON = 'notes 超过 300 字，只按前 300 字读（文件没改）';
+const truncatedKey = (file) => sha256(`truncated\n${file}\n${TRUNCATED_REASON}`).slice(0, 32);
 const invalidBookName = (file) => (file.length <= MAX_INVALID_KEY_LEN ? file : sha256(file).slice(0, 32));
 
 // 状态文件里「下一次发出的消息要附带的说明」：只认已知的键和形状（说明会进私聊正文）
@@ -289,8 +292,13 @@ export function validateTask(raw, slug) {
   }
   if (raw.notes !== undefined && raw.notes !== null) {
     if (typeof raw.notes !== 'string') return bad('notes 不是字符串');
-    if (raw.notes.length > 300) return bad('notes 超过 300 字');
     task.notes = raw.notes;
+    if (raw.notes.length > 300) {
+      // 超长不让整条台账失效（BRIDGE-LEDGER-1 R1）：只按前 300 字读，文件不动；第 300 位落在代理对中间就少截一位，不留半个字符
+      const hi = raw.notes.charCodeAt(299);
+      task.notes = raw.notes.slice(0, hi >= 0xd800 && hi <= 0xdbff ? 299 : 300);
+      task.notes_truncated = true;
+    }
   }
   // 办完的依据（BRIDGE-VR-1，可选）：kind 决定 ref 的格式；summary 是助理写的话，进任何提示词都要围栏。
   // 依据写得不合规不让整条台账失效（R1）：台账照常有效、不带 done_evidence，原因记在 evidence_error（桥接自己的话），
@@ -787,7 +795,8 @@ export function createHeartbeat(deps) {
   function saveState(st) {
     writeJsonAtomic(stateFile, st);
   }
-  const rememberUnpersisted = (st) => { unpersisted = JSON.stringify(st); };
+  // fail closed 得到的状态（读盘失败的空壳）不记：它不是真实状态，记了盘恢复后会用它覆盖真实状态；保持原值，下拍照常重读盘
+  const rememberUnpersisted = (st) => { if (!closedStates.has(st)) unpersisted = JSON.stringify(st); };
   function persist(st) {
     try {
       saveState(st);
@@ -1449,32 +1458,55 @@ export function createHeartbeat(deps) {
   // ---------------------------------------------------------------- 坏台账通知（BRIDGE-LEDGER-1）
 
   // 本拍无效的台账文件：按「文件名 + 内容指纹 + 原因」算键，跟状态里记下的比，新出现 / 内容或原因变了的私聊 owner 一次。
-  // 通知前同一拍再读一遍：已经变合法、或内容又变了的这拍不报（主会话正在写的瞬间不误报）。
+  // 另有一组「已截断」（notes 超 300 字，只按前 300 字读，台账照常有效）：键＝文件名 + 固定原因，不含内容指纹
+  // （模型每拍往 notes 里追加，含指纹会每拍通知）；与无效条目共用同一份记录表，键算法区分开。
+  // 通知前同一拍再读一遍：已经变合法（或不再超长）、或内容又变了的这拍不报（主会话正在写的瞬间不误报）。
   // 走 deliver（正文 + slugs: []，不调模型）：免打扰 / 未读暂停 / 本拍额度 / 待发队列去重照旧，免打扰时顺延到时段结束后补发。
-  // deliver 返回 sent / queued / dup 都算已通知。文件变合法或消失后从记录里删掉，以后再坏（哪怕内容一样）算新的一次。
-  // 正文只写文件名（压成一行、截断）和桥接自己的原因，不带任何文件内容
-  async function noticeInvalid(st, invalid, nowMs, quota) {
-    const cur = new Map(invalid.slice(0, MAX_INVALID_NOTIFIED).map((i) => [invalidBookName(i.file), i]));
+  // deliver 返回 sent / queued / dup 都算已通知。文件变合法 / 不再超长 / 消失后从记录里删掉，以后再坏（哪怕内容一样）算新的一次。
+  // 正文只写文件名（压成一行、截断）和桥接自己的原因，不带任何文件内容。
+  // fail closed 得到的状态（读状态文件失败）整拍跳过：它的 invalid_notified 是空的，会放开去重重发同一条，也不该落盘
+  async function noticeInvalid(st, invalid, tasks, nowMs, quota) {
+    if (closedStates.has(st)) return;
+    const cur = new Map();
+    for (const i of invalid) cur.set(invalidBookName(i.file), { file: i.file, key: invalidKey(i), line: `${i.reason}`, cut: false });
+    for (const t of tasks) {
+      if (!t.notes_truncated) continue;
+      const file = `${t.slug}.json`;
+      cur.set(invalidBookName(file), { file, key: truncatedKey(file), line: TRUNCATED_REASON, cut: true });
+    }
+    const entries = [...cur].slice(0, MAX_INVALID_NOTIFIED);
+    const names = new Set(entries.map(([name]) => name));
     let changed = false;
     if (st.invalid_notified) {
       for (const name of Object.keys(st.invalid_notified)) {
-        if (!cur.has(name)) { delete st.invalid_notified[name]; changed = true; }
+        if (!names.has(name)) { delete st.invalid_notified[name]; changed = true; }
       }
       if (!Object.keys(st.invalid_notified).length) delete st.invalid_notified;
     }
-    const fresh = [...cur].filter(([name, i]) => st.invalid_notified?.[name] !== invalidKey(i));
+    const fresh = entries.filter(([name, e]) => st.invalid_notified?.[name] !== e.key);
     if (fresh.length) {
-      const again = new Map(loadTasks(tasksDir, { log: () => {} }).invalid.map((i) => [i.file, invalidKey(i)]));
-      const stable = fresh.filter(([, i]) => again.get(i.file) === invalidKey(i));
+      const re = loadTasks(tasksDir, { log: () => {} });
+      const again = new Map(re.invalid.map((i) => [i.file, invalidKey(i)]));
+      for (const t of re.tasks) if (t.notes_truncated) again.set(`${t.slug}.json`, truncatedKey(`${t.slug}.json`));
+      const stable = fresh.filter(([, e]) => again.get(e.file) === e.key);
       if (stable.length) {
-        const listed = stable.slice(0, MAX_INVALID_LISTED).map(([, i]) => `tasks/${plain(i.file, 63)}：${i.reason}`);
-        if (stable.length > MAX_INVALID_LISTED) listed.push(`等 ${stable.length - MAX_INVALID_LISTED} 条，/heartbeat status 可看`);
-        const body = [`有台账文件读不了（${stable.length} 个）：`, ...listed, '这几条台账在修好之前不会到期提醒。'].join('\n');
+        const bad = stable.filter(([, e]) => !e.cut);
+        const cut = stable.filter(([, e]) => e.cut);
+        const shown = [...bad, ...cut];
+        const listed = shown.slice(0, MAX_INVALID_LISTED).map(([, e]) => `tasks/${plain(e.file, 63)}：${e.line}`);
+        if (shown.length > MAX_INVALID_LISTED) listed.push(`等 ${shown.length - MAX_INVALID_LISTED} 条，/heartbeat status 可看`);
+        const head = [];
+        if (bad.length) head.push(`有台账文件读不了（${bad.length} 个）`);
+        if (cut.length) head.push(`有台账 notes 已截断（${cut.length} 个）`);
+        const tail = [];
+        if (bad.length) tail.push('这几条台账在修好之前不会到期提醒。');
+        if (cut.length) tail.push('截断的那几条照常到期提醒，建议让助理把 notes 精简到 300 字内。');
+        const body = [`${head.join('、')}：`, ...listed, tail.join('')].join('\n');
         // 新出现 / 变了的才走到这里：不被 24 小时同正文去重吞掉（队列里已有同一条的仍判 dup）
         delete st.sent[sha256(body).slice(0, 32)];
         await deliver(st, body, [], nowMs, quota);
         st.invalid_notified ??= {};
-        for (const [name, i] of stable) st.invalid_notified[name] = invalidKey(i);
+        for (const [name, e] of stable) st.invalid_notified[name] = e.key;
         changed = true;
       }
     }
@@ -1800,7 +1832,7 @@ export function createHeartbeat(deps) {
     const { tasks, invalid } = loadTasks(tasksDir, { log });
     prune(st, new Set([...tasks.map((t) => t.slug), ...invalid.map((i) => i.file.replace(/\.json$/i, ''))]), nowMs);
     applyWatchLocks(st, tasks); // 心跳轮里改过的 watch 按原值（不看外部增量也算原值）
-    await noticeInvalid(st, invalid, nowMs, quota); // 新出现 / 变了的坏台账私聊 owner（不调模型、不占每日次数）
+    await noticeInvalid(st, invalid, tasks, nowMs, quota); // 新出现 / 变了的坏台账私聊 owner（不调模型、不占每日次数）
     // BRIDGE-VR-1（开关全关时这一段什么都不做）：拍与拍之间台账的状态变化记作 chat；待验收的先核对、发卡片；
     // 升级阶梯到点发模板。都在心跳的每日次数之外（验收审核有自己的 VERIFY_MAX_PER_DAY）
     if (historyOn()) diffSeen(st, tasks, 'chat', nowMs, invalid);
