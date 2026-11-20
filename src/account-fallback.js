@@ -272,6 +272,11 @@ function enterFallback(kind) {
   sendNotice(kind);
 }
 
+/** BRIDGE-RUN-2：告诉调用方「这一轮改用新会话了」（meta.onRenewed）；回调出错不影响本轮 */
+function notifyRenewed(meta) {
+  try { meta?.onRenewed?.(); } catch { /* 回调出错不影响本轮 */ }
+}
+
 /**
  * 未配置备用：第一次调用 opts 原样传入，与没有本功能时一致。只多一件事（BRIDGE-RUN-1 M5）——
  * 原会话已不存在（会话表里的 id 被清掉、换了 CLI 配置目录……）、本轮还没动过手、也不是被取消时，
@@ -288,6 +293,7 @@ async function runWithoutFallback(once, opts, meta) {
     if (e?.cancelled || e?.acted || explicitResume || !SESSION_NOT_FOUND.test(errorText(e))) throw e;
     // console.log 取调用时的值：测试与别处会替换它，不能在模块加载时绑定
     if (meta?.key) console.log(`[session] ${meta.key} 原会话已不存在，已开新会话`);
+    notifyRenewed(meta);
     return once({ ...opts, resumeId: '' });
   }
 }
@@ -297,7 +303,8 @@ async function runWithoutFallback(once, opts, meta) {
  * 账号层的重试在网络重试之内：不 sleep，不占 CLAUDE_MAX_RETRIES 名额。
  * @param {(opts: object) => Promise<any>} once
  * @param {object} [opts]
- * @param {{key?: string}} [meta] key：会话键，只用来给「原会话已不存在」那行日志署名
+ * @param {{key?: string, onRenewed?: () => void}} [meta] key：会话键，只用来给「原会话已不存在」那行日志署名；
+ *   onRenewed（BRIDGE-RUN-2）：这一轮因「原会话已不存在」改成不带 --resume 重开时调用一次，调用方据此提示用户上下文已换新（出错被吞）
  */
 export async function runWithAccount(once, opts = {}, meta = {}) {
   if (!state.enabled) return runWithoutFallback(once, opts, meta);
@@ -315,6 +322,7 @@ export async function runWithAccount(once, opts = {}, meta = {}) {
       const room = spawns < MAX_SPAWNS_PER_TURN; // 硬上界：一轮最多起 3 个子进程
       if (room && !freshSession && !e?.acted && SESSION_NOT_FOUND.test(text)) {
         freshSession = true; // 每轮只这一次不带 --resume（主用、备用都适用）
+        notifyRenewed(meta);
         continue;
       }
       const kind = classifyError(e); // result / errors 与 stderr 分两路、口径不同（M7）

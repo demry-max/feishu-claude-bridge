@@ -5,17 +5,24 @@
 // 模型一句 `env` 就能把飞书 App Secret 读出来。App Secret 特意不进 argv、写 0600 临时文件传给 MCP，
 // 靠环境继承漏出去等于白做。MCP 要用的飞书凭据由临时 mcp.json 的 env 字段单独交给它，不靠继承。
 //
-// 做法：黑名单，只去掉两类——
+// 做法：黑名单，去掉三类——
 //   1. BRIDGE_OWN_KEYS：桥接自己的配置项（模板里的全部键，加上 src/、scripts/ 里读取的环境变量名）；
-//   2. 任何以 FEISHU_ 开头的键（以后新增的飞书类配置默认就不外传，不用记得回来补清单）。
-// 其余原样透传：代理、语言区域、ANTHROPIC_*、CLAUDE_CODE_*、CLAUDE_CONFIG_DIR 等 claude 自己要用的都不动。
+//   2. 任何以 FEISHU_ 开头的键（以后新增的飞书类配置默认就不外传，不用记得回来补清单）；
+//   3. BRIDGE-RUN-2：桥接自己的 .env 文件里写了的键（启动时由 index.js 把键名登记进来，见 registerEnvFileKeys）。
+//      清单会漏——有人往 .env 里放了 R2_SECRET_ACCESS_KEY、GITHUB_TOKEN 之类、清单里没有的键，dotenv 会把它们灌进桥接的
+//      环境，继承给 claude 就等于交给模型。放行项（PASSTHROUGH：登录令牌、HOME、PATH……）不受这条影响，写在 .env 里也照样传。
+//      只取键名：.env 的值读出来就丢，不进日志、不进返回值。没登记过（或登记了空表）时与前两条完全一致。
+// 其余原样透传：代理、语言区域、ANTHROPIC_*、CLAUDE_CODE_*、CLAUDE_CONFIG_DIR 等 claude 自己要用的都不动
+// （前提是它们不写在桥接的 .env 里——写在 .env 里的一律不外传，要给 claude 用的请设在服务自己的环境里）。
 // 不做白名单：claude CLI 认的环境变量很多、随版本增减，白名单漏一个就是登录态 / 代理悄悄失效。
 //
 // 清单怎么维护：test/child-env.test.js 的防漂移测试会对照模板与 src/、scripts/ 里读取的环境变量名，
 // 出现这里没归类的名字就红，并列出名字（只列名字，不含值）。新增配置项时，桥接自己用的加进
 // BRIDGE_OWN_KEYS；必须传给子进程的加进 PASSTHROUGH，并写明原因。
 //
-// 本文件不读任何环境变量，也不打印任何值。
+// 本文件不读任何环境变量，也不打印任何值；唯一读的是 .env 文件，且只留键名。
+import fs from 'node:fs';
+import { parse as parseDotenv } from 'dotenv';
 
 /** 必须传给子进程的键（桥接或脚本也读它们），每项写原因。与 BRIDGE_OWN_KEYS 互不相交。 */
 export const PASSTHROUGH = Object.freeze({
@@ -54,18 +61,55 @@ export const BRIDGE_OWN_KEYS = Object.freeze([
   'SCHED_MAX_CONCURRENT', 'SCHED_MAX_LATE_MS', 'WORKSPACE_DIR', 'GUEST_WORKSPACE_DIR', 'DATA_DIR', 'INCOMING_TTL_MS',
   'SHUTDOWN_GRACE_SEC', 'STARTUP_NOTICE', 'WS_PING_TIMEOUT_SEC', 'LAUNCHD_LABEL',
   'TTS_VOICE', 'TTS_MAX_CHARS', 'FFMPEG_BIN',
+  // dotenv 自己的 .env 路径开关（BRIDGE-RUN-2）：不外传也让 claude 起的、会 import 'dotenv/config' 的 MCP 子进程读不到桥接的 .env
+  'DOTENV_CONFIG_PATH',
 ]);
 
 const OWN = new Set(BRIDGE_OWN_KEYS);
 
+// 桥接 .env 文件里写了的键名（BRIDGE-RUN-2）。启动时登记一次；没登记过就是空集，行为与 RUN-1 完全一致。
+let fileKeys = new Set();
+
 /**
- * 子进程环境：src 的一份拷贝，去掉桥接自己的键和所有 FEISHU_* 键。
+ * 读 .env 文件里的键名（只要名字：值读出来就丢，不进日志、不进返回值）。
+ * 文件不存在 → []，不打日志（没有 .env、全靠服务自己的环境变量是正常配法）；
+ * 读不了（权限、是目录……）→ 打一行带错误码的警告、返回 []，这次只按清单过滤。永不抛。
+ * @param {string} file
+ * @param {{log?: (msg: string) => void, read?: (file: string, enc: string) => string}} [o]
+ */
+export function readEnvFileKeys(file, { log = console.error, read = fs.readFileSync } = {}) {
+  try {
+    return Object.keys(parseDotenv(read(file, 'utf8')));
+  } catch (e) {
+    if (e?.code === 'ENOENT') return [];
+    try { log(`[config] ⚠️ 读不了 .env 的键名（${e?.code ?? 'ERR'}），这次只按清单过滤`); } catch { /* 日志出错不影响启动 */ }
+    return [];
+  }
+}
+
+/**
+ * 登记「.env 文件里写了的键名」（整体替换上一次登记）：此后 childEnv 去掉这些键，放行项除外。
+ * 非数组当空表；只收非空字符串。
+ * 返回「只因为这一条才被去掉」的键名（不在 BRIDGE_OWN_KEYS、不以 FEISHU_ 开头、不是放行项），排序后，供启动日志列名字提醒。
+ * @param {unknown} names
+ * @returns {string[]}
+ */
+export function registerEnvFileKeys(names) {
+  fileKeys = new Set(Array.isArray(names) ? names.filter((n) => typeof n === 'string' && n !== '') : []);
+  return [...fileKeys]
+    .filter((k) => !OWN.has(k) && !k.startsWith('FEISHU_') && !Object.hasOwn(PASSTHROUGH, k))
+    .sort();
+}
+
+/**
+ * 子进程环境：src 的一份拷贝，去掉桥接自己的键、所有 FEISHU_* 键，以及（登记过的话）桥接 .env 里写了的键（放行项除外）。
  * 返回新对象，不改 src；被去掉的键即使值是空串也不留。
  */
 export function childEnv(src = process.env) {
   const out = {};
   for (const [k, v] of Object.entries(src)) {
     if (OWN.has(k) || k.startsWith('FEISHU_')) continue;
+    if (fileKeys.has(k) && !Object.hasOwn(PASSTHROUGH, k)) continue; // BRIDGE-RUN-2：.env 里写了的、清单之外的键
     out[k] = v;
   }
   return out;

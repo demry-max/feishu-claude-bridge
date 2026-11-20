@@ -66,6 +66,28 @@
   `test/mcp-secret.test.js` 第 4 条由源码形状断言（匹配 `child.on('close'…cleanup()`）改成行为断言（真跑正常 / 错误 result / 启动失败三种收尾，数临时目录与清理次数）。
 - **已知限制**：桥接进程被强杀（SIGKILL / 崩溃）时，正在跑的 claude 子进程不会被一起结束，会把手上的工具调用跑完；正常重启（SIGTERM）会清理。后续另开卡在启动时清理残留。
 
+### BRIDGE-RUN-2：桥接被强杀后清理残留的 claude 进程组、会话换新时告诉仓主、写在 .env 里的键不交给 claude（安全卡）
+
+- **启动时清理上一代留下的 claude 进程组（macOS / Linux，恒开、没有开关）**：RUN-1「已知限制」里「桥接被 SIGKILL / 崩溃时 claude 子进程不会被结束」**已由本卡解决（macOS / Linux）**。新增 `src/child-registry.js`：
+  - 登记：claude 子进程起来后用 `ps -p <pid>` 取一次它的进程组与启动时间（只按单个 pid 查，不枚举进程表、不用 `pgrep` / `pkill`），把 `{pid, pgid, lstart, spawnedAt}` 写进 `data/claude-children.json`（0600，临时文件加 rename 原子写；不记命令行、会话键、chat id、会话 id），`settle()` 收尾时删掉。取不到进程组、找不到 `ps`、写不进去都只记一条告警、不影响本轮；登记 / 删除 / 写盘永不抛，不新增任何进程监听。
+  - 清理：下次启动，`src/index.js` 在调度器、心跳、每日会话、收消息、启动自检之前**同步**清理，所以「先清残留、后由调度器决定补不补跑」。逐条要求 ① `pid` 与进程组号一致；② 启动时间与记录逐字一致（pid 被别的程序复用时这里对不上）；③ 命令里在第 1 个词之后依次出现 `-p`、`--output-format`、`stream-json`、`--verbose`（桥接起的那种 claude 调用）；④ 父进程是 1 号进程（上一代已死；本代自己起的、别的桥接还活着时起的都不是）——**全部对上**才对整组发 SIGTERM，最多等 2 秒，仍在的先复核一遍指纹再补 SIGKILL（领头进程已没了但组还在的，直接补）；任何一条对不上只删记录、不碰进程。本代自己刚登记的 pid 跳过；记录文件读不出来 / 损坏时本次不清理、不改文件；最多看前 200 条。
+  - 清掉了进程（个数大于 0，只删记录不算）就私信仓主一次：「⚠️ 上次异常退出时有 N 个进行中的任务被中断（已清理）。如果当时在等回复，请把那条消息再发一次。」，沿用备用账号切换通知的免打扰判定（`HEARTBEAT_QUIET_HOURS`，时段内延后到结束再发）；没有 owner 或发送失败只记日志、不重试。
+  - Windows 不登记也不清理；没有 `/bin/ps`、`/usr/bin/ps` 时整个登记 / 清理停用（只记一次日志）。`src/scheduler.js`、`src/shutdown.js` 没改。
+- **会话换新时告诉仓主**：仓主私聊那一轮里，原会话已不存在而被自动换成新会话（未配备用：不带 `--resume` 重试；配了备用：换账号后找不到会话）时，成功回复末尾多一句固定提示「（提示：原来的会话已失效，这一轮是在新会话里回答的，之前聊过的上下文已经不在了；需要的话把要点再说一遍。）」。
+  触发条件、`[session]` 日志原文、`MAX_SPAWNS_PER_TURN` 都不变；`src/claude.js` 的 `runClaude` 里按 `opts.turn.kind === 'owner-dm'` 追加，`index.js` 里私聊那一轮的调用与回复行没动。同一轮里换新之后再走网络重试，提示照样加；群、访客、定时任务、心跳、自诊断、交接、验收一律不加，失败与空答案不加。
+  提示出现在答案之后、审计 / strict 档的工具回执之前；开了语音回复时语音也会读到这句。
+- **写在 `.env` 文件里的键一律不交给 claude（放行表除外）**：`src/child-env.js` 新增 `readEnvFileKeys()`（只取键名、值读出来立即丢，日志与返回值里都没有值；认 `export A=1`、`B: 2`、带引号的多行值）与 `registerEnvFileKeys()`。`childEnv()` 在 RUN-1 的两条规则（桥接自己的配置项、`FEISHU_*`）之外多一条：登记过的 `.env` 键名一律去掉，只有放行表 `PASSTHROUGH`（`CLAUDE_CODE_OAUTH_TOKEN`、`HOME`、`USER`、`PATH`、`TMPDIR`、`APPDATA`、`NODE_TLS_REJECT_UNAUTHORIZED`）里的照传。
+  原来 `.env` 里为别的工具顺手写的 `R2_SECRET_ACCESS_KEY`、`GITHUB_TOKEN` 这类不在桥接清单里的键会原样进到 claude 的环境，模型一句 `env` 就能读到。没登记过键名时（测试、脚本、没有 `.env` 的安装）行为与 RUN-1 逐字一致。
+  `index.js` 启动时按 `DOTENV_CONFIG_PATH`（没设就是当前目录的 `.env`，与 dotenv 取路径的顺序一致）读一遍，有清单之外的键时打一行日志（只列键名）。`DOTENV_CONFIG_PATH` 归入桥接自己的键、不外传（防止 claude 起的、自带 `dotenv/config` 的 MCP 子进程按它读到桥接的 `.env`）。
+- **新增日志**（全部不含 pid、命令、启动时间、会话 / chat id、值）：`[reaper] 上次运行留下的 claude 进程：已结束 N 组；记录对不上、只删记录 M 条`（文件里有过记录时才有）、`[reaper] 子进程记录读不出来（<错误码>），本次不清理`、`子进程记录损坏，本次不清理`、`清理出错，本次跳过`、`子进程记录写不进去（<错误码>），只影响桥接异常退出后的残留清理`、`取不到子进程的进程组或启动时间，本轮不登记（只影响桥接异常退出后的残留清理）`、`找不到 ps 命令，不登记、也不清理上一代残留的 claude 进程`、`免打扰时段，中断通知延后到时段结束`、`中断通知发送失败`；`[config] .env 里另有 N 个未登记的键，不交给 claude：<键名>`、`[config] ⚠️ 读不了 .env 的键名（<错误码>），这次只按清单过滤`。
+- 测试：新增 `test/child-registry.test.js`（探测 / 登记 / 清理 / 通知的纯逻辑，注入假 `ps` 与假 `kill`）、`test/child-reaper.test.js`（真进程：伪造「被强杀的桥接」留下的孤儿进程组，验证只清指纹全对的、对不上的原样不动；不碰任何不是本测试起的进程）、`test/run2-claude.test.js`（会话换新提示的各档来源与重试组合，及 `running` 守卫）、`test/run2-wiring.test.js`（`index.js` 里三处新接线的位置与取值）；
+  `test/child-env.test.js` 追加「放行表里除登录令牌外没有 SECRET / TOKEN / KEY / PASSWORD」「`.env` 键过滤」「主用 / 备用真实一轮子进程拿到的环境里没有这些键」，`test/mcp-secret.test.js` 追加「空闲超时 / 结果宽限到期 / 取消三种收尾也清掉临时 MCP 配置目录」（补 RUN-1 复审点名的 4 项测试缺口）。
+- **已知限制与升级注意**：
+  - 清理只在下次启动时做：桥接被强杀后、重启之前，残留的 claude 照常跑；另外，领头进程已经退出（记录随 `settle()` 删掉）、同组的孙进程却忽略 SIGTERM、正等 `killChild` 那 2 秒补刀的当口桥接被强杀，这一组已不在记录里，不会被清理（只会漏清，不会误杀）；
+  - 只清指纹全对的：Linux 上被别的收养者（subreaper，父进程不是 1 号）接管的不清理；同一目录起两个桥接，后写的记录文件会盖掉先写的（只会漏清，不会误杀）；领头进程已死、只剩孙进程的进程组只删记录；
+  - 启动时遇到忽略 SIGTERM 的残留组会多等最多约 2 秒（同步）；每次起 claude 子进程多一次同步的 `ps -p` 查询（超时 2 秒）；
+  - **升级前先做一次只读的键名核对**：原来写在 `.env` 里、本想让 claude 也用上的变量（代理 `HTTPS_PROXY`、`ANTHROPIC_*`、`CLAUDE_CONFIG_DIR`、`NODE_EXTRA_CA_CERTS`、`LANG` / `LC_*` 等）升级后不再传给 claude，要给 claude 用就设在服务自己的环境里（前台启动时 export，常驻服务写进 plist / unit 的环境变量）；启动日志里 `[config] .env 里另有 N 个未登记的键` 那一行会列出被拦的键名。
+
 ### owner 私聊目的地落盘（重启后定时任务立即恢复业务查询工具）
 
 - **问题**：owner 私聊的 chat_id 只记在内存里，桥接重启后、owner 没再私聊之前，「结果发 owner 私聊」的定时任务判不出目的地，没有 `mcp__biz__biz_get`（11/20 07:30 的定时任务因此报找不到工具）。
