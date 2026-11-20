@@ -11,6 +11,7 @@
 import { ACTION_BY_PHRASE, actionLabel } from './ledger-actions.js';
 import { ownerText, OWNER } from './owner-name.js';
 import { withUuid, contentPart } from './send-key.js'; // BRIDGE-SEND-1
+import { splitMessage, segmentCost, MAX_SEGMENTS } from './split-message.js'; // BRIDGE-SEND-2
 
 const MSG_ID_RE = /^om_[A-Za-z0-9_-]{1,64}$/;
 const TOAST_OK = Object.freeze({ toast: Object.freeze({ type: 'success', content: '已记下' }) });
@@ -54,8 +55,13 @@ export function buildMarkdownCard(chunk, actions) {
 /**
  * 发卡片，失败降级纯文本（与原 sendMarkdown 同一套）。create(data) 是 im.v1.message.create 的包装。
  * 返回飞书的 message_id（两条路都取 data.message_id；拿不到返回 undefined，调用方不记索引）。
+ *
+ * BRIDGE-SEND-2：正文按两次 JSON 转义后的字节分段（src/split-message.js），一段放得下时走下面原来的单段路径，
+ * 逐字不变；多段时逐段串行发送，段名带「#第几段/共几段」，按钮只放在最后一段，返回最后一段的 message_id。
  */
 export async function sendCardWithFallback(create, chunk, opts = {}, onFallback = () => {}) {
+  const { segments, ranges, omittedChars } = splitMessage(chunk);
+  if (segments.length > 1) return sendSegments(create, chunk, { segments, ranges, omittedChars }, opts, onFallback);
   const actions = Array.isArray(opts?.actions) && opts.actions.length ? opts.actions : null;
   const key = opts?.idempotencyKey; // BRIDGE-SEND-1：同一次逻辑发送的每次重试同一个键；不给键时请求体逐字不变
   let res;
@@ -68,6 +74,51 @@ export async function sendCardWithFallback(create, chunk, opts = {}, onFallback 
   }
   const id = res?.data?.message_id;
   return typeof id === 'string' && id ? id : undefined;
+}
+
+const validId = (res) => { const id = res?.data?.message_id; return typeof id === 'string' && id ? id : undefined; };
+const codePoints = (str) => { let n = 0; for (const _ of str) n += 1; return n; };
+
+async function sendSegments(create, chunk, { segments, ranges, omittedChars }, opts, onFallback) {
+  const actions = Array.isArray(opts?.actions) && opts.actions.length ? opts.actions : null;
+  const key = opts?.idempotencyKey;
+  const n = segments.length;
+  const kb = segments.map((seg) => (segmentCost(seg) / 1024).toFixed(1));
+  console.log(`[send] 长消息分 ${n} 段发送（各段约 ${kb.join(' / ')} KB${omittedChars ? `；超出 ${MAX_SEGMENTS} 段，末段注明后面约 ${omittedChars} 字没有发出` : ''}）`);
+  let lastId;
+  for (let i = 0; i < n; i += 1) {
+    const seg = segments[i];
+    const tag = `#${i + 1}/${n}`;
+    const cardPart = `${contentPart('card', seg)}${tag}`;
+    let res;
+    try {
+      const card = buildMarkdownCard(seg, i === n - 1 ? actions : null);
+      res = await create(withUuid({ msg_type: 'interactive', content: JSON.stringify(card) }, key, cardPart));
+    } catch (e) {
+      onFallback(e);
+      try {
+        res = await create(withUuid({ msg_type: 'text', content: JSON.stringify({ text: seg }) }, key, e?.response ? `${contentPart('text', seg)}${tag}` : cardPart));
+      } catch (e2) {
+        let rest = omittedChars;
+        for (let j = i; j < n; j += 1) rest += codePoints(chunk.slice(ranges[j][0], ranges[j][1]));
+        if (key) {
+          console.error(`[send] 长消息第 ${i + 1}/${n} 段发送失败，后面约 ${rest} 字没有发出（交给调用方重试）`);
+          throw e2;
+        }
+        if (i === 0) throw e2;
+        // 没有幂等键：抛错会让调用方整条重发、前面已送达的段重复，所以补一条提示，不抛
+        console.error(`[send] 长消息第 ${i + 1}/${n} 段发送失败，后面约 ${rest} 字没有发出（已补发提示）`);
+        try {
+          await create({ msg_type: 'text', content: JSON.stringify({ text: `⚠️ 上面这条消息较长，分 ${n} 段发送；第 ${i + 1} 段起没能发出，后面约 ${rest} 字没有送达。` }) });
+        } catch (e3) {
+          console.error('[send] 补发「没发完」提示也失败:', e3?.message ?? e3);
+        }
+        return lastId;
+      }
+    }
+    lastId = validId(res);
+  }
+  return lastId;
 }
 
 const asMs = (v) => {

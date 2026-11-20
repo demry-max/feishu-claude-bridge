@@ -1,7 +1,8 @@
 // 出站能力：进度卡片原地更新、图片/文件回传、发送者姓名解析
 import fs from 'node:fs';
 import path from 'node:path';
-import { withUuid, outboxPart } from './send-key.js'; // BRIDGE-SEND-1
+import { withUuid, outboxPart, contentPart } from './send-key.js'; // BRIDGE-SEND-1 / SEND-2
+import { defaultKeepDir, keepEntry, displayName, unsentNote } from './outbox-keep.js'; // BRIDGE-SEND-2
 
 
 // ---- 出站脱敏：回复送出前抹掉密钥/令牌/内网地址，避免误发到群里 ----
@@ -170,42 +171,133 @@ export function migrateLegacyOutbox(outboxRoot) {
  *
  * 必须按会话隔离：共享一个 outbox 时，定时任务生成的文件会滞留到下一条**任意**消息
  * 被顺手发走——周报图表可能就这么发给了随口问天气的同事，且发完即删无法追回。
+ *
+ * BRIDGE-SEND-2：opts.mode —— 缺省 = 发送；'hold'（失败轮）不发，全部挪进保留目录并返回说明；
+ * 'discard'（取消轮）不发，全部清掉。发送模式下上传 / 发送失败的文件、子目录不再悄悄删掉，挪进保留目录，
+ * 并补一条文字说明（文件名清洗过、不带路径）。回传目录顶层的符号链接与非普通文件一律不上传、直接删链接（不动目标）。
+ * 返回 { sent, unsent, nested, links, lost, removed, note }。
  */
 export async function flushOutbox(client, outboxDir, sendRaw, opts = {}) {
   const idemKey = opts?.idempotencyKey; // BRIDGE-SEND-1：每个文件的键 = 逻辑键 + 文件名与内容的哈希；不给键时请求体逐字不变
-  if (!fs.existsSync(outboxDir)) return 0;
-  const files = fs
-    .readdirSync(outboxDir)
-    .filter((f) => !f.startsWith('.') && fs.statSync(path.join(outboxDir, f)).isFile());
-  let sent = 0;
-  for (const name of files) {
-    const p = path.join(outboxDir, name);
-    try {
-      const ext = path.extname(name).toLowerCase();
-      const part = idemKey ? outboxPart(name, fs.readFileSync(p)) : null;
-      if (IMAGE_EXT.has(ext)) {
-        const up = await client.im.v1.image.create({
-          data: { image_type: 'message', image: fs.createReadStream(p) },
-        });
-        const key = up?.image_key ?? up?.data?.image_key;
-        if (!key) throw new Error('上传图片未返回 image_key');
-        await sendRaw(withUuid({ msg_type: 'image', content: JSON.stringify({ image_key: key }) }, idemKey, part));
-      } else {
-        const up = await client.im.v1.file.create({
-          data: { file_type: 'stream', file_name: name, file: fs.createReadStream(p) },
-        });
-        const key = up?.file_key ?? up?.data?.file_key;
-        if (!key) throw new Error('上传文件未返回 file_key');
-        await sendRaw(withUuid({ msg_type: 'file', content: JSON.stringify({ file_key: key }) }, idemKey, part));
+  const mode = opts?.mode === 'hold' || opts?.mode === 'discard' ? opts.mode : 'send';
+  const keepOpts = { keepDir: opts?.keepDir ?? defaultKeepDir(), now: opts?.now };
+  const result = { sent: 0, unsent: [], nested: 0, links: 0, lost: 0, removed: 0, note: '' };
+  if (!fs.existsSync(outboxDir)) return result;
+  const files = [];
+  const dirs = [];
+  const odd = []; // 符号链接 / 其它非普通文件
+  for (const name of fs.readdirSync(outboxDir)) {
+    if (name.startsWith('.')) continue;
+    let st;
+    try { st = fs.lstatSync(path.join(outboxDir, name)); } catch { continue; }
+    if (st.isFile()) files.push(name);
+    else if (st.isDirectory()) dirs.push(name);
+    else odd.push(name);
+  }
+
+  if (mode === 'discard') {
+    for (const name of [...files, ...dirs, ...odd]) {
+      fs.rmSync(path.join(outboxDir, name), { recursive: true, force: true });
+      result.removed++;
+    }
+    if (result.removed > 0) console.log(`[outbox] 取消的那一轮：清掉 ${result.removed} 个待发条目（不发送）`);
+    return result;
+  }
+
+  const holdFile = (name) => {
+    const ok = keepEntry(path.join(outboxDir, name), name, keepOpts);
+    result.unsent.push(displayName(name));
+    if (!ok) result.lost++;
+  };
+  if (mode === 'send') {
+    for (const name of files) {
+      const p = path.join(outboxDir, name);
+      let failed = false;
+      try {
+        const ext = path.extname(name).toLowerCase();
+        const part = idemKey ? outboxPart(name, fs.readFileSync(p)) : null;
+        if (IMAGE_EXT.has(ext)) {
+          const up = await client.im.v1.image.create({
+            data: { image_type: 'message', image: openUpload(p) },
+          });
+          const key = up?.image_key ?? up?.data?.image_key;
+          if (!key) throw new Error('上传图片未返回 image_key');
+          await sendRaw(withUuid({ msg_type: 'image', content: JSON.stringify({ image_key: key }) }, idemKey, part));
+        } else {
+          const up = await client.im.v1.file.create({
+            data: { file_type: 'stream', file_name: name, file: openUpload(p) },
+          });
+          const key = up?.file_key ?? up?.data?.file_key;
+          if (!key) throw new Error('上传文件未返回 file_key');
+          await sendRaw(withUuid({ msg_type: 'file', content: JSON.stringify({ file_key: key }) }, idemKey, part));
+        }
+        result.sent++;
+      } catch (e) {
+        console.error(`[outbox] 发送 ${name} 失败:`, e?.message ?? e);
+        failed = true;
       }
-      sent++;
+      if (failed) holdFile(name);
+      else fs.rmSync(p, { force: true }); // 发出去了才清掉，避免下次重复发送
+    }
+  } else {
+    for (const name of files) holdFile(name);
+  }
+  for (const name of dirs) {
+    const p = path.join(outboxDir, name);
+    const n = countFilesStripLinks(p);
+    if (n === 0) { fs.rmSync(p, { recursive: true, force: true }); continue; }
+    result.nested += n;
+    if (!keepEntry(p, name, keepOpts)) result.lost += n;
+  }
+  for (const name of odd) {
+    fs.rmSync(path.join(outboxDir, name), { recursive: true, force: true }); // 删的是链接本身，不动目标
+    result.links++;
+  }
+
+  const failedTurn = mode === 'hold';
+  result.note = unsentNote({ names: result.unsent, nested: result.nested, lost: result.lost, links: result.links, failedTurn });
+  if (failedTurn) {
+    const k = result.unsent.length + result.nested;
+    if (k > 0) console.log(`[outbox] 这一轮没完成：${k} 个待发文件没有发送，已移到保留目录`);
+    return result;
+  }
+  if (result.unsent.length || result.nested || result.lost || result.links) {
+    console.log(`[outbox] ${result.unsent.length} 个文件没发出去、子目录里 ${result.nested} 个文件未发送，已移到保留目录（${result.lost} 个没能留存）`);
+    try {
+      await sendRaw(withUuid({ msg_type: 'text', content: JSON.stringify({ text: redact(result.note) }) }, idemKey, contentPart('unsent', result.note)));
     } catch (e) {
-      console.error(`[outbox] 发送 ${name} 失败:`, e?.message ?? e);
-    } finally {
-      fs.rmSync(p, { force: true }); // 无论成败都清掉，避免下次重复发送
+      console.error('[outbox] 补发「没发出去」说明失败:', e?.message ?? e); // 文件已挪走，抛了重试也找不回
     }
   }
-  return sent;
+  return result;
+}
+
+// 上传用的读流。流是异步打开的：上传在读之前就失败（取 token 失败、网络断了）、文件随后被挪走 / 删掉时，
+// 它会发一个没人监听的 'error'，直接让进程以未捕获异常退出。这里挂一个空监听（SDK 自己的监听照常工作，错误仍会传给它）。
+function openUpload(p) {
+  const s = fs.createReadStream(p);
+  s.on('error', () => {});
+  return s;
+}
+
+// 子目录里的文件数：lstat 递归数（不跟随链接，最多数 1000 个）；沿途遇到的符号链接直接删掉（不动目标）
+function countFilesStripLinks(dir) {
+  let n = 0;
+  const walk = (d) => {
+    let names;
+    try { names = fs.readdirSync(d); } catch { return; }
+    for (const name of names) {
+      if (n >= 1000) return;
+      const p = path.join(d, name);
+      let st;
+      try { st = fs.lstatSync(p); } catch { continue; }
+      if (st.isDirectory()) walk(p);
+      else if (st.isFile()) n++;
+      else fs.rmSync(p, { force: true });
+    }
+  };
+  walk(dir);
+  return n;
 }
 
 // 发送者姓名解析（群里知道是谁在说话）；失败或无权限时静默降级
