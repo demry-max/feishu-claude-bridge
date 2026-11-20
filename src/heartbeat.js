@@ -389,9 +389,15 @@ export function loadTasks(tasksDir, { log = console.log } = {}) {
       continue;
     }
     v.task.hash = sha256(text); // 文件内容变了＝模型推进过，attempts 归零
+    v.task.due_fp = dueFingerprint(v.task); // 退避只看这个：决定到期的字段变了才清零（BRIDGE-MISC-3）
     tasks.push(v.task);
   }
   return { tasks, invalid };
+}
+
+/** 到期字段指纹：status、next_check_at、escalate_after（后两者按解析后的毫秒，同一时刻换写法不算变；缺省记「无」）。 */
+function dueFingerprint(task) {
+  return [task.status, task.times?.next_check_at ?? '-', task.times?.escalate_after ?? '-'].join('|');
 }
 
 /** 到期＝状态 open/waiting，且 next_check_at 已到或 escalate_after 已过。按最早到期排序。 */
@@ -450,7 +456,7 @@ export function buildHeartbeatPrompt({ due, deltas = [], now, stats = {}, omitte
     '1. 只处理下面列出的到期台账条目。**不要主动找活**：不翻聊天记录、不巡检别的文件、不新建台账条目。',
     '2. 每处理一条，就改写对应的 `tasks/<slug>.json`：把 `next_check_at` 推到下次该看的时间（本地时间，不带时区后缀），'
       + '或把 `status` 改成 `waiting` / `done` / `dropped`；处理过的 `escalate_after` 清掉或后移；`notes` 不超过 300 字；'
-      + '同时更新 `updated_at`。不推进的条目下一拍会再次到期。',
+      + '推不动的就把 `next_check_at` 往后推，并在 `notes` 记一句原因。不推进的条目下一拍会再次到期。',
     '3. 过程要点追加到今天的 `memory/journal/YYYY-MM-DD.md`。',
     '4. 对外动作（发消息、回邮件、改日程、提交审批等）一律只起草：把草稿写进回复，请 owner 确认后再由 owner 安排执行。',
     '5. 有值得告诉 owner 的事（进展、需要拍板的、起草好的稿子），直接写出来，桥接会私聊发给 owner；'
@@ -505,10 +511,10 @@ export function buildHeartbeatPrompt({ due, deltas = [], now, stats = {}, omitte
 class DeltaTimeout extends Error {}
 
 // 退避判定（纯函数；rec＝状态里这条台账的记录，{ task, reasons }＝dueTasks 的一项）：
-// changed＝文件变了（或第一次见）→ 清零、照送；escalate＝escalate_after 首次越过 → 照送，不受退避影响；
+// changed＝决定到期的字段（status / next_check_at / escalate_after）变了（或第一次见、记录里没有指纹）→ 清零、照送；escalate＝escalate_after 首次越过 → 照送，不受退避影响；
 // skip＝还在退避 → 本拍跳过；ready＝照送
 function backoffVerdict(rec, { task, reasons }) {
-  if (!rec || rec.last_hash !== task.hash) return 'changed';
+  if (!rec || rec.due_fp !== task.due_fp) return 'changed';
   if (reasons.includes('escalate_after') && rec.escalated !== task.escalate_after) return 'escalate';
   if (Number.isInteger(rec.skip_left) && rec.skip_left > 0) return 'skip';
   return 'ready';
@@ -930,7 +936,7 @@ export function createHeartbeat(deps) {
     for (const it of due) {
       const rec = st.tasks[it.task.slug];
       const verdict = backoffVerdict(rec, it);
-      if (verdict === 'changed' && rec) { // 文件变了：退避清零
+      if (verdict === 'changed' && rec) { // 到期字段变了：退避清零
         delete rec.stale_runs;
         delete rec.skip_left;
       }
@@ -1958,6 +1964,7 @@ export function createHeartbeat(deps) {
         attempts: prev.last_hash === task.hash ? (Number.isInteger(prev.attempts) ? prev.attempts : 0) + 1 : 1,
         last_checked_at: iso(nowMs),
         last_hash: task.hash,
+        due_fp: task.due_fp,
       };
       st.tasks[task.slug] = next;
       stats[task.slug] = { ...next, prev_checked_at: prev.last_checked_at };

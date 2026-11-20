@@ -323,6 +323,13 @@ export function consumeMemoryNudge(chatId) {
 // 注入了固化提醒、但还不知道那一轮成没成功
 const nudgeInFlight = new Set();
 
+// 带提醒的那一轮整个 runClaude（含网络重试）最终失败：提醒没被执行，撤掉「已注入」、重新排到下一轮。
+function requeueMemoryNudge(chatId) {
+  if (!nudgeInFlight.delete(chatId)) return;
+  nudgePending.add(chatId);
+  console.log(`[context] ${chatId} 带固化提醒的那一轮没跑成，下一轮再提醒`);
+}
+
 // 记忆已固化、可以安全重开会话的标记
 const memoryFlushed = new Set();
 
@@ -426,6 +433,7 @@ export function resetSession(chatId) {
   resetGeneration.set(chatId, (resetGeneration.get(chatId) ?? 0) + 1);
   contextSize.delete(chatId);
   nudgePending.delete(chatId);
+  nudgeInFlight.delete(chatId);
   memoryFlushed.delete(chatId);
 }
 
@@ -1635,6 +1643,16 @@ export const SESSION_RENEWED_NOTE = '（提示：原来的会话已失效，这�
  * 模型一个工具都没调、只收到 API Error: 529 Overloaded 的纯网络类失败，被误判成「执行到一半」而放弃重试。
  */
 export async function runClaude(chatId, prompt, isOwner = false, extraTools = [], onProgress = null, opts = {}) {
+  try {
+    return await runClaudeWithRetries(chatId, prompt, isOwner, extraTools, onProgress, opts);
+  } catch (e) {
+    // 整个 runClaude（含重试与重试等待）以抛错结束才算这一轮没跑成；中途重试后成功的不走这里
+    requeueMemoryNudge(chatId);
+    throw e;
+  }
+}
+
+async function runClaudeWithRetries(chatId, prompt, isOwner, extraTools, onProgress, opts) {
   // BRIDGE-RUN-2：本轮（含网络重试）里只要有过一次「原会话不存在、换了新会话」就记下，不随重试清零
   let renewed = false;
   const acct = { key: chatId, onRenewed: () => { renewed = true; } };
