@@ -372,8 +372,8 @@ describe('测试 7：坏台账跳过，不抛异常', () => {
     fs.writeFileSync(p('notes.md'), '# 不是台账');
     const logs = [];
     const { tasks, invalid } = loadTasks(env.tasksDir, { log: (...a) => logs.push(a.join(' ')) });
-    assert.deepEqual(tasks.map((t) => t.slug), ['good']);
-    for (const f of ['broken.json', 'bad-status.json', 'bad-date.json', 'bad-day.json', 'long-notes.json', 'no-title.json',
+    assert.deepEqual(tasks.map((t) => t.slug), ['good', 'long-notes']); // notes 超 300 字不再判无效：读入时截到 300
+    for (const f of ['broken.json', 'bad-status.json', 'bad-date.json', 'bad-day.json', 'no-title.json',
       'bad-watch.json', 'bad-chat.json', 'array.json', '跟进.json', 'dir.json', 'link.json']) {
       assert.ok(invalid.some((i) => i.file === f), `${f} 应判为无效`);
       assert.ok(logs.some((l) => l.includes(f)), `${f} 跳过要记日志`);
