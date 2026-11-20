@@ -1,6 +1,7 @@
 // 出站能力：进度卡片原地更新、图片/文件回传、发送者姓名解析
 import fs from 'node:fs';
 import path from 'node:path';
+import { withUuid, outboxPart } from './send-key.js'; // BRIDGE-SEND-1
 
 
 // ---- 出站脱敏：回复送出前抹掉密钥/令牌/内网地址，避免误发到群里 ----
@@ -170,7 +171,8 @@ export function migrateLegacyOutbox(outboxRoot) {
  * 必须按会话隔离：共享一个 outbox 时，定时任务生成的文件会滞留到下一条**任意**消息
  * 被顺手发走——周报图表可能就这么发给了随口问天气的同事，且发完即删无法追回。
  */
-export async function flushOutbox(client, outboxDir, sendRaw) {
+export async function flushOutbox(client, outboxDir, sendRaw, opts = {}) {
+  const idemKey = opts?.idempotencyKey; // BRIDGE-SEND-1：每个文件的键 = 逻辑键 + 文件名与内容的哈希；不给键时请求体逐字不变
   if (!fs.existsSync(outboxDir)) return 0;
   const files = fs
     .readdirSync(outboxDir)
@@ -180,20 +182,21 @@ export async function flushOutbox(client, outboxDir, sendRaw) {
     const p = path.join(outboxDir, name);
     try {
       const ext = path.extname(name).toLowerCase();
+      const part = idemKey ? outboxPart(name, fs.readFileSync(p)) : null;
       if (IMAGE_EXT.has(ext)) {
         const up = await client.im.v1.image.create({
           data: { image_type: 'message', image: fs.createReadStream(p) },
         });
         const key = up?.image_key ?? up?.data?.image_key;
         if (!key) throw new Error('上传图片未返回 image_key');
-        await sendRaw({ msg_type: 'image', content: JSON.stringify({ image_key: key }) });
+        await sendRaw(withUuid({ msg_type: 'image', content: JSON.stringify({ image_key: key }) }, idemKey, part));
       } else {
         const up = await client.im.v1.file.create({
           data: { file_type: 'stream', file_name: name, file: fs.createReadStream(p) },
         });
         const key = up?.file_key ?? up?.data?.file_key;
         if (!key) throw new Error('上传文件未返回 file_key');
-        await sendRaw({ msg_type: 'file', content: JSON.stringify({ file_key: key }) });
+        await sendRaw(withUuid({ msg_type: 'file', content: JSON.stringify({ file_key: key }) }, idemKey, part));
       }
       sent++;
     } catch (e) {

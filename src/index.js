@@ -678,8 +678,8 @@ function isQuietAnswer(answer) {
   return !body || /^HEARTBEAT_OK[.。!！]?$/i.test(body);
 }
 
-async function sendToChat(chatId, text) {
-  return sendMarkdown('chat_id', chatId, text);
+async function sendToChat(chatId, text, opts) {
+  return sendMarkdown('chat_id', chatId, text, opts);
 }
 
 // 以应用身份私聊 owner（与启动通知同一条路：receive_id_type=open_id），桥接心跳用。
@@ -817,6 +817,7 @@ const scheduler = startScheduler({
     const schedTurn = schedTurnFor('sched', job); // 私密档只给「发往 owner 私聊」的任务；其余走访客边界
     if (chatId && schedTurn.private === false && !ownerDmChatId) console.log(`[sched] 「${job.name ?? job._file}」owner 私聊目的地未知，按非私密档运行`);
     const sendCreate = (data) => client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } });
+    const sendOpts = ctx?.sendKey ? { idempotencyKey: ctx.sendKey } : undefined; // BRIDGE-SEND-1：同一次触发的结果与回传文件，每次重试同一个键
     // 编排（缺 chat_id、调模型、发送重试与通知）在 scheduler.js 的 fireJob；这里只接线
     await fireJob({
       job,
@@ -829,9 +830,9 @@ const scheduler = startScheduler({
         null,
         { ...schedOpts, turn: schedTurn }
       ),
-      send: (text) => sendToChat(chatId, text),
+      send: (text) => sendToChat(chatId, text, sendOpts),
       // 定时任务写的文件此前从不发送，会滞留到下一条任意消息被顺手发走
-      flush: () => flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate),
+      flush: () => flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate, sendOpts),
       notifyOwner: (text, reason) => (ctx?.notifyOnce ? ctx.notifyOnce(reason, text) : sendToOwner(text)),
       isQuiet: isQuietAnswer,
       onRunFailure: async (e) => {
