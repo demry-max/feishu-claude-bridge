@@ -60,8 +60,8 @@ const journalOf = (env, day = '2026-11-16') => {
   return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
 };
 const CFG = (env = {}) => heartbeatConfig({ HEARTBEAT_ENABLED: 'true', HEARTBEAT_QUIET_HOURS: 'none', ...env }, quietLog);
-// 每拍顺手改一下台账的 notes：文件一变退避就清零，多拍测试不会被退避挡住
-const touch = (env, slug, n) => writeTask(env, slug, { ...readTask(env, slug), notes: `第 ${n} 次看过` });
+// 每拍顺手改一下 next_check_at：到期字段一变退避就清零，多拍测试不会被退避挡住（时间每拍不同、仍在过去）
+const touch = (env, slug, n) => writeTask(env, slug, { ...readTask(env, slug), notes: `第 ${n} 次看过`, next_check_at: `2026-11-16T09:${String(n).padStart(2, '0')}` });
 
 // 心跳 + 事件处理函数。send 桩默认返回 om_<第几次调用>，并记下参数个数（没有按钮时应只传一个参数）；
 // sendImpl(rec, n) 可以改成抛错 / 返回 undefined。defer 默认同步（排队的回写立刻执行），syncDefer:false 用真实的 setImmediate

@@ -58,11 +58,24 @@ function onSuccess(p) {
   ensureEnvFile(ROOT);
   // open_id 同时写进 .env：只写 data/owner.json 的话，盘故障/误删后 owner 身份就丢了，
   // 而多数人不会自己再去把它复制进 OWNER_OPEN_ID
-  patchEnvFile(ENV_PATH, {
+  const wrote = patchEnvFile(ENV_PATH, {
     FEISHU_APP_ID: p.appId,
     FEISHU_APP_SECRET: p.appSecret,
     ...(openId ? { OWNER_OPEN_ID: openId } : {}),
   });
+  if (!wrote) {
+    // 写不进 .env：不报成功、不写 owner 文件、不清待取记录（--resume 修好后还能再取一次）。
+    // 提示里不带 App Secret，也不把它另存到任何地方
+    console.error(`⛔ 应用已在飞书创建（App ID：${p.appId}），但凭据没有写进 .env。App Secret 没有打印，也没有另存。`);
+    console.error('   请检查仓库目录与 .env 是否可写（权限、磁盘空间、.env.tmp 是否被占用），修好后再取。');
+    if (mode === 'resume') {
+      console.error('   修好后运行：npm run register -- --resume 再取一次凭据（待取记录已保留）。');
+      console.error('   若提示链接失效或取不到，只能 npm run register -- --no-wait --restart 重新建应用，并到开发者后台删掉这次多出来的应用。');
+    } else {
+      console.error('   这条路径没有待取记录：修好后重新运行 npm run register（会新建应用），并到开发者后台删掉这次多出来的应用。');
+    }
+    process.exit(1);
+  }
   // patchEnvFile 写临时文件再 rename，新文件按默认 umask（常见 644）：App Secret 不能让同机其他用户读到
   try { fs.chmodSync(ENV_PATH, 0o600); } catch { /* Windows */ }
   if (openId) {

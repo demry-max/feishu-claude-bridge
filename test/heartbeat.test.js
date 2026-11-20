@@ -857,13 +857,13 @@ describe('BRIDGE-HB-1B 第 3 项：反复到期退避', () => {
     assert.match(h.hb.statusText(), /退避中 1 条/);
   });
 
-  test('台账文件一变，退避立刻清零：那一拍照常送模型，之后从头计', async () => {
+  test('决定到期的字段一变，退避立刻清零：那一拍照常送模型，之后从头计', async () => {
     const env = mkEnv();
     writeTask(env, 'quote', dueTask());
     const h = harness(env, { config: MANY() });
     assert.equal(await trace(h, 6), 'SSSKSK'); // 第 6 拍本该接着跳
-    writeTask(env, 'quote', dueTask({ notes: '对方说周五前回复' }));
-    assert.equal(await trace(h, 6, 6), 'SSSKSK', '文件一变马上送模型，退避从头计');
+    writeTask(env, 'quote', dueTask({ next_check_at: '2026-11-16T09:30' }));
+    assert.equal(await trace(h, 6, 6), 'SSSKSK', '决定到期的字段一变马上送模型，退避从头计');
   });
 
   test('退避状态在 heartbeat-state.json 里：新实例（模拟重启）接着退避；删掉状态文件才从头来', async () => {

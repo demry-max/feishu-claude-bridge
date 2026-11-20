@@ -285,8 +285,8 @@ Only items the owner hands off are recorded; it doesn't take over your calendar.
 2. No due items (`status` is open/waiting and `next_check_at` has arrived or `escalate_after` has passed) and nothing new from external increments → one log line, **no model call**;
 3. Due items → one model call (`HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT`, no session resume, no intermediate progress) whose prompt contains only the due items,
    with title/notes in the untrusted fence; the model edits the ledger to move things along; if the previous tick is still running, this tick is skipped.
-   **Backoff for repeatedly due items**: once the same ledger item has been successfully sent to the model 3 times in a row with unchanged content (same hash), each further send
-   skips 1 → 2 → 4 → 8 ticks (capped at 8); any change to the file resets it, and the tick where `escalate_after` is first crossed is always sent.
+   **Backoff for repeatedly due items**: once the same ledger item has been successfully sent to the model 3 times in a row with its due-deciding fields (`status`, `next_check_at`, `escalate_after`) unchanged, each further send
+   skips 1 → 2 → 4 → 8 ticks (capped at 8); a change to any of those three fields resets it (editing only `updated_at`, `notes` or other fields does not), and the tick where `escalate_after` is first crossed is always sent.
    Items in backoff stay out of the prompt and don't count against the daily limit (if every due item is in backoff, the tick makes no model call); backoff state is also in `data/heartbeat-state.json` and survives restarts;
 4. A `HEARTBEAT_OK` answer → complete silence; otherwise the bot DMs the owner as the app. The same text is sent at most once per 24 hours;
    during quiet hours only state is recorded, and everything is merged into one message when quiet hours end. While the pending queue isn't empty, new messages go to the back, never jumping the queue;
