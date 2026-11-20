@@ -1,12 +1,12 @@
 // BRIDGE-SEND-1：定时任务结果发送重试不重复——飞书发送的幂等键（请求体 data.uuid）。
 // 全部用桩：不连飞书、不读 .env、不用真实 HOME。K1 键的形状、K2 schedSendKey、K3 sendCardWithFallback、
-// K4 index.js 真接线 + 真 fireJob + 假客户端（W1–W8）、K5 flushOutbox、K6 调度器给 ctx.sendKey、日志不含键。
+// K4 index.js 真接线 + 真 fireJob + 假客户端（W1–W8）、K5 flushOutbox、K6 调度器给 ctx.sendKey、K7 同键不同内容不吞、日志不含键。
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { feishuUuid, withUuid, outboxPart, FEISHU_UUID_MAX_LEN } from '../src/send-key.js';
+import { feishuUuid, withUuid, outboxPart, contentPart, FEISHU_UUID_MAX_LEN } from '../src/send-key.js';
 import { sendCardWithFallback } from '../src/events.js';
 import { flushOutbox, redact } from '../src/outbound.js';
 import { fireJob, startScheduler, schedSendKey } from '../src/scheduler.js';
@@ -86,14 +86,24 @@ describe('K2 schedSendKey', () => {
     assert.notEqual(k, schedSendKey('daily.json', '2026-11-21T01:00:00.000Z'));
     assert.notEqual(k, schedSendKey('daily.json', D, true));
   });
+  test('scope（目的会话 + when 原文）不同键不同；scope 缺省与 \'\' 同键', () => {
+    const k = schedSendKey('daily.json', D, false);
+    assert.equal(k, schedSendKey('daily.json', D, false, ''));
+    assert.equal(k, schedSendKey('daily.json', D, false, undefined));
+    const a = schedSendKey('daily.json', D, false, 'oc_aaa\n2026-11-20 09:29');
+    assert.notEqual(a, k);
+    assert.notEqual(a, schedSendKey('daily.json', D, false, 'oc_bbb\n2026-11-20 09:29'));
+    assert.notEqual(a, schedSendKey('daily.json', D, false, 'oc_aaa\n2026-11-20T09:29'));
+    assert.match(a, /^sched:[0-9a-f]{32}$/);
+  });
   test('返回串不含文件名与时间原文；含 oc_ / ou_ 的文件名也不会漏进 uuid', () => {
     const k = schedSendKey('daily.json', D);
     assert.ok(!k.includes('daily') && !k.includes('2026'));
     const k2 = schedSendKey('oc_abc_ou_def.json', D);
     assert.ok(!k2.includes('oc_abc') && !k2.includes('ou_def'));
-    const u = feishuUuid(k2, 'card');
+    const u = feishuUuid(k2, contentPart('card', 'x'));
     assert.ok(!u.includes('oc_') && !u.includes('ou_'));
-    assert.ok(feishuUuid(k, 'card').length <= FEISHU_UUID_MAX_LEN);
+    assert.ok(feishuUuid(k, contentPart('card', 'x')).length <= FEISHU_UUID_MAX_LEN);
   });
 });
 
@@ -107,7 +117,7 @@ describe('K3 sendCardWithFallback 带键', () => {
     const { reqs, create } = fake(() => ok);
     assert.equal(await sendCardWithFallback(create, 'hi', { idempotencyKey: K }), 'om_1');
     assert.equal(reqs.length, 1);
-    assert.equal(reqs[0].uuid, feishuUuid(K, 'card'));
+    assert.equal(reqs[0].uuid, feishuUuid(K, contentPart('card', 'hi')));
     assert.ok(logs.every((l) => !l.includes(reqs[0].uuid)));
   });
   test('卡片网络错 → 文本沿用卡片的 uuid', async () => {
@@ -119,7 +129,7 @@ describe('K3 sendCardWithFallback 带键', () => {
   test('卡片 HTTP 400 → 文本用 text 段，与卡片不同', async () => {
     const { reqs, create } = fake((d, n) => { if (n === 1) throw httpErr(); return ok; });
     await sendCardWithFallback(create, 'hi', { idempotencyKey: K });
-    assert.equal(reqs[1].uuid, feishuUuid(K, 'text'));
+    assert.equal(reqs[1].uuid, feishuUuid(K, contentPart('text', 'hi')));
     assert.notEqual(reqs[1].uuid, reqs[0].uuid);
   });
   test('带 actions + 键：仍是 2.0 卡片并带 uuid', async () => {
@@ -127,7 +137,7 @@ describe('K3 sendCardWithFallback 带键', () => {
     await sendCardWithFallback(create, 'hi', { idempotencyKey: K, actions: [{ text: '好', value: { a: 1 } }] });
     const card = JSON.parse(reqs[0].content);
     assert.equal(card.schema, '2.0');
-    assert.equal(reqs[0].uuid, feishuUuid(K, 'card'));
+    assert.equal(reqs[0].uuid, feishuUuid(K, contentPart('card', 'hi')));
   });
   test('不带键 → 每次请求的字段恰为 msg_type、content', async () => {
     const a = fake(() => ok);
@@ -171,6 +181,8 @@ describe('K4 index.js 真接线 + 真 fireJob + 假飞书客户端', () => {
   const job = (extra = {}) => ({ _file: 'daily.json', name: '晨报', prompt: 'P', chat_id: DM, ...extra });
   const KEY = schedSendKey('daily.json', '2026-11-20T01:00:00.000Z');
   const okRes = { data: { message_id: 'om_1' } };
+  // sendMarkdown 的写法：redact(text).slice(0, 20000)；text 是 fireJob 拼的「⏰ **名字**\n\n正文」
+  const CHUNK = redact('⏰ **晨报**\n\nANSWER').slice(0, 20000);
 
   test('W1 卡片、文本都网络错，第二轮卡片成功：3 次请求，uuid 全等且是 card 段', async (t) => {
     const logs = collectLogs(t);
@@ -180,7 +192,7 @@ describe('K4 index.js 真接线 + 真 fireJob + 假飞书客户端', () => {
     assert.equal(reqs.length, 3);
     assert.deepEqual(reqs.map((r) => r.data.msg_type), ['interactive', 'text', 'interactive']);
     assert.equal(new Set(reqs.map((r) => r.data.uuid)).size, 1);
-    assert.equal(reqs[0].data.uuid, feishuUuid(KEY, 'card'));
+    assert.equal(reqs[0].data.uuid, feishuUuid(KEY, contentPart('card', CHUNK)));
     assert.ok(reqs.every((r) => r.data.receive_id === DM && r.params.receive_id_type === 'chat_id'));
     assert.equal(notes.length, 0);
     assert.ok(logs.every((l) => !l.includes(reqs[0].data.uuid) && !l.includes(KEY)));
@@ -202,7 +214,7 @@ describe('K4 index.js 真接线 + 真 fireJob + 假飞书客户端', () => {
     const { reqs, opts } = build((x) => { if (x.data.msg_type === 'interactive') throw httpErr(); return okRes; });
     await opts.onFire(job(), { sendKey: KEY, notifyOnce: async () => {} });
     assert.equal(reqs.length, 2);
-    assert.equal(reqs[1].data.uuid, feishuUuid(KEY, 'text'));
+    assert.equal(reqs[1].data.uuid, feishuUuid(KEY, contentPart('text', CHUNK)));
     assert.notEqual(reqs[1].data.uuid, reqs[0].data.uuid);
   });
 
@@ -342,7 +354,7 @@ describe('K6 调度器给 ctx.sendKey', () => {
       await h.whenIdle();
       const at = JSON.parse(fs.readFileSync(e.state, 'utf8'))['once.json'].at;
       assert.equal(got.length, 1);
-      assert.equal(got[0][1], schedSendKey('once.json', at, false));
+      assert.equal(got[0][1], schedSendKey('once.json', at, false, `${CHAT}\n${localWhen(-60_000)}`));
     } finally { h.stop(); fs.rmSync(e.dir, { recursive: true, force: true }); }
   });
 
@@ -355,8 +367,8 @@ describe('K6 调度器给 ctx.sendKey', () => {
     const h = startScheduler({ schedulesDir: e.jobs, stateFile: e.state, turnFor: () => ({ private: true }), notifyOwner: async () => {}, onFire: async (j, ctx) => { got.push([j._resumed === true, ctx.sendKey]); } });
     try {
       await h.whenIdle();
-      assert.deepEqual(got, [[true, schedSendKey('daily.json', AT, true)]]);
-      assert.notEqual(got[0][1], schedSendKey('daily.json', AT, false));
+      assert.deepEqual(got, [[true, schedSendKey('daily.json', AT, true, `${CHAT}\n0 9 * * *`)]]);
+      assert.notEqual(got[0][1], schedSendKey('daily.json', AT, false, `${CHAT}\n0 9 * * *`));
     } finally { h.stop(); fs.rmSync(e.dir, { recursive: true, force: true }); }
   });
 
@@ -372,5 +384,87 @@ describe('K6 调度器给 ctx.sendKey', () => {
       assert.equal(Object.keys(got).length, 2);
       assert.notEqual(got['a.json'], got['b.json']);
     } finally { h.stop(); fs.rmSync(e.dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('K7 同一逻辑键下内容不同 → uuid 不同（不被飞书当重复吞掉）', () => {
+  const K = schedSendKey('daily.json', 'D');
+  const ok = { data: { message_id: 'om_1' } };
+  const fake = (impl) => { const reqs = []; return { reqs, create: async (d) => { reqs.push(d); return impl(d, reqs.length); } }; };
+
+  test('K7-a 同键两段不同正文 → 不同 uuid；同一段正文两次 → 相同；网络错降级文本 = 卡片 uuid；HTTP 400 降级文本 ≠ 卡片 uuid', async () => {
+    const a = fake(() => ok);
+    await sendCardWithFallback(a.create, '第一版', { idempotencyKey: K });
+    await sendCardWithFallback(a.create, '第二版', { idempotencyKey: K });
+    await sendCardWithFallback(a.create, '第一版', { idempotencyKey: K });
+    assert.notEqual(a.reqs[0].uuid, a.reqs[1].uuid);
+    assert.equal(a.reqs[0].uuid, a.reqs[2].uuid);
+    assert.equal(a.reqs[0].uuid, feishuUuid(K, contentPart('card', '第一版')));
+
+    const n = fake((d, i) => { if (i === 1) throw netErr(); return ok; });
+    await sendCardWithFallback(n.create, '正文', { idempotencyKey: K });
+    assert.deepEqual(n.reqs.map((r) => r.msg_type), ['interactive', 'text']);
+    assert.equal(n.reqs[1].uuid, n.reqs[0].uuid);
+
+    const h = fake((d, i) => { if (i === 1) throw httpErr(); return ok; });
+    await sendCardWithFallback(h.create, '正文', { idempotencyKey: K });
+    assert.notEqual(h.reqs[1].uuid, h.reqs[0].uuid);
+    assert.equal(h.reqs[1].uuid, feishuUuid(K, contentPart('text', '正文')));
+
+    // 降级文本也随正文变
+    const h2 = fake((d, i) => { if (i === 1) throw httpErr(); return ok; });
+    await sendCardWithFallback(h2.create, '另一段', { idempotencyKey: K });
+    assert.notEqual(h2.reqs[1].uuid, h.reqs[1].uuid);
+  });
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmt = (d, sep = ' ') => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}${sep}${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const CHAT = 'oc_0123456789abcdef0123';
+  const NOW = new Date(2026, 10, 20, 9, 30, 10);
+  function env(t) {
+    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'error', () => {});
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: NOW.getTime() });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'send1k7-'));
+    const e = { dir, jobs: path.join(dir, 'jobs'), state: path.join(dir, 's.json') };
+    fs.mkdirSync(e.jobs);
+    e.write = (n, j) => fs.writeFileSync(path.join(e.jobs, n), JSON.stringify(j));
+    return e;
+  }
+
+  test('K7-b 一次性任务改期后又改回同一时刻（换写法、重新启用）→ 第三次与第一次的 sendKey 不同', async (t) => {
+    const e = env(t);
+    const at = new Date(NOW.getTime() - 60_000);
+    e.write('o.json', { name: 'o', when: fmt(at), prompt: '第一版', chat_id: CHAT });
+    const got = [];
+    const h = startScheduler({ schedulesDir: e.jobs, stateFile: e.state, onFire: async (j, c) => { got.push([j.prompt, c.sendKey]); } });
+    try {
+      await h.whenIdle(); await settle();
+      e.write('o.json', { name: 'o', when: fmt(new Date(NOW.getTime() + 60_000)), prompt: '改期', chat_id: CHAT, enabled: true });
+      t.mock.timers.tick(90_000); await settle();
+      e.write('o.json', { name: 'o', when: fmt(at, 'T'), prompt: '第三版', chat_id: CHAT, enabled: true });
+      t.mock.timers.tick(30_000); await settle();
+      assert.equal(got.length, 3, JSON.stringify(got.map((g) => g[0])));
+      assert.notEqual(got[0][1], got[1][1]);
+      assert.notEqual(got[2][1], got[0][1], '同一时刻、when 换了写法 → 不同键');
+      assert.notEqual(got[2][1], got[1][1]);
+    } finally { h.stop(); fs.rmSync(e.dir, { recursive: true, force: true }); }
+  });
+
+  test('K7-c 两个调度器实例、不同目录、同名 daily.json、同一时刻、chat_id 不同 → sendKey 不同', async (t) => {
+    const e1 = env(t);
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'send1k7b-'));
+    const when = fmt(new Date(NOW.getTime() - 60_000));
+    e1.write('daily.json', { name: 'a', when, prompt: 'A', chat_id: CHAT });
+    fs.writeFileSync(path.join(dir2, 'daily.json'), JSON.stringify({ name: 'a', when, prompt: 'A', chat_id: 'oc_ffffffffffffffffffff' }));
+    const got = [];
+    const h1 = startScheduler({ schedulesDir: e1.jobs, stateFile: e1.state, onFire: async (j, c) => { got.push([j.chat_id, c.sendKey]); } });
+    const h2 = startScheduler({ schedulesDir: dir2, stateFile: path.join(dir2, 's.json'), onFire: async (j, c) => { got.push([j.chat_id, c.sendKey]); } });
+    try {
+      await h1.whenIdle(); await h2.whenIdle();
+      assert.equal(got.length, 2);
+      assert.notEqual(got[0][0], got[1][0]);
+      assert.notEqual(got[0][1], got[1][1], '不同目的会话 → 不同键');
+    } finally { h1.stop(); h2.stop(); fs.rmSync(e1.dir, { recursive: true, force: true }); fs.rmSync(dir2, { recursive: true, force: true }); }
   });
 });

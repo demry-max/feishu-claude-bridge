@@ -145,10 +145,10 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * BRIDGE-SEND-1：定时任务一次触发的发送逻辑键（只含哈希）。同一任务文件 + 同一应触发时间 → 同一个键；
- * 因重启补跑是新的执行（结果可能不同），换键。
+ * 因重启补跑是新的执行（结果可能不同），换键。scope 是目的会话与 when 原文：换了写法 / 换了会话就换键。
  */
-export function schedSendKey(file, dueIso, resumed = false) {
-  return `sched:${crypto.createHash('sha256').update(`${file}\n${dueIso}\n${resumed ? 'resumed' : 'first'}`).digest('hex').slice(0, 32)}`;
+export function schedSendKey(file, dueIso, resumed = false, scope = '') {
+  return `sched:${crypto.createHash('sha256').update(`${file}\n${dueIso}\n${resumed ? 'resumed' : 'first'}\n${scope}`).digest('hex').slice(0, 32)}`;
 }
 
 /**
@@ -401,7 +401,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
       ...(lateOver ? { _late: lateMs, _lateOver: true } : {}),
       ...(resumed ? { _resumed: true } : {}),
     };
-    const ctx = { notifyOnce: (reason, text) => noticeOnce(`${file}|${reason}`, text), sendKey: schedSendKey(file, due.toISOString(), resumed) };
+    const ctx = { notifyOnce: (reason, text) => noticeOnce(`${file}|${reason}`, text), sendKey: schedSendKey(file, due.toISOString(), resumed, `${job.chat_id ?? ''}\n${job.when ?? ''}`) };
     const runOne = (async () => {
       let endStatus = 'done';
       try {

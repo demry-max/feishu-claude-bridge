@@ -10,7 +10,7 @@
 //   全部通过才排队回写并回「已记下」，否则回「已失效」、不改任何文件。回写异步执行，回调 3 秒内必返回
 import { ACTION_BY_PHRASE, actionLabel } from './ledger-actions.js';
 import { ownerText, OWNER } from './owner-name.js';
-import { withUuid } from './send-key.js'; // BRIDGE-SEND-1
+import { withUuid, contentPart } from './send-key.js'; // BRIDGE-SEND-1
 
 const MSG_ID_RE = /^om_[A-Za-z0-9_-]{1,64}$/;
 const TOAST_OK = Object.freeze({ toast: Object.freeze({ type: 'success', content: '已记下' }) });
@@ -60,11 +60,11 @@ export async function sendCardWithFallback(create, chunk, opts = {}, onFallback 
   const key = opts?.idempotencyKey; // BRIDGE-SEND-1：同一次逻辑发送的每次重试同一个键；不给键时请求体逐字不变
   let res;
   try {
-    res = await create(withUuid({ msg_type: 'interactive', content: JSON.stringify(buildMarkdownCard(chunk, actions)) }, key, 'card'));
+    res = await create(withUuid({ msg_type: 'interactive', content: JSON.stringify(buildMarkdownCard(chunk, actions)) }, key, contentPart('card', chunk)));
   } catch (e) {
     onFallback(e);
     // 飞书给了 HTTP 应答＝卡片确定没发出，文本用自己的键；没有应答（超时 / 连接断）＝卡片可能已送达，沿用卡片的键让飞书去重
-    res = await create(withUuid({ msg_type: 'text', content: JSON.stringify({ text: chunk }) }, key, e?.response ? 'text' : 'card'));
+    res = await create(withUuid({ msg_type: 'text', content: JSON.stringify({ text: chunk }) }, key, e?.response ? contentPart('text', chunk) : contentPart('card', chunk)));
   }
   const id = res?.data?.message_id;
   return typeof id === 'string' && id ? id : undefined;

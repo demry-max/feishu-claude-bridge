@@ -1,6 +1,7 @@
 // BRIDGE-SEND-1：飞书发消息的请求级幂等键（im.v1.message.create 请求体 data.uuid）。
 // 飞书：同一 uuid 约 1 小时内至多成功发送一条；超过 50 个字符会被拒。
 // 键只由哈希构成，不含会话 id、open_id、提示词、文件名原文；日志一律不打印键。
+// 卡片 / 文本的段名带正文哈希：同一个逻辑键下内容不同的两次发送一定是不同的 uuid，不会被飞书当重复吞掉。
 import crypto from 'node:crypto';
 
 export const FEISHU_UUID_MAX_LEN = 50;
@@ -22,4 +23,9 @@ export function withUuid(data, logicalKey, part) {
 /** 回传文件的段名：文件名 + 文件内容的哈希。 */
 export function outboxPart(name, bytes) {
   return `file:${sha256(Buffer.concat([Buffer.from(`${name}\n`, 'utf8'), Buffer.from(bytes)]))}`;
+}
+
+/** 卡片 / 文本的段名：段类型 + 正文的哈希（全长十六进制，不含原文）。 */
+export function contentPart(kind, text) {
+  return `${kind}:${sha256(String(text))}`;
 }
