@@ -234,7 +234,7 @@ describe('owner-dm-store', () => {
 describe('index.js 接线（BRIDGE-DMID-1）', () => {
   test('启动时读回并赋给 ownerDmChatId（绑定 OWNER_OPEN_ID || loadOwner()），打一行启动日志', () => {
     assert.match(SRC, /\nconst OWNER_DM_FILE = path\.join\(DATA_DIR, OWNER_DM_FILE_NAME\);\n/);
-    assert.match(SRC, /\nconst ownerDmBoot = loadOwnerDm\(OWNER_DM_FILE, OWNER_OPEN_ID \|\| loadOwner\(\), \{ log: console\.error \}\);\n/);
+    assert.match(SRC, /\nconst ownerDmBoot = await bootOwnerDm\(\{ file: OWNER_DM_FILE, ownerId: OWNER_OPEN_ID \|\| loadOwner\(\), keyFile: SCHED_APPROVAL_KEY_FILE, send: \(payload\) => client\.im\.v1\.message\.create\(payload\), log: console\.error \}\);/);
     assert.match(SRC, /\nlet ownerDmChatId = ownerDmBoot\.chatId;/);
     assert.match(SRC, /\nconsole\.log\(ownerDmBootLine\(ownerDmBoot\)\);\n/);
     assert.ok(SRC.indexOf('let ownerDmChatId = ownerDmBoot.chatId;') < SRC.indexOf('startScheduler({'), '定时器起来之前就已读回');

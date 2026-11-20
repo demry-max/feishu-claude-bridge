@@ -22,7 +22,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { OWNER_DM_CHAT_ID_RE } from './owner-dm-store.js'; // BRIDGE-PRIV-1：chat_id 的写法校验与 owner 私聊 id 同一个正则
 import { parseTime } from './heartbeat.js';
 import { plain } from './digest.js';
-import { SCHED_APPROVALS_FILE_NAME, SCHED_APPROVAL_KEY_FILE, createApprovalStore, needsApproval, approvalHash, approvalCode, pendingNoticeText } from './sched-approval.js'; // BRIDGE-PRIV-2
+import { SCHED_APPROVALS_FILE_NAME, SCHED_APPROVAL_KEY_FILE, createApprovalStore, needsApproval, approvalHash, approvalCode, pendingNoticeText, approvalModeOf } from './sched-approval.js'; // BRIDGE-PRIV-2
 
 const TICK_MS = 30_000;
 // 迟到窗口：错过的任务只在这个窗口内补跑。机器休眠一夜后醒来，
@@ -228,13 +228,20 @@ export async function fireJob({
  * maxConcurrent / maxLateMs（不传则读 SCHED_MAX_CONCURRENT / SCHED_MAX_LATE_MS）、oneShotCatchupMaxMs（一次性 prompt 任务迟到补发的上限，默认 24 小时，供测试）。
  * 调度器自己产生的通知（被打断 / 迟到跳过 / 等位超时 / when 写错 / 坏 JSON / chat_id 写法不对）同一拍合并成一条私聊。
  * BRIDGE-PRIV-2：requireApproval 为真时，结果不是发往 owner 私聊的任务要 owner 在私聊确认后才执行（approvalKeyFile 是确认记录的签名密钥，测试用）；不传则行为与以前逐字相同。
- * 返回 { stop, whenIdle, idle, inflightCount, approvalOf, approvalCandidates, approvalStore }。
+ * BRIDGE-PRIV-3：approvalMode（'button' 时发确认卡，其余按 command）与 sendApprovalCard({ file, hash, job, destUnknown }) → Promise<boolean>；requireApproval 为假时两项都不起作用。
+ * 返回 { stop, whenIdle, idle, inflightCount, approvalOf, approvalCandidates, approvalStore, approvalMode, resendApprovalCard }。
  */
-export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notifyOwner, maxConcurrent, maxLateMs, oneShotCatchupMaxMs, requireApproval = false, approvalKeyFile }) {
+export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notifyOwner, maxConcurrent, maxLateMs, oneShotCatchupMaxMs, requireApproval = false, approvalKeyFile, approvalMode, sendApprovalCard }) {
   fs.mkdirSync(schedulesDir, { recursive: true });
   const approvals = requireApproval
     ? createApprovalStore({ file: path.join(path.dirname(stateFile), SCHED_APPROVALS_FILE_NAME), keyFile: approvalKeyFile ?? SCHED_APPROVAL_KEY_FILE })
     : null;
+  // BRIDGE-PRIV-3：button 模式（且有发卡函数）时，待确认通知改发确认卡；requireApproval 为假时恒为 command
+  const mode = approvals ? approvalModeOf(approvalMode, console.log) : 'command';
+  const cardMode = mode === 'button' && typeof sendApprovalCard === 'function';
+  const MAX_CARDS_PER_TICK = 5;
+  const RESEND_MIN_MS = 120_000;
+  let cardsThisTick = 0;
   const MAX_CONCURRENT = maxConcurrent ?? intSetting(process.env.SCHED_MAX_CONCURRENT, 'SCHED_MAX_CONCURRENT', DEFAULT_MAX_CONCURRENT, 1, 10, console.log);
   const MAX_LATE_MS = maxLateMs ?? intSetting(process.env.SCHED_MAX_LATE_MS, 'SCHED_MAX_LATE_MS', DEFAULT_MAX_LATE_MS, 60_000, 86_400_000, console.log);
   const ONE_SHOT_MAX_MS = oneShotCatchupMaxMs ?? ONE_SHOT_CATCHUP_MAX_MS;
@@ -417,13 +424,27 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
       console.log(`[sched] 「${nameOf(job)}」的结果要发往别处，等 owner 在私聊确认（${file}）`);
     }
     if (!notifyOwner || notices.approvals[file] === g.hash) return;
+    if (cardMode && cardsThisTick >= MAX_CARDS_PER_TICK) return; // 本拍发卡已满：不记，留到下一拍
     notices.approvals[file] = g.hash;
     saveNotices();
     if (approvals?.invalidated === true && !invalidatedSaid) {
       invalidatedSaid = true;
-      queueLine(`⚠️ 定时任务的确认记录有 ${approvals.invalidCount} 条校验不通过（或签名密钥已重建），之前的确认已作废。下面这些发往别处的任务需要你重新确认：`);
+      queueLine(mode === 'button'
+        ? `⚠️ 定时任务的确认记录有 ${approvals.invalidCount} 条校验不通过（或签名密钥已重建），之前的确认 / 拒绝已作废。需要你重新确认的任务会各发一张确认卡。`
+        : `⚠️ 定时任务的确认记录有 ${approvals.invalidCount} 条校验不通过（或签名密钥已重建），之前的确认 / 拒绝已作废。本条里带 ⏸ 的任务需要你重新确认：`);
+    }
+    if (cardMode) {
+      cardsThisTick += 1;
+      void issueCard(job, g);
+      return;
     }
     queueLine(pendingNoticeText({ job, code: g.code, destUnknown: g.destUnknown }));
+  };
+  // 发确认卡；发不出去（返回非 true 或抛错）就退回文字通知。永不抛
+  const issueCard = async (job, g) => {
+    let ok = false;
+    try { ok = (await sendApprovalCard({ file: job._file, hash: g.hash, job, destUnknown: g.destUnknown })) === true; } catch { ok = false; }
+    if (!ok) await noticeNow(pendingNoticeText({ job, code: g.code, destUnknown: g.destUnknown, fallback: true }));
   };
   const approvalCandidates = () => {
     if (!approvals) return [];
@@ -439,6 +460,29 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
       });
     }
     return out;
+  };
+
+  // BRIDGE-PRIV-3：补发确认卡（owner 在 button 模式下发 /tasks approve、或点了失效的旧卡时）。同一文件 2 分钟内最多 1 张。
+  // 返回 'sent' | 'recent' | 'gone'（不在 button 模式、任务不存在 / 不受闸 / 已确认）
+  const resendLog = new Map(); // file → 上次补发的毫秒时间
+  const resendApprovalCard = (fileOrCandidate) => {
+    try {
+      if (!cardMode) return 'gone';
+      const file = typeof fileOrCandidate === 'string' ? fileOrCandidate : fileOrCandidate?.file;
+      if (typeof file !== 'string' || !file) return 'gone';
+      const job = readJobs(schedulesDir).find((j) => j._file === file);
+      const g = job ? gateOf(job) : null;
+      if (!job || !g || g.state === 'approved') return 'gone';
+      const t = Date.now();
+      const last = resendLog.get(file);
+      if (last !== undefined && t - last < RESEND_MIN_MS) return 'recent';
+      resendLog.set(file, t);
+      if (notices.approvals[file] !== g.hash) { notices.approvals[file] = g.hash; saveNotices(); } // 这份内容已有卡，下一拍不再重复发
+      void issueCard(job, g);
+      return 'sent';
+    } catch {
+      return 'gone';
+    }
   };
 
   const dispatch = (job, due, { lateMs = 0, lateOver = false, resumed = false } = {}) => {
@@ -533,6 +577,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
   // ---- 扫描：只扫描、派发，不等任务跑完 ----
   const tick = () => {
     if (scanning || stopped) return; // 仅防止扫描本身重入；执行是异步的
+    cardsThisTick = 0; // BRIDGE-PRIV-3：每拍最多发 5 张确认卡
     scanning = true;
     try {
       flushMemState();
@@ -640,5 +685,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     approvalOf: gateOf,
     approvalCandidates,
     approvalStore: approvals,
+    approvalMode: mode,
+    resendApprovalCard,
   };
 }
