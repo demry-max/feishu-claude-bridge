@@ -18,6 +18,7 @@ const titles = (h) => h.sent.map((s) => s.text);
 const count = (h, re) => titles(h).filter((t) => re.test(t)).length;
 const NOTICE = /台账文件读不了/;
 const FAULT = /心跳状态写不进去/;
+const READ_FAULT = /心跳状态文件读不出来/;
 const TRUNC = /notes 已截断/;
 const withDirDenied = async (dir, fn) => {
   fs.mkdirSync(dir, { recursive: true });
@@ -395,7 +396,7 @@ test('T9 状态目录读、写都失败一拍（EACCES 模拟 EMFILE / EIO）后
   assert.equal(h.calls.length, 3, '20:00、23:00（免打扰里调模型、结果排队）、08:00 各一次；01:00 的故障拍没调');
 });
 
-test('T10 状态目录读写都坏期间连跑 3 拍、另有一条坏台账：坏台账通知 0 条（整拍跳过），写不进去通知恰好 1 条；恢复后下一拍坏台账通知 1 条', async (t) => {
+test('T10 状态目录读写都坏期间连跑 3 拍、另有一条坏台账：坏台账通知 0 条（整拍跳过），读不出来通知恰好 1 条；恢复后下一拍坏台账通知 1 条', async (t) => {
   if (isRoot()) { t.skip('root 无视目录权限，chmod 造不出读写失败'); return; }
   const env = mkEnv();
   writeTask(env, 'later', base({ next_check_at: '2026-12-31T09:00' }));
@@ -408,10 +409,12 @@ test('T10 状态目录读写都坏期间连跑 3 拍、另有一条坏台账：�
     for (let i = 0; i < 3; i++) { next(h); await h.hb.beat(); }
   });
   assert.equal(count(h, NOTICE), 1, 'fail-closed 的拍不再发坏台账通知（整拍跳过）');
-  assert.equal(count(h, FAULT), 1, '写不进去通知恰好 1 条');
+  assert.equal(count(h, READ_FAULT), 1, '读不出来通知恰好 1 条');
+  assert.equal(count(h, FAULT), 0, '整拍跳过、不落盘，所以没有写不进去通知');
   next(h); await h.hb.beat(); // 恢复：盘上没有状态文件 → 新状态、记录是空的 → 坏台账通知再发 1 条
   assert.equal(count(h, NOTICE), 2, '恢复后下一拍发 1 条');
-  assert.equal(count(h, FAULT), 1);
+  assert.equal(count(h, READ_FAULT), 1);
+  assert.equal(count(h, FAULT), 0);
 });
 
 test('T10b 状态文件在、目录读写都坏：连跑 3 拍期间坏台账通知一条都不发，恢复后不重发（记录还在盘上）', async (t) => {
@@ -426,7 +429,8 @@ test('T10b 状态文件在、目录读写都坏：连跑 3 拍期间坏台账通
     for (let i = 0; i < 3; i++) { next(h); await h.hb.beat(); }
   });
   assert.equal(count(h, NOTICE), 1);
-  assert.equal(count(h, FAULT), 1);
+  assert.equal(count(h, READ_FAULT), 1);
+  assert.equal(count(h, FAULT), 0);
   next(h); await h.hb.beat();
   assert.equal(count(h, NOTICE), 1, '盘上记录还在，恢复后不重发');
 });
