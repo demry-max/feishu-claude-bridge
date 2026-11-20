@@ -22,6 +22,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { OWNER_DM_CHAT_ID_RE } from './owner-dm-store.js'; // BRIDGE-PRIV-1：chat_id 的写法校验与 owner 私聊 id 同一个正则
 import { parseTime } from './heartbeat.js';
 import { plain } from './digest.js';
+import { SCHED_APPROVALS_FILE_NAME, SCHED_APPROVAL_KEY_FILE, createApprovalStore, needsApproval, approvalHash, approvalCode, pendingNoticeText } from './sched-approval.js'; // BRIDGE-PRIV-2
 
 const TICK_MS = 30_000;
 // 迟到窗口：错过的任务只在这个窗口内补跑。机器休眠一夜后醒来，
@@ -226,10 +227,14 @@ export async function fireJob({
  * 可选：turnFor（判定「结果是否发往 owner 私聊」，与 index.js 的 schedTurnFor 同一个）、notifyOwner(text)、
  * maxConcurrent / maxLateMs（不传则读 SCHED_MAX_CONCURRENT / SCHED_MAX_LATE_MS）、oneShotCatchupMaxMs（一次性 prompt 任务迟到补发的上限，默认 24 小时，供测试）。
  * 调度器自己产生的通知（被打断 / 迟到跳过 / 等位超时 / when 写错 / 坏 JSON / chat_id 写法不对）同一拍合并成一条私聊。
- * 返回 { stop, whenIdle, idle, inflightCount }。
+ * BRIDGE-PRIV-2：requireApproval 为真时，结果不是发往 owner 私聊的任务要 owner 在私聊确认后才执行（approvalKeyFile 是确认记录的签名密钥，测试用）；不传则行为与以前逐字相同。
+ * 返回 { stop, whenIdle, idle, inflightCount, approvalOf, approvalCandidates, approvalStore }。
  */
-export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notifyOwner, maxConcurrent, maxLateMs, oneShotCatchupMaxMs }) {
+export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notifyOwner, maxConcurrent, maxLateMs, oneShotCatchupMaxMs, requireApproval = false, approvalKeyFile }) {
   fs.mkdirSync(schedulesDir, { recursive: true });
+  const approvals = requireApproval
+    ? createApprovalStore({ file: path.join(path.dirname(stateFile), SCHED_APPROVALS_FILE_NAME), keyFile: approvalKeyFile ?? SCHED_APPROVAL_KEY_FILE })
+    : null;
   const MAX_CONCURRENT = maxConcurrent ?? intSetting(process.env.SCHED_MAX_CONCURRENT, 'SCHED_MAX_CONCURRENT', DEFAULT_MAX_CONCURRENT, 1, 10, console.log);
   const MAX_LATE_MS = maxLateMs ?? intSetting(process.env.SCHED_MAX_LATE_MS, 'SCHED_MAX_LATE_MS', DEFAULT_MAX_LATE_MS, 60_000, 86_400_000, console.log);
   const ONE_SHOT_MAX_MS = oneShotCatchupMaxMs ?? ONE_SHOT_CATCHUP_MAX_MS;
@@ -295,9 +300,10 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
   const notices = (() => {
     try {
       const j = JSON.parse(fs.readFileSync(noticeFile, 'utf8'));
-      return { days: { ...(j?.days ?? {}) }, files: { ...(j?.files ?? {}) } };
+      // 确认记录作废过（密钥重建 / 验签不过）：通知去重记录从空开始，受闸的待确认任务首拍各重新通知一次
+      return { days: { ...(j?.days ?? {}) }, files: { ...(j?.files ?? {}) }, approvals: approvals?.invalidated === true ? {} : { ...(j?.approvals ?? {}) } };
     } catch {
-      return { days: {}, files: {} };
+      return { days: {}, files: {}, approvals: {} };
     }
   })();
   const saveNotices = () => {
@@ -306,7 +312,9 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
       for (const k of Object.keys(notices.days)) if (notices.days[k] !== today) delete notices.days[k];
       fs.mkdirSync(path.dirname(noticeFile), { recursive: true });
       const tmp = `${noticeFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(notices, null, 2));
+      // 没有受闸任务时与以前逐字节相同（不写 approvals 键）
+      const out = Object.keys(notices.approvals).length ? notices : { days: notices.days, files: notices.files };
+      fs.writeFileSync(tmp, JSON.stringify(out, null, 2));
       fs.renameSync(tmp, noticeFile);
     } catch { /* 写不进去：去重记录留在内存里 */ }
   };
@@ -386,6 +394,51 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
 
   const ownerDm = (job) => {
     try { return turnFor?.('sched', job)?.private === true; } catch { return false; }
+  };
+
+  // BRIDGE-PRIV-2：受闸判定。不受闸返回 null（且不碰确认记录）；受闸返回 { state: pending|approved|rejected, at, hash, code, destUnknown }
+  const gateOf = (job) => {
+    if (!approvals) return null;
+    let t = null;
+    try { t = turnFor?.('sched', job) ?? null; } catch { t = null; } // 抛错按受闸处理
+    if (!needsApproval(job, t?.private === true)) return null;
+    const hash = approvalHash(job._file, job);
+    const rec = approvals.lookup(job._file, hash);
+    return { state: rec?.decision ?? 'pending', at: rec?.at ?? null, hash, code: approvalCode(job._file, hash), destUnknown: t?.destUnknown === true };
+  };
+  const announcedLog = new Set();
+  let invalidatedSaid = false; // 作废提示整个进程只说一次，排在第一条待确认通知之前
+  // 同一文件同一内容只通知一次（持久化），并进同一拍的合并通知；先记再发，发送失败也算用掉（/tasks 里仍看得到）
+  const announce = (job, g) => {
+    const file = job._file;
+    const lk = `${file}|${g.hash}`;
+    if (!announcedLog.has(lk)) {
+      announcedLog.add(lk);
+      console.log(`[sched] 「${nameOf(job)}」的结果要发往别处，等 owner 在私聊确认（${file}）`);
+    }
+    if (!notifyOwner || notices.approvals[file] === g.hash) return;
+    notices.approvals[file] = g.hash;
+    saveNotices();
+    if (approvals?.invalidated === true && !invalidatedSaid) {
+      invalidatedSaid = true;
+      queueLine(`⚠️ 定时任务的确认记录有 ${approvals.invalidCount} 条校验不通过（或签名密钥已重建），之前的确认已作废。下面这些发往别处的任务需要你重新确认：`);
+    }
+    queueLine(pendingNoticeText({ job, code: g.code, destUnknown: g.destUnknown }));
+  };
+  const approvalCandidates = () => {
+    if (!approvals) return [];
+    const out = [];
+    for (const job of readJobs(schedulesDir)) {
+      const g = gateOf(job);
+      if (!g) continue;
+      const p = parseWhen(job.when);
+      out.push({
+        file: job._file, name: job.name ?? job._file, code: g.code, hash: g.hash, state: g.state,
+        announced: notices.approvals[job._file] === g.hash, destTail: String(job.chat_id).slice(-4), when: job.when,
+        expired: p.kind === 'once' && p.at <= new Date(),
+      });
+    }
+    return out;
   };
 
   const dispatch = (job, due, { lateMs = 0, lateOver = false, resumed = false } = {}) => {
@@ -490,6 +543,8 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
         if (stopped) break;
         const file = job._file;
         if (inflight.has(file)) continue; // 上一轮还没跑完
+        const g = gateOf(job);
+        if (g && g.state !== 'approved') { if (g.state === 'pending') announce(job, g); continue; }
         const { due, once, bad } = lastDueAt(job, now);
         if (bad) {
           logOnceDaily(`when|${file}|${bad}`, () => console.error(`[sched] 无效的 when（${nameOf(job)}，${file}）：${bad}`));
@@ -512,6 +567,10 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
           continue;
         }
         if (last && due <= last) continue; // 这一次已经跑过
+        if (g && g.at && due < new Date(g.at)) {
+          markFired(file, due.toISOString(), { when: job.when, status: once ? 'skipped-pending' : 'baseline' });
+          continue;
+        }
 
         // 迟到太久：cron 任务与 action 型任务放弃（关机一夜后醒来不该把昨天的任务、过期的模型切换倒着补一遍）；
         // 一次性 prompt 任务（提醒）补发一次，结果标题注明迟到多久——但迟到超过 ONE_SHOT_MAX_MS 的也放弃
@@ -578,5 +637,8 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     whenIdle: () => first, // 首拍扫描与首拍（含启动补跑）派发出去的任务都结束
     idle: async () => { while (inflight.size) await Promise.allSettled([...inflight.values()]); }, // 当前所有在跑的任务结束
     inflightCount: () => inflight.size,
+    approvalOf: gateOf,
+    approvalCandidates,
+    approvalStore: approvals,
   };
 }

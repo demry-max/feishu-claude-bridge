@@ -5,7 +5,7 @@ import path from 'node:path';
 import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession, routeTurn } from './claude.js';
 import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
-import { startScheduler, fireJob, nextFireAt } from './scheduler.js';
+import { startScheduler, fireJob, nextFireAt, parseWhen } from './scheduler.js';
 import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY, inQuietHours } from './heartbeat.js';
 import { VERIFY_KEY } from './verifier.js';
 import { createShutdown, shutdownGraceSec, replyIfDraining } from './shutdown.js';
@@ -18,6 +18,7 @@ import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-
 import { OWNER_TOOL_PROFILE, BIZ_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 import { schedDestOf } from './biz-wiring.js';
+import { tasksCommandReply, listPlain, listWhen } from './sched-approval.js'; // BRIDGE-PRIV-2
 import { resolveTurn } from './turn-context.js'; // BRIDGE-PRIV-1：一轮的「身份 × 场合」只在入口算一次
 import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.js';
 import { OWNER_DM_FILE_NAME, loadOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
@@ -140,7 +141,7 @@ const HELP_TEXT = [
   '- `/model [模型] [思考档]` 查看或切换模型，如 `/model fable high`（仅 owner）',
   '- `/model exec <模型|off>` 设置执行模型，如 `/model exec sonnet`（仅 owner）',
   '- `/do <任务>` 用执行模型跑这一轮；说「执行」「去做」也一样，会话上下文保留',
-  '- `/tasks` 查看定时任务：上次/下次触发时间（仅 owner）',
+  '- `/tasks` 查看定时任务：上次/下次触发时间；`/tasks approve|reject <确认码>` 确认或拒绝发往别处的任务（仅 owner 私聊）',
   '- `/heartbeat on|off|status` 心跳开关与状态（仅 owner 私聊；只改运行时开关，不写 .env）',
   '- `/session [status|back|auto|rotate]` 每日新会话：状态 / 退回旧会话并暂停 / 恢复 / 立即交接换新（仅 owner 私聊；DAILY_SESSION 非 off 时）',
   '',
@@ -359,7 +360,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   // 会话生命周期类命令会影响整个会话（群里是大家共用的），限 owner 使用，
   // 否则任意群成员都能把 owner 正在跑的任务掐掉、或清空群会话上下文
   const LIFECYCLE_CMDS = ['/new', '/cancel', '取消', '/voice', '/voice on', '/voice off', '/tasks'];
-  const isLifecycle = LIFECYCLE_CMDS.includes(text) || text.startsWith('/redirect');
+  const isLifecycle = LIFECYCLE_CMDS.includes(text) || text.startsWith('/redirect') || text.startsWith('/tasks ');
   if (isLifecycle && !isOwner && message.chat_type !== 'p2p') {
     await reply(message.message_id, '群会话里只有 owner 能使用会话控制指令（可以私聊我使用）。');
     return;
@@ -381,7 +382,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
     await reply(message.message_id, '🆕 已重置，下一条消息将开启全新 Claude 会话。');
     return;
   }
-  if (text === '/tasks') {
+  if (text === '/tasks' || text.startsWith('/tasks ')) {
     if (!isOwner) {
       await reply(message.message_id, '只有 owner 可以查看定时任务。');
       return;
@@ -390,7 +391,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       await reply(message.message_id, '定时任务只在私聊里查看');
       return;
     }
-    await reply(message.message_id, describeTasks());
+    await reply(message.message_id, text === '/tasks' ? describeTasks() : tasksDecision(text));
     return;
   }
   // 心跳开关只改运行时状态、从不写 .env。只在私聊生效（BRIDGE-HB-1B）：群聊里（包括 owner 本人发的）
@@ -714,29 +715,43 @@ function describeTasks() {
       : [];
     if (!files.length) return '当前没有定时任务。';
     const lines = ['**定时任务**', ''];
+    let pendingN = 0; // BRIDGE-PRIV-2：等 owner 确认的任务数
     for (const f of files.sort()) {
       let job;
       try {
         job = JSON.parse(fs.readFileSync(path.join(SCHEDULES_DIR, f), 'utf8'));
       } catch {
-        lines.push(`- ⚠️ \`${f}\` 解析失败`);
+        lines.push(`- ⚠️ \`${listPlain(f)}\` 解析失败`);
         continue;
       }
       const rec = state[f];
       const at = typeof rec === 'string' ? rec : rec?.at;
       const st = typeof rec === 'string' ? '' : rec?.status;
-      const stLabel = { baseline: '已登记', running: '执行中', done: '已完成', failed: '失败', 'skipped-late': '迟到跳过', 'skipped-busy': '等位超时跳过', interrupted: '被重启打断' }[st] ?? '';
+      const stLabel = { baseline: '已登记', running: '执行中', done: '已完成', failed: '失败', 'skipped-late': '迟到跳过', 'skipped-busy': '等位超时跳过', interrupted: '被重启打断', 'skipped-pending': '确认前已过点，未执行' }[st] ?? '';
       const last = at ? `${new Date(at).toLocaleString('zh-CN')}${stLabel ? `（${stLabel}）` : ''}` : '（尚未触发）';
       const status = job.enabled === false ? '⏸ 已停用' : '▶️ 启用';
-      lines.push(`- ${status} **${job.name ?? f}** — \`${job.when}\``);
-      lines.push(`  上次：${last}${job.action ? ` ｜ 动作：${job.action}` : ''}`);
+      lines.push(`- ${status} **${listPlain(job.name ?? f)}** — \`${listWhen(job.when, parseWhen)}\``);
+      lines.push(`  上次：${last}${job.action ? ` ｜ 动作：${listPlain(job.action)}` : ''}`);
+      const gate = job.enabled !== false ? scheduler.approvalOf?.({ ...job, _file: f }) : null;
+      if (gate) {
+        if (gate.state === 'pending') pendingN += 1;
+        lines.push(`  确认：${gate.state === 'approved' ? '已确认' : gate.state === 'rejected' ? `已拒绝（确认码 ${gate.code}）` : `待确认（确认码 ${gate.code}）`}`);
+      }
       const next = nextFireAt(job);
-      if (next) lines.push(`  下次：${next.toLocaleString('zh-CN')}`);
+      if (gate && gate.state !== 'approved') lines.push(`  下次：不执行（${gate.state === 'rejected' ? '已拒绝' : '待确认'}）`);
+      else if (next) lines.push(`  下次：${next.toLocaleString('zh-CN')}`);
     }
+    if (pendingN) lines.splice(1, 0, `有 ${pendingN} 个任务要把结果发往别处，等你确认：私聊发 \`/tasks approve <确认码>\``);
     return lines.join('\n');
   } catch (e) {
     return `读取定时任务失败：${e?.message ?? e}`;
   }
+}
+
+// BRIDGE-PRIV-2：/tasks approve|reject。有带 owner 工具的回合在跑时不认确认（防模型以 owner 身份发命令）
+function tasksDecision(text) {
+  const busy = runningKeysWithPrefix('').filter((k) => !k.startsWith('guest:')).length;
+  return tasksCommandReply({ text, candidates: scheduler.approvalCandidates?.() ?? [], store: scheduler.approvalStore, busy });
 }
 
 // 启动通知：进程崩溃/重启此前完全静默，owner 无从知道自己发的消息其实没人接
@@ -789,6 +804,7 @@ const scheduler = startScheduler({
   schedulesDir: SCHEDULES_DIR,
   stateFile: SCHED_STATE_FILE,
   turnFor: schedTurnFor, // 按引用传：启动补跑只补「目的地是 owner 私聊」的任务，判定与上面同一处
+  requireApproval: true, // BRIDGE-PRIV-2：结果不是发往 owner 私聊的任务，要 owner 在私聊确认后才执行
   notifyOwner: (text) => sendToOwner(text), // 迟到跳过 / 被重启打断 / when 写错等私聊 owner（与启动通知同一条路）
   onFire: async (job, ctx) => {
     const chatId = job.chat_id;

@@ -110,7 +110,11 @@ for (const [label, bms] of SWITCH) {
         assert.ok(hasSecretsDeny(s.args), tag);
         assert.ok(!s.args.join(' ').includes('lark-cli') && !s.args.join(' ').includes('mcp__'), tag);
         assert.ok(o.prompt.startsWith(g.prompt), tag);
-        assert.match(o.prompt.slice(g.prompt.length), /^\n- 本轮是定时任务，结果会发往群或别的会话/, tag);
+        assert.match(
+          o.prompt.slice(g.prompt.length),
+          turn.destUnknown === true ? /^\n- 本轮是定时任务；桥接暂时不知道主人的私聊会话/ : /^\n- 本轮是定时任务，结果会发往群或别的会话/,
+          tag,
+        );
       }
       // 旧式调用（opts.schedDest 显式写 other）同形
       const legacy = snapOf(m, ['sched:daily.json', true, [], { toolProfile: 'sched', schedDest: 'other' }]);
