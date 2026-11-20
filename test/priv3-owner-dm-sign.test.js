@@ -14,6 +14,7 @@ const OWNER = 'ou_1111aaaa2222bbbb3333cccc4444dddd';
 const OTHER = 'ou_9999zzzz8888yyyy7777xxxx6666wwww';
 const TEXT_UNSIGNED = '🔐 桥接已重新记下和你的私聊会话（用来判断定时任务的结果是不是发给你本人），不用回复。';
 const TEXT_TAMPERED = '⚠️ 私聊会话记录被改动过（签名对不上），已按你的账号重新记下并恢复。';
+const TEXT_NEWKEY = '🔐 签名密钥是新建的，之前记下的私聊会话没法核对，已按你的账号重新记下，不用回复。';
 
 function env() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'priv3-odm-'));
@@ -128,6 +129,56 @@ describe('O4–O7 bootOwnerDm', () => {
       assert.equal(read(e.file).chat_id, CHAT2);
       noLeak(e.out);
     } finally { e.rm(); }
+  });
+  test('LOW-2 对不上的原因分开说：密钥原有 → 被改动过；密钥是这次新建的 / 只能放内存 → 新建句；没有签名 → 老的那句', async () => {
+    const sentText = (e) => JSON.parse(e.sends[0].data.content).text;
+    { // 密钥原有、记录被改：被改动过
+      const e = env();
+      try {
+        saveOwnerDm(e.file, CHAT, OWNER, { key: e.key });
+        const d = read(e.file); d.chat_id = 'oc_attacker0000000000000000000000ff'; fs.writeFileSync(e.file, JSON.stringify(d));
+        await bootOwnerDm({ file: e.file, ownerId: OWNER, keyFile: e.keyFile, send: e.sendOk(CHAT2), log: e.log });
+        assert.equal(sentText(e), TEXT_TAMPERED);
+      } finally { e.rm(); }
+    }
+    { // 密钥文件没了（这次启动新建）：记录原本是对的，也必然对不上
+      const e = env();
+      try {
+        saveOwnerDm(e.file, CHAT, OWNER, { key: e.key });
+        fs.rmSync(e.keyFile);
+        const b = await bootOwnerDm({ file: e.file, ownerId: OWNER, keyFile: e.keyFile, send: e.sendOk(CHAT2), log: e.log });
+        assert.equal(sentText(e), TEXT_NEWKEY);
+        assert.equal(b.chatId, CHAT2);
+        assert.equal(loadOwnerDm(e.file, OWNER, { log: () => {}, key: b.signKey }).reason, 'ok');
+      } finally { e.rm(); }
+    }
+    { // 密钥文件内容坏了、被重建：同样是新建句
+      const e = env();
+      try {
+        saveOwnerDm(e.file, CHAT, OWNER, { key: e.key });
+        fs.writeFileSync(e.keyFile, 'not a key');
+        await bootOwnerDm({ file: e.file, ownerId: OWNER, keyFile: e.keyFile, send: e.sendOk(CHAT2), log: e.log });
+        assert.equal(sentText(e), TEXT_NEWKEY);
+      } finally { e.rm(); }
+    }
+    { // 密钥写不进磁盘（路径上是非空目录）：只能用内存密钥，每次启动都对不上
+      const e = env();
+      try {
+        saveOwnerDm(e.file, CHAT, OWNER, { key: e.key });
+        fs.rmSync(e.keyFile);
+        fs.mkdirSync(e.keyFile); fs.writeFileSync(path.join(e.keyFile, 'x'), '1');
+        await bootOwnerDm({ file: e.file, ownerId: OWNER, keyFile: e.keyFile, send: e.sendOk(CHAT2), log: e.log });
+        assert.equal(sentText(e), TEXT_NEWKEY);
+      } finally { e.rm(); }
+    }
+    { // 密钥原有、记录没有签名：老的那句（不受本条影响）
+      const e = env();
+      try {
+        saveOwnerDm(e.file, CHAT, OWNER);
+        await bootOwnerDm({ file: e.file, ownerId: OWNER, keyFile: e.keyFile, send: e.sendOk(CHAT2), log: e.log });
+        assert.equal(sentText(e), TEXT_UNSIGNED);
+      } finally { e.rm(); }
+    }
   });
   test('签名通过：不发、原样返回（带 signKey）', async () => {
     const e = env();

@@ -133,6 +133,14 @@ export function createOwnerDmRecorder({ file, boot, log = (...a) => console.erro
 
 const TEXT_UNSIGNED = '🔐 桥接已重新记下和你的私聊会话（用来判断定时任务的结果是不是发给你本人），不用回复。';
 const TEXT_TAMPERED = '⚠️ 私聊会话记录被改动过（签名对不上），已按你的账号重新记下并恢复。';
+const TEXT_NEWKEY = '🔐 签名密钥是新建的，之前记下的私聊会话没法核对，已按你的账号重新记下，不用回复。';
+/** 调用 loadOrCreateKey 之前先看一眼密钥文件的内容；读不了就是 null（不改 loadOrCreateKey 的返回形状）。 */
+const peekKey = (keyFile) => {
+  try {
+    const st = fs.lstatSync(keyFile, { throwIfNoEntry: false });
+    return st?.isFile() && st.size <= 128 ? fs.readFileSync(keyFile, 'utf8').trim() : null;
+  } catch { return null; }
+};
 
 /**
  * 启动时读回并验签；不采信（没有签名 / 签名不对 / 缺文件 / owner 不一致等）时，按 owner 的 open_id 以应用身份发一条私聊，
@@ -142,10 +150,12 @@ const TEXT_TAMPERED = '⚠️ 私聊会话记录被改动过（签名对不上�
  */
 export async function bootOwnerDm({ file, ownerId, keyFile, send, log = (...a) => console.error(...a), timeoutMs = 10_000 } = {}) {
   const say = (m) => { try { log(m); } catch { /* 日志失败不影响启动 */ } };
+  const before = peekKey(keyFile);
   const key = loadOrCreateKey(keyFile, { log });
+  const keyFresh = before !== key; // 原先没有 / 不可用而重建，或写不进磁盘只能用内存密钥：旧记录的签名必然对不上，不是被改
   const b = loadOwnerDm(file, ownerId, { log, key });
   if (b.reason === 'ok' || b.reason === 'no-owner' || typeof send !== 'function' || !validOwner(ownerId)) return { ...b, signKey: key };
-  const text = b.reason === 'bad-sig' ? TEXT_TAMPERED : TEXT_UNSIGNED;
+  const text = b.reason === 'bad-sig' ? (keyFresh ? TEXT_NEWKEY : TEXT_TAMPERED) : TEXT_UNSIGNED;
   const unknown = (why) => {
     say(`[owner-dm] 重新确认私聊会话失败（${why}），按未知处理`);
     return { ...b, signKey: key };
