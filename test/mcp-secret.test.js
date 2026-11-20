@@ -4,6 +4,11 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { makeSandbox, childProcessEnv, runDriver } from './fixtures/run-helpers.mjs';
+
+const CLEANUP_DRIVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'cleanup-driver.mjs');
 
 const argVal = (args, flag) => {
   const i = args.indexOf(flag);
@@ -69,10 +74,31 @@ describe('MCP 凭据不进 argv', () => {
     }
   });
 
-  test('runClaudeOnce 在子进程结束后调用 cleanup（源码断言）', () => {
-    const src = fs.readFileSync(new URL('../src/claude.js', import.meta.url), 'utf8');
-    assert.match(src, /const \{ args, cwd, effort, cleanup \} = buildClaudeArgs/);
-    assert.match(src, /child\.on\('close'[\s\S]{0,120}cleanup\(\)/, "close 回调里要先 cleanup");
-    assert.match(src, /child\.on\('error'[\s\S]{0,120}cleanup\(\)/, "启动失败也要清");
+  // BRIDGE-RUN-1：原来是三条源码断言（匹配 child.on('close'…cleanup()）。收尾改成「单点 settle」后
+  // 清理不再写在 close 回调里，源码形状断言失去意义，改成行为断言：真跑三种收尾，数临时目录和清理次数。
+  test('runClaude 三种收尾（正常 / 错误 result / 启动失败）都清掉临时 MCP 配置目录，且各清一次（行为断言）', { timeout: 60_000 }, async () => {
+    const sb = makeSandbox('mcp-cleanup');
+    try {
+      const init = (sid) => ({ type: 'system', subtype: 'init', session_id: sid });
+      sb.plan(
+        { events: [init('s-ok'), { type: 'assistant', message: { content: [{ type: 'text', text: '好' }] } }, { type: 'result', subtype: 'success', is_error: false, result: '好', session_id: 's-ok' }] },
+        { events: [init('s-err'), { type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Execution error', session_id: 's-err' }], exit: 1 },
+      );
+      const env = childProcessEnv(sb, { FEISHU_APP_ID: 'cli_test', FEISHU_APP_SECRET: SECRET, FEISHU_TOOLS: undefined, CLAUDE_MAX_RETRIES: '0' });
+      const r = await runDriver(CLEANUP_DRIVER, env, 40_000);
+      assert.ok(r.result, `驱动没有给出结果（退出码 ${r.code}）：${r.err.slice(-300)}`);
+      assert.equal(r.result.ok.outcome, 'resolved');
+      assert.equal(r.result.error.outcome, 'rejected');
+      assert.equal(r.result.spawnFail.outcome, 'rejected');
+      for (const name of ['ok', 'error', 'spawnFail']) {
+        // left 是在 runClaude 的 promise 落定的那一刻数的：目录已经没了，说明清理发生在 resolve / reject 之前
+        assert.equal(r.result[name].left, 0, `${name}：promise 落定时临时 MCP 目录还在`);
+        assert.equal(r.result[name].leftLater, 0, `${name}：临时 MCP 目录没清掉`);
+        // rm 在迟到事件都跑完之后才数：启动失败时旧写法 error / close 各清一次（共 2 次）
+        assert.equal(r.result[name].rm, 1, `${name}：应恰好清理一次，实际 ${r.result[name].rm} 次`);
+      }
+    } finally {
+      sb.cleanup();
+    }
   });
 });

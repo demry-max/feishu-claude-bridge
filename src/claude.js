@@ -9,6 +9,7 @@ import { ensureOwnerWorkspace } from './workspace.js';
 import { patchEnvFile } from './env-file.js';
 import { routeTurn, DEFAULT_EXEC_TRIGGERS } from './lanes.js';
 import { spawnBinFor, runWithAccount, skipErrorSession, accountStatusLine } from './account-fallback.js'; // BRIDGE-ACCT-1 备用账号（未配置时零变化）
+import { childEnv } from './child-env.js'; // BRIDGE-RUN-1：交给 claude 子进程的环境（去掉桥接自己的配置与飞书凭据）
 export { routeTurn, DEFAULT_EXEC_TRIGGERS };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -139,6 +140,19 @@ if (CLAUDE_MAX_MS < CLAUDE_IDLE_TIMEOUT_MS) {
   );
   CLAUDE_MAX_MS = CLAUDE_IDLE_TIMEOUT_MS * 6;
 }
+// 结果宽限（BRIDGE-RUN-1 M1）：result 事件到了、进程却迟迟不退（后台任务、孙进程攥着管道……）时，
+// 最多再等这么久，然后杀掉进程组、用已收到的结果收尾。毫秒，100–120000 的整数，留空 = 10000。
+// 写错按默认并记一条日志——日志不回显取值（取值来自 .env，别往日志里抄）。
+const DEFAULT_RESULT_GRACE_MS = 10_000;
+export function parseResultGraceMs(env = process.env, log = console.error) {
+  const raw = String(env.CLAUDE_RESULT_GRACE_MS ?? '').trim();
+  if (raw === '') return DEFAULT_RESULT_GRACE_MS;
+  const n = /^\d{1,6}$/.test(raw) ? Number(raw) : NaN;
+  if (n >= 100 && n <= 120_000) return n;
+  log(`[config] ⚠️ CLAUDE_RESULT_GRACE_MS 不合法（要 100–120000 的整数毫秒），按默认 ${DEFAULT_RESULT_GRACE_MS} 毫秒`);
+  return DEFAULT_RESULT_GRACE_MS;
+}
+const CLAUDE_RESULT_GRACE_MS = parseResultGraceMs();
 let CLAUDE_MODEL = process.env.CLAUDE_MODEL || '';
 // 思考深度：low/medium/high/xhigh/max，留空=CLI 默认
 let CLAUDE_EFFORT = process.env.CLAUDE_EFFORT || '';
@@ -211,14 +225,14 @@ const cmpVer = (a, b) => {
 export function checkCliEnvironment(model = CLAUDE_MODEL) {
   const res = { bin: CLAUDE_BIN, version: null, ok: false, problem: null };
   try {
-    const out = spawn.sync(CLAUDE_BIN, ['--version'], { encoding: 'utf8', env: process.env });
+    const out = spawn.sync(CLAUDE_BIN, ['--version'], { encoding: 'utf8', env: childEnv() }); // BRIDGE-RUN-1：自检也不带桥接的凭据
     if (out.error) {
       res.problem = `找不到可执行的 claude（PATH=${process.env.PATH}）：${out.error.message}`;
       return res;
     }
     // 记录解析到的真实路径，多份安装时一眼看出用的是哪个
     const which = spawn.sync(process.platform === 'win32' ? 'where' : 'which',
-      [CLAUDE_BIN], { encoding: 'utf8', env: process.env });
+      [CLAUDE_BIN], { encoding: 'utf8', env: childEnv() });
     if (which.stdout) res.bin = which.stdout.trim().split('\n')[0];
     res.version = (String(out.stdout ?? '').match(/(\d+\.\d+\.\d+)/) ?? [])[1] ?? null;
     if (!res.version) {
@@ -339,6 +353,46 @@ const FEISHU_TOOLS = process.env.FEISHU_TOOLS !== 'false';
 
 const sessions = loadSessions(); // { [chatId]: sessionId }
 
+// ---- claude 子进程的收尾（BRIDGE-RUN-1 M2）----
+// claude 会再起 Bash / MCP / hook 等子孙进程，它们继承 stdout / stderr 管道。只杀 claude 本身的话，
+// 子孙还攥着管道，child 的 'close'（要等所有 stdio 关闭）永远不来——这一轮挂死，running 键释放不了，
+// 同一会话再发消息就一直排不上。所以：非 Windows 上让 claude 自成进程组（spawn 时 detached:true，pgid == pid），
+// 超时 / 取消 / 宽限到期时用 process.kill(-pid, 信号) 把整组一起收。
+// Windows 没有进程组语义，沿用原来的 child.kill()（cross-spawn 包装的 .cmd 也由它处理）；那里不用 detached（会弹控制台窗口）。
+const IS_WINDOWS = process.platform === 'win32';
+const KILL_ESCALATE_MS = 2_000; // 发出 SIGTERM 之后，进程组还在就再等这么久，然后 SIGKILL
+const STDIO_DRAIN_MS = 2_000; // 进程 'exit' 之后最多再等这么久让 stdio 关闭；孙进程还攥着管道就强行收尾
+
+function signalChild(child, sig) {
+  try {
+    if (IS_WINDOWS || !child.pid) child.kill(sig);
+    else process.kill(-child.pid, sig); // 负数 = 整个进程组
+  } catch { /* 已退出 */ }
+}
+function groupAlive(child) {
+  if (IS_WINDOWS || !child.pid) return false;
+  try { process.kill(-child.pid, 0); return true; } catch { return false; }
+}
+/** SIGTERM 整组；到点进程组还在就补 SIGKILL（Windows 没法探测进程组，沿用旧行为：无条件补一刀）。补刀的定时器不拖住进程退出。 */
+function killChild(child) {
+  signalChild(child, 'SIGTERM');
+  const t = setTimeout(() => {
+    if (IS_WINDOWS || groupAlive(child)) signalChild(child, 'SIGKILL');
+  }, KILL_ESCALATE_MS);
+  t.unref?.();
+}
+
+// 桥接进程退出时（正常退出、process.exit()）同步给还在跑的 claude 进程组发 SIGTERM，不留孤儿。
+// 单例：测试与热加载会带 ?query 重复 import 本模块，监听器只能挂一次，各份模块实例共用同一个集合
+// （靠 globalThis 上的 Symbol.for 键共享）。桥接自己被 SIGKILL 时 exit 事件不会触发，这里管不到。
+const liveChildren = (globalThis[Symbol.for('feishu-claude-bridge.claude.live-children')] ??= (() => {
+  const set = new Set();
+  process.on('exit', function bridgeClaudeGroupCleanup() {
+    for (const c of set) signalChild(c, 'SIGTERM');
+  });
+  return set;
+})());
+
 // 运行中的 claude 子进程：chatId → child，供 /cancel 终止
 const running = new Map();
 export function isRunning(chatId) {
@@ -348,10 +402,8 @@ export function cancelRun(chatId) {
   const child = running.get(chatId);
   if (!child) return false;
   child.__cancelled = true;
-  try {
-    child.kill('SIGTERM');
-    setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 2000);
-  } catch { /* 已退出 */ }
+  killChild(child); // 整组：SIGTERM，2 秒后还在就 SIGKILL
+  child.__hardStop?.(); // 就算 'close' 迟迟不来，也保证本轮在有限时间内以 CANCELLED 落定
   running.delete(chatId);
   return true;
 }
@@ -1291,46 +1343,120 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
   return new Promise((resolve, reject) => {
     const child = spawn(spawnBinFor(CLAUDE_BIN, opts), args, { // BRIDGE-ACCT-1：选 bin 只在这一处
       cwd,
-      env: process.env,
+      env: childEnv(), // BRIDGE-RUN-1（H3）：去掉桥接自己的配置与飞书凭据；MCP 要用的飞书凭据另由临时 mcp.json 传
+      detached: !IS_WINDOWS, // BRIDGE-RUN-1（M2）：非 Windows 上自成进程组，超时 / 取消 / 退出时整组一起收；Windows 见上方说明
     });
     running.set(chatId, child);
+    if (child.pid) liveChildren.add(child); // 桥接退出时据此收掉还在跑的进程组
     const startedGeneration = resetGeneration.get(chatId) ?? 0; // /new 撤销检测用
     let stderr = '';
     let pending = ''; // 暂存的 assistant 文本（可能是中间进度，也可能是最终答案）
     let finalText = null;
     let finalErr = null;
     let timedOut = null;
-    let producedOutput = false; // 是否已产生过输出/副作用——决定断连后能否安全重放
-    // BRIDGE-ACCT-1：比 producedOutput 窄——出错的 result 事件本身不算，只认调过工具或已发出进度消息
+    let producedOutput = false; // 是否已产生过输出/副作用——每日新会话据此判断能否退回旧会话（语义不变：错误 result 也算）
+    // BRIDGE-ACCT-1：比 producedOutput 窄——出错的 result 事件本身不算，只认调过工具或已发出进度消息。
+    // BRIDGE-RUN-1（H1）：runClaude 的断连重试、runWithAccount 的换账号，判断「能不能安全重放」都只看它
     let acted = false;
     let lastActivity = Date.now();
     const startedAt = Date.now();
+    let exitInfo = null; // 进程 'exit' 时的退出码 / 信号，强行收尾时写进错误信息
+    let settled = false;
+    let graceTimer = null; // result 到了之后，进程不退的宽限
+    let drainTimer = null; // 进程退了之后，等 stdio 关闭的限时
+    let hardTimer = null; // 我们主动杀进程之后的总兜底
     // 深度推理档静默期天然更长，空闲阈值相应放宽，避免把「在想」误判成「卡死」
     const idleLimit = /^(xhigh|max)$/.test(effort ?? '')
       ? CLAUDE_IDLE_TIMEOUT_MS * 3
       : CLAUDE_IDLE_TIMEOUT_MS;
-    // 活动式超时：有输出就续命，静默过久或总时长超上限才终止
-    const timer = setInterval(() => {
+
+    const rl = readline.createInterface({ input: child.stdout });
+
+    // 唯一的收尾出口（BRIDGE-RUN-1 M2）：close、exit 之后的限时等待、取消 / 超时的兜底、结果宽限到期、启动失败都走这里。
+    // 只生效一次：清掉全部定时器，从 running 与存活集合里摘掉自己，删凭据临时目录（恰好一次），
+    // 关读行器（工具审计在它 'close' 时落盘），销毁管道，最后才 resolve / reject。
+    const settle = (finish) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(watchdog);
+      clearTimeout(graceTimer);
+      clearTimeout(drainTimer);
+      clearTimeout(hardTimer);
+      liveChildren.delete(child);
+      if (running.get(chatId) === child) running.delete(chatId); // 同一会话键上后来者的登记不能被误删
+      cleanup(); // 凭据临时文件：无论成败都删
+      try { rl.close(); } catch { /* 已关 */ }
+      try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* 已销毁 */ }
+      finish();
+    };
+    // 标记「本次是否已经动过手」——重试层据此决定能否安全重放
+    const mark = (err) => {
+      err.producedOutput = producedOutput;
+      err.acted = acted; // BRIDGE-ACCT-1
+      err.cliStderr = stderr;
+      return err;
+    };
+    // 按已知状态落定。顺序有讲究：取消 → 错误 result → 正常 result → 超时 → 暂存文本 → 失败。
+    // result 排在超时前面：终止信号已发、结果却在之后才到（或宽限到期）时，以结果为准，别把做完的活报成超时。
+    const conclude = (code) => settle(() => {
+      if (child.__cancelled) {
+        const err = new Error('CANCELLED');
+        err.cancelled = true;
+        err.producedOutput = producedOutput; // 取消前是否已动过手（每日新会话据此决定能否退回旧会话）
+        err.acted = acted;
+        return reject(err);
+      }
+      if (finalErr) return reject(mark(finalErr));
+      if (finalText !== null) {
+        // 这一轮确实跑完了：若本轮携带过固化提醒，此刻才算固化完成
+        if (nudgeInFlight.delete(chatId)) memoryFlushed.add(chatId);
+        return resolve(finalText);
+      }
+      if (timedOut) {
+        const err = new Error(`claude CLI 超时（${timedOut}）`);
+        err.producedOutput = producedOutput;
+        err.acted = acted;
+        return reject(err);
+      }
+      if (pending) {
+        if (nudgeInFlight.delete(chatId)) memoryFlushed.add(chatId);
+        return resolve(pending); // 异常缺失 result 时兜底
+      }
+      reject(mark(new Error(`claude CLI 失败(code ${code}): ${stderr.slice(0, 500)}`)));
+    });
+    // 我们主动杀进程（超时 / 取消）之后的总兜底：SIGTERM → 2 秒 → SIGKILL → 再等 stdio 2 秒 → 再留 1 秒余量，
+    // 到点不管 'close' 来没来都落定。
+    const armHardStop = () => {
+      if (settled || hardTimer) return;
+      hardTimer = setTimeout(() => conclude(exitInfo), KILL_ESCALATE_MS + STDIO_DRAIN_MS + 1_000);
+    };
+    child.__hardStop = armHardStop; // cancelRun 用
+    // result 已到（BRIDGE-RUN-1 M1）：静默超时不再适用；进程若在宽限内不退，杀掉进程组，用已收到的结果收尾
+    const armGrace = () => {
+      clearInterval(watchdog);
+      clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => {
+        console.log(`[claude] ${chatId} 结果已到但进程 ${Number((CLAUDE_RESULT_GRACE_MS / 1000).toFixed(2))} 秒未退出，已结束`);
+        killChild(child);
+        conclude(exitInfo);
+      }, CLAUDE_RESULT_GRACE_MS);
+    };
+    // 活动式超时：有输出就续命，静默过久或总时长超上限才终止。
+    // 轮询间隔取空闲阈值的 1/4，夹在 50 毫秒到 15 秒之间（默认 10 分钟阈值下仍是 15 秒）
+    const watchdog = setInterval(() => {
       const idle = Date.now() - lastActivity;
       const total = Date.now() - startedAt;
       if (idle > idleLimit) timedOut = `静默 ${Math.round(idle / 60000)} 分钟无输出`;
       else if (total > CLAUDE_MAX_MS) timedOut = `总时长超过 ${Math.round(CLAUDE_MAX_MS / 60000)} 分钟上限`;
       if (timedOut) {
-        clearInterval(timer);
-        try { child.kill('SIGKILL'); } catch {}
+        clearInterval(watchdog);
+        killChild(child); // 整个进程组，不只 claude 本身
+        armHardStop();
       }
-    }, 15_000);
+    }, Math.min(15_000, Math.max(50, Math.floor(idleLimit / 4))));
 
-    const rl = readline.createInterface({ input: child.stdout });
-    rl.on('line', (line) => {
-      lastActivity = Date.now(); // 有输出即续命
-      if (!line.trim()) return;
-      let d;
-      try {
-        d = JSON.parse(line);
-      } catch {
-        return; // 非 JSON 行（罕见）忽略
-      }
+    // 一个事件（已确认是普通对象）的处理
+    const handleEvent = (d) => {
       if (d.type === 'assistant') {
         // 任何 assistant 事件都意味着模型已开始动作（可能已调用工具、写过文件、发过消息），
         // 此后的断连不可安全重放——只有在这之前失败才允许自动重试。
@@ -1380,60 +1506,62 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
           finalErr = new Error(String(d.result ?? 'unknown error').slice(0, 500));
           if (Array.isArray(d.errors)) finalErr.cliErrors = d.errors.join('\n'); // BRIDGE-ACCT-1 分类用
         } else {
-          finalText = String(d.result ?? pending ?? '');
+          // BRIDGE-RUN-1（M3）：result 为空串、全空白或不是字符串时，退回已暂存的 assistant 文本；都没有才是空串。
+          // 过去 `String(d.result ?? pending ?? '')` 只挡 null / undefined，空串会把已经生成的答案吞掉
+          finalText = typeof d.result === 'string' && d.result.trim() ? d.result : (pending || '');
         }
         pending = ''; // 暂存的就是最终答案，丢弃避免重复
+        armGrace(); // BRIDGE-RUN-1（M1）：结果已到，进程不退也不能一直等
+      }
+    };
+
+    // 一行输出 → 一个事件。BRIDGE-RUN-1（L1）：
+    //  - 合法 JSON 但不是普通对象（null / 数字 / 字符串 / 数组 / 布尔）直接跳过。过去对 null 取 d.type 会抛 TypeError，
+    //    而 readline 回调里抛出的错误会冒泡成 uncaughtException，打死整个桥接进程；
+    //  - 整个处理包 try/catch：事件结构异常也只丢这一行。日志只写固定文案，不带行内容、不带异常信息（可能含 prompt 片段）。
+    rl.on('line', (line) => {
+      if (settled) return;
+      lastActivity = Date.now(); // 有输出即续命
+      try {
+        if (!line.trim()) return;
+        let d;
+        try {
+          d = JSON.parse(line);
+        } catch {
+          return; // 非 JSON 行（罕见）忽略
+        }
+        if (d === null || typeof d !== 'object' || Array.isArray(d)) return;
+        handleEvent(d);
+      } catch {
+        console.log('[claude] 跳过一行无法处理的输出');
       }
     });
 
     child.stderr.on('data', (d) => { stderr += d; lastActivity = Date.now(); });
     child.on('error', (e) => {
-      cleanup(); // 凭据临时文件
-      clearInterval(timer);
-      running.delete(chatId);
-      const err = new Error(`claude CLI 启动失败: ${e.message}`);
-      err.producedOutput = false; // 进程没起来，什么都没做
-      reject(err);
+      settle(() => {
+        const err = new Error(`claude CLI 启动失败: ${e.message}`);
+        err.producedOutput = false; // 进程没起来，什么都没做
+        err.acted = false;
+        reject(err);
+      });
     });
     // CLI 启动后立刻退出（损坏的 --resume 会话、盘不可读）时写 stdin 会抛 EPIPE，
     // 无监听器会直接冒泡成 uncaughtException 打死整个桥接进程
     child.stdin.on('error', (e) => {
       if (e?.code !== 'EPIPE') console.error('[stdin]', e?.message ?? e);
     });
-    child.on('close', (code) => {
-      cleanup(); // 凭据临时文件：无论成败都删
-      clearInterval(timer);
-      running.delete(chatId);
-      if (child.__cancelled) {
-        const err = new Error('CANCELLED');
-        err.cancelled = true;
-        err.producedOutput = producedOutput; // 取消前是否已动过手（每日新会话据此决定能否退回旧会话）
-        return reject(err);
-      }
-      if (timedOut) {
-        const err = new Error(`claude CLI 超时（${timedOut}）`);
-        err.producedOutput = producedOutput;
-        return reject(err);
-      }
-      // 标记「本次是否已经动过手」——重试层据此决定能否安全重放
-      const mark = (err) => {
-        err.producedOutput = producedOutput;
-        err.acted = acted; // BRIDGE-ACCT-1
-        err.cliStderr = stderr;
-        return err;
-      };
-      if (finalErr) return reject(mark(finalErr));
-      if (finalText !== null) {
-        // 这一轮确实跑完了：若本轮携带过固化提醒，此刻才算固化完成
-        if (nudgeInFlight.delete(chatId)) memoryFlushed.add(chatId);
-        return resolve(finalText);
-      }
-      if (pending) {
-        if (nudgeInFlight.delete(chatId)) memoryFlushed.add(chatId);
-        return resolve(pending); // 异常缺失 result 时兜底
-      }
-      reject(mark(new Error(`claude CLI 失败(code ${code}): ${stderr.slice(0, 500)}`)));
+    // 'exit'：进程本身已经退了，stdio 本该紧跟着关闭（'close'）。但孙进程若继承了管道并一直握着，'close' 永远不来，
+    // 这一轮就会永远挂着、会话键永远「忙」。所以限时等 STDIO_DRAIN_MS，到点销毁管道、清掉残留进程组，用已知状态落定。
+    child.on('exit', (code, signal) => {
+      exitInfo = code ?? signal;
+      if (settled || drainTimer) return;
+      drainTimer = setTimeout(() => {
+        if (groupAlive(child)) killChild(child); // 管道没关说明还有后代在握着：清掉，别留孤儿
+        conclude(exitInfo);
+      }, STDIO_DRAIN_MS);
     });
+    child.on('close', (code) => conclude(code));
 
     child.stdin.write(prompt);
     child.stdin.end();
@@ -1445,6 +1573,10 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
 // 超时、登录失效、用户取消都不重试——重跑既解决不了问题，还白烧一遍额度。
 const CLAUDE_MAX_RETRIES = Number(process.env.CLAUDE_MAX_RETRIES ?? 2);
 const RETRY_DELAYS_MS = [3_000, 15_000];
+// 仅测试用：原地替换退避时长，免得测试里干等 3 秒 / 15 秒。不对应任何环境变量，生产代码不调用
+export function _setRetryDelaysForTest(arr) {
+  RETRY_DELAYS_MS.splice(0, RETRY_DELAYS_MS.length, ...arr);
+}
 
 const RETRYABLE =
   /Connection (lost|error|closed|reset)|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|network error|stream (error|disconnected)|Internal server error|overloaded|\b(502|503|529)\b/i;
@@ -1481,18 +1613,21 @@ const sleepAbortable = (chatId, ms) =>
  * 运行 claude 无头模式，网络类失败自动重试（默认最多 2 次，退避 3s / 15s）。
  * 重试次数可用 CLAUDE_MAX_RETRIES 调整，设 0 关闭。
  *
- * 重要：只重试「还没动过手」的早期失败。一旦模型已经开始输出，就可能已经写过表、
+ * 重要：只重试「还没动过手」的早期失败。模型一旦调过工具、或已把进度消息发出去，就可能已经写过表、
  * 发过消息、改过记忆——整段重放会造成双写，比不重试更糟。
+ * BRIDGE-RUN-1（H1）：「动过手」只看 e.acted。过去看 producedOutput，而出错的 result 事件本身也让它变成 true——
+ * 模型一个工具都没调、只收到 API Error: 529 Overloaded 的纯网络类失败，被误判成「执行到一半」而放弃重试。
  */
 export async function runClaude(chatId, prompt, isOwner = false, extraTools = [], onProgress = null, opts = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
-      // BRIDGE-ACCT-1：账号层重试包在网络重试之内（不 sleep、不占名额）；未配置备用时直接调用
-      return await runWithAccount((o) => runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, o), opts);
+      // BRIDGE-ACCT-1：账号层重试包在网络重试之内（不 sleep、不占名额）；未配置备用时直接调用。
+      // BRIDGE-RUN-1（M5）：第三个参数只用来给「原会话不存在」的那行日志署会话键
+      return await runWithAccount((o) => runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, o), opts, { key: chatId });
     } catch (e) {
       const msg = String(e?.message ?? e);
-      if (e?.producedOutput && !e?.cancelled && RETRYABLE.test(msg)) {
-        console.log(`[retry] ${chatId} 已产生输出，断连后不自动重放（避免重复写入/重复发送）`);
+      if (e?.acted && !e?.cancelled && RETRYABLE.test(msg)) {
+        console.log(`[retry] ${chatId} 已动过手（调过工具或已发出进度），断连后不自动重放（避免重复写入/重复发送）`);
         e.message = `${msg}\n（任务已执行到一半，为避免重复写入未自动重试——请确认副作用后手动重发）`;
         throw e;
       }

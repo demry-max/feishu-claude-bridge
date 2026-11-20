@@ -14,10 +14,13 @@
 //     已有副作用 → 不重放，提示「已切到备用账号，请再发一次 / 说“继续”」。
 //   - 配置了备用时，主用或备用报会话不存在 → 每轮只一次不带 --resume 再试（两个 bin 最好共用同一个 CLI 配置目录，
 //     否则换账号两边都会开新会话）。
+//   - 未配置备用时（BRIDGE-RUN-1 M5）：原会话不存在、本轮还没动过手、也不是被取消 → 同样不带 --resume 重试一次，
+//     新会话 id 随这一轮的 result 写回会话表，不再让这个会话键每一轮都报同一个错。
+//     调用方显式传了非空 resumeId 的（每日新会话的交接轮续的是别人的会话）不这样做。
 //   - 进入备用时私信 owner 一条固定文案，同一次连续的备用期只发一次；回到主用只打日志。
 //     注入了免打扰判断且当时在免打扰时段 → 延后到时段结束再发；那之前已回到主用就不发。
 //   - 状态只在内存：重启后从主用起，主用仍不可用会再收到一条通知。
-// 日志闭集（不含消息内容、姓名、id、令牌、原始错误串）：
+// 日志闭集（不含消息内容、姓名、令牌、原始错误串；只有 [session] 那一行带会话键，与 claude.js 里别的 [session] 日志一致）：
 //   [account] 主用不可用(quota|auth)，切到备用，冷却 N 分钟
 //   [account] 冷却到期，试主用
 //   [account] 回到主用
@@ -25,12 +28,57 @@
 //   [account] 备用启动失败，回到主用路径
 //   [account-notice] 免打扰时段，切换通知延后到时段结束
 //   [account-notice] 切换通知发送失败
+//   [session] <会话键> 原会话已不存在，已开新会话
 import spawn from 'cross-spawn';
+import { childEnv } from './child-env.js';
 
-// 两条正则与同作者另一个桥接的实现一致（经真实 CLI 报错核对），改动要两边一起改
+// 会话不存在：与同作者另一个桥接的实现一致（经真实 CLI 报错核对）。
+// 注意（BRIDGE-RUN-1 M7）：下面的账号分类正则已经与那个桥接的实现分叉——这边按 test/fixtures/claude-auth-signatures.js
+// 的 2.1.280 文案补全了登录故障、去掉了裸的 401 / 429、stderr 只认强信号；那边没有改。
+// 两边不再逐条一致，别再假设「改动要两边一起改」就能对齐，要同步得人工对照夹具。
 export const SESSION_NOT_FOUND = /No conversation found/i;
-export const ACCOUNT_AUTH_UNAVAILABLE = /Not logged in|Run \/login|Invalid API key|OAuth token (?:has )?expired|authentication_error|\b401\b|Failed to authenticate|Login expired|OAuth token revoked|OAuth session expired/i;
-export const ACCOUNT_UNAVAILABLE = /usage limit|limit reached|rate[ _]limit|\b429\b|out of extra usage|Not logged in|Run \/login|Invalid API key|OAuth token (?:has )?expired|authentication_error|\b401\b|You[’']ve hit your\b[^\n]{0,40}?\b(?:limit|budget)|spend limit reached|Failed to authenticate|Login expired|OAuth token revoked|OAuth session expired/i;
+
+// 每个短语一条正则，方便逐条加注释、逐条删；拼成一条（忽略大小写）。
+const anyOf = (list) => new RegExp(list.map((r) => r.source).join('|'), 'i');
+
+// 登录失效（auth）的强信号：result 文本、errors、stderr 三路都认
+const AUTH_STRONG = [
+  /Not logged in/,
+  /Run \/login/,
+  /Invalid API key/,
+  /Invalid auth token/, // 2.1.280：外部 auth token 无效
+  /OAuth token (?:has )?expired/,
+  /OAuth token (?:has been )?revoked/, // 含 `API Error: 403 OAuth token has been revoked`
+  /authentication_error/,
+  /Failed to authenticate/,
+  /Login expired/, // 也命中 `Anthropic profile login expired`
+  /OAuth session expired/,
+  /OAuth authentication is currently not allowed/, // 组织不允许 OAuth
+  /Keychain[^\n]{0,40}not writable/, // macOS 钥匙串不可写（-25293）
+  /does not have access to Claude/, // 账号无权访问 Claude
+  /disabled Claude subscription access/, // 组织停用了订阅访问
+];
+// 只在 result 文本 / errors 里认的数字形态：必须带 `API Error:` 前缀。
+// 裸的 \b401\b 会把「工单 WO-401」当登录失效；stderr 里还常混着别的工具（lark-cli 等）自己的 HTTP 状态码
+const AUTH_RESULT_ONLY = [/API Error:\s*401\b/];
+// 额度用完（quota）的强信号：三路都认
+const QUOTA_STRONG = [
+  /usage limit/,
+  /limit reached/,
+  /out of extra usage/,
+  /You[’']ve hit your\b[^\n]{0,40}?\b(?:limit|budget)/,
+  /spend limit reached/,
+];
+// 只在 result 文本 / errors 里认的限流形态：stderr 里别的工具报的 rate limit / HTTP 429 不是 claude 账号的额度问题
+const QUOTA_RESULT_ONLY = [/rate[ _]limit/, /API Error:\s*429\b/];
+
+const AUTH_RESULT = anyOf([...AUTH_STRONG, ...AUTH_RESULT_ONLY]);
+const AUTH_STDERR = anyOf(AUTH_STRONG);
+const QUOTA_RESULT = anyOf([...QUOTA_STRONG, ...QUOTA_RESULT_ONLY]);
+const QUOTA_STDERR = anyOf(QUOTA_STRONG);
+// 保留原导出名（result 文本口径），免得外部引用断掉
+export const ACCOUNT_AUTH_UNAVAILABLE = AUTH_RESULT;
+export const ACCOUNT_UNAVAILABLE = anyOf([...AUTH_STRONG, ...AUTH_RESULT_ONLY, ...QUOTA_STRONG, ...QUOTA_RESULT_ONLY]);
 
 export const DEFAULT_COOLDOWN_MIN = 30;
 const MIN_COOLDOWN_MIN = 1;
@@ -42,15 +90,39 @@ const SPAWN_FAILED_PREFIX = 'claude CLI 启动失败'; // claude.js 起子进程
 /** 本轮用哪个账号：由 runWithAccount 写进 opts，runClaudeOnce 起子进程时读 */
 export const ACCOUNT = Symbol('claude-account');
 
-/** @returns {'quota'|'auth'|null} 会话不存在优先（那不是账号问题） */
-export function classifyAccountError(text) {
-  const s = String(text ?? '');
-  if (SESSION_NOT_FOUND.test(s) || !ACCOUNT_UNAVAILABLE.test(s)) return null;
-  return ACCOUNT_AUTH_UNAVAILABLE.test(s) ? 'auth' : 'quota';
+const asText = (x) => String(x ?? '');
+
+/**
+ * 分两路看文本，口径不同（BRIDGE-RUN-1 M7）：
+ *   resultText  result 事件的文本（含 errors 数组）。这是 claude 自己对账号状态的说法，认全部形态，
+ *               包括 `API Error: 401` / `API Error: 429` 与 rate_limit 字样；
+ *   stderrText  子进程 stderr。里面常混着 Bash / MCP / lark-cli 等别的工具的输出，只认强信号
+ *               （额度用完的几句固定话、登录失效的几句固定话），不认裸的 HTTP 状态码和 rate limit。
+ * 只传一个参数＝按 result 文本口径看。
+ * 会话不存在（任何一路出现）优先：那不是账号问题。两类信号都有时 auth 优先（登录失效了，额度无从谈起）。
+ * @returns {'quota'|'auth'|null}
+ */
+export function classifyAccountError(resultText, stderrText = '') {
+  const r = asText(resultText);
+  const s = asText(stderrText);
+  if (SESSION_NOT_FOUND.test(r) || SESSION_NOT_FOUND.test(s)) return null;
+  if (AUTH_RESULT.test(r) || AUTH_STDERR.test(s)) return 'auth';
+  if (QUOTA_RESULT.test(r) || QUOTA_STDERR.test(s)) return 'quota';
+  return null;
 }
 
-/** 分类用的全文：截断前的错误结果 + errors 数组 + stderr（runClaudeOnce 挂在 err 上） */
+/** 分类用的全文：截断前的错误结果 + errors 数组 + stderr（runClaudeOnce 挂在 err 上）。只用来找「会话不存在」 */
 const errorText = (e) => [e?.message ?? e, e?.cliErrors ?? '', e?.cliStderr ?? ''].join('\n');
+
+// 进程没出 result 就退出时，runClaudeOnce 的报错形如 `claude CLI 失败(code N): ` + stderr 头 500 字：
+// 那一段本质上是 stderr，不能当 result 文本看，否则 stderr 里的弱信号会经 message 绕过 stderr 的严格口径
+const CRASH_WRAPPER = /^claude CLI 失败\(code [^)]*\):/;
+function classifyError(e) {
+  const msg = asText(e?.message ?? e);
+  const stderr = typeof e?.cliStderr === 'string' ? e.cliStderr : '';
+  const resultPart = CRASH_WRAPPER.test(msg) && stderr ? '' : msg;
+  return classifyAccountError([resultPart, e?.cliErrors ?? ''].join('\n'), stderr);
+}
 
 export function parseCooldownMin(env = process.env, warn = console.error) {
   const raw = env?.CLAUDE_FALLBACK_COOLDOWN_MIN;
@@ -201,12 +273,34 @@ function enterFallback(kind) {
 }
 
 /**
- * 包住「跑一次 CLI」：未配置备用时直接调用、opts 原样传入（零变化）。
+ * 未配置备用：第一次调用 opts 原样传入，与没有本功能时一致。只多一件事（BRIDGE-RUN-1 M5）——
+ * 原会话已不存在（会话表里的 id 被清掉、换了 CLI 配置目录……）、本轮还没动过手、也不是被取消时，
+ * 不带 --resume 重试一次：新会话的 id 随这一轮的 result 写回会话表，这个会话键下一轮起就正常了，
+ * 不必等人发现后手动 /new。不 sleep、不占 CLAUDE_MAX_RETRIES 名额。
+ * 调用方显式传了非空 resumeId（每日新会话的交接轮续的是别人的会话，不是本会话键自己的）时不这样做：
+ * 那种场景下悄悄换成空会话，会把交接内容丢掉而没人知道。
+ */
+async function runWithoutFallback(once, opts, meta) {
+  try {
+    return await once(opts);
+  } catch (e) {
+    const explicitResume = typeof opts?.resumeId === 'string' && opts.resumeId !== '';
+    if (e?.cancelled || e?.acted || explicitResume || !SESSION_NOT_FOUND.test(errorText(e))) throw e;
+    // console.log 取调用时的值：测试与别处会替换它，不能在模块加载时绑定
+    if (meta?.key) console.log(`[session] ${meta.key} 原会话已不存在，已开新会话`);
+    return once({ ...opts, resumeId: '' });
+  }
+}
+
+/**
+ * 包住「跑一次 CLI」：未配置备用时只做上面那一次「不带 --resume 重试」，其余直接调用。
  * 账号层的重试在网络重试之内：不 sleep，不占 CLAUDE_MAX_RETRIES 名额。
  * @param {(opts: object) => Promise<any>} once
+ * @param {object} [opts]
+ * @param {{key?: string}} [meta] key：会话键，只用来给「原会话已不存在」那行日志署名
  */
-export async function runWithAccount(once, opts = {}) {
-  if (!state.enabled) return once(opts);
+export async function runWithAccount(once, opts = {}, meta = {}) {
+  if (!state.enabled) return runWithoutFallback(once, opts, meta);
   let { account, probe } = chooseAccount();
   let freshSession = false;
   for (let spawns = 1; ; spawns++) {
@@ -223,7 +317,7 @@ export async function runWithAccount(once, opts = {}) {
         freshSession = true; // 每轮只这一次不带 --resume（主用、备用都适用）
         continue;
       }
-      const kind = classifyAccountError(text);
+      const kind = classifyError(e); // result / errors 与 stderr 分两路、口径不同（M7）
       if (account === 'fallback') {
         if (kind) {
           cfg.log(`[account] 备用也不可用(${kind})`);
@@ -268,7 +362,7 @@ export function verifyFallbackAtStartup({ log = console.log, warn = console.erro
   let version = null;
   let problem = null;
   try {
-    const out = spawn.sync(bin, ['--version'], { encoding: 'utf8', env: process.env });
+    const out = spawn.sync(bin, ['--version'], { encoding: 'utf8', env: childEnv() }); // BRIDGE-RUN-1（H3）：不把桥接的配置与飞书凭据递给备用 CLI
     if (out.error) problem = `无法运行：${out.error.message}`;
     else {
       version = (String(out.stdout ?? '').match(/(\d+\.\d+\.\d+)/) ?? [])[1] ?? null;
