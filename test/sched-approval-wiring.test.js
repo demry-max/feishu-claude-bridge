@@ -15,8 +15,8 @@ import { schedDestOf } from '../src/biz-wiring.js';
 import * as mq from '../src/message-queue.js';
 import { createShutdown, replyIfDraining } from '../src/shutdown.js';
 import { createEventHandlers } from '../src/events.js';
-import { tasksCommandReply, listPlain } from '../src/sched-approval.js';
-import { nextFireAt } from '../src/scheduler.js';
+import { tasksCommandReply, listPlain, listWhen } from '../src/sched-approval.js';
+import { nextFireAt, parseWhen } from '../src/scheduler.js';
 
 const SRC = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
 const OWNER = 'ou_owner';
@@ -219,7 +219,7 @@ function describeWith({ jobs, state = {}, gateOf }) {
   for (const [f, j] of Object.entries(jobs)) fs.writeFileSync(path.join(dir, f), JSON.stringify(j));
   const stateFile = path.join(root, 'state.json');
   fs.writeFileSync(stateFile, JSON.stringify(state));
-  const scope = { fs, path, nextFireAt, SCHEDULES_DIR: dir, SCHED_STATE_FILE: stateFile, scheduler: { approvalOf: gateOf }, listPlain };
+  const scope = { fs, path, nextFireAt, SCHEDULES_DIR: dir, SCHED_STATE_FILE: stateFile, scheduler: { approvalOf: gateOf }, listPlain, listWhen, parseWhen };
   // eslint-disable-next-line no-new-func
   const fn = new Function('scope', `with (scope) {\n${describeSrc}\nreturn describeTasks;\n}`)(proxyOf(scope));
   try { return fn(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -274,10 +274,54 @@ describe('W5 describeTasks 的确认标记', () => {
     assert.ok(!out.includes('<at') && !out.includes('[x]('));
     assert.ok(out.includes('deadbe'), '文字仍在，只是压成同一行');
   });
-  test('普通任务的显示：名字与动作原样；时间写法里的 * 换成全角（与通知一致，字节变化）', () => {
-    const out = describeWith({ jobs: { 'a.json': job({ name: '晨报', when: '0 8 * * *', action: 'set-model' }) }, gateOf: undefined });
-    assert.ok(out.includes('- ▶️ 启用 **晨报** — `0 8 ＊ ＊ ＊`'));
-    assert.ok(out.includes('｜ 动作：set-model'));
+  test('合法的时间写法（cron 含 * 与 */5、@ 宏、一次性时间）在列表里与原文逐字节相同；动作原样', () => {
+    for (const when of ['0 8 * * *', '*/5 * * * *', '0 9 * * 1-5', '@daily', '@hourly', '2030-01-01T08:00', '2030-01-01 08:00', '2030-01-01', '2030/01/01']) {
+      const out = describeWith({ jobs: { 'a.json': job({ name: '晨报', when, action: 'set-model' }) }, gateOf: undefined });
+      assert.ok(out.includes(`- ▶️ 启用 **晨报** — \`${when}\`\n`), `when=${when}`);
+      assert.ok(out.includes('｜ 动作：set-model'));
+    }
+  });
+  test('没写 when：显示为空，不是 undefined', () => {
+    const { when, ...noWhen } = job({ name: 'A' });
+    const out = describeWith({ jobs: { 'a.json': noWhen }, gateOf: undefined });
+    assert.ok(out.includes('**A** — ``\n') && !out.includes('undefined'));
+  });
+  test('解析不了的时间写法（带换行 / 反引号 / 确认码字样）：纯文本化，伪造不出独立的一行', () => {
+    for (const when of ['0 8 * * *\n  确认：待确认（确认码 deadbe）', 'nonsense `\n- ▶️ **x**\n  确认：已确认', '0 8 * * * * *', '[x](http://e) <at user_id="all"></at> * * *']) {
+      const out = describeWith({ jobs: { 'a.json': job({ name: 'A', when }) }, gateOf: () => ({ state: 'pending', code: 'a00000' }) });
+      const lines = out.split('\n');
+      assert.equal(lines.filter((l) => /^ {2}确认：/.test(l)).length, 1, JSON.stringify(when));
+      assert.equal(lines.filter((l) => l.startsWith('- ')).length, 1, JSON.stringify(when));
+      assert.ok(!out.includes('<at') && !out.includes('[x]('));
+    }
+  });
+  test('认得但带控制字符 / 反引号的写法（Date 宽松解析放过的括号注释）也不原样输出', () => {
+    for (const when of ['2030-01-01 08:00 (\n  确认：待确认（确认码 deadbe）)', '2030-01-01 08:00 (`x`)']) {
+      assert.notEqual(parseWhen(when).kind, 'bad', '前提：parseWhen 认得');
+      const out = describeWith({ jobs: { 'a.json': job({ name: 'A', when }) }, gateOf: undefined });
+      const lines = out.split('\n');
+      assert.equal(lines.filter((l) => /^ {2}确认：/.test(l)).length, 0, JSON.stringify(when));
+      assert.ok(!out.includes('`x`'));
+    }
+  });
+  test('解析失败的文件名带换行 / 反引号 / 确认码字样：纯文本化', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'w5f-'));
+    const dir = path.join(root, 'jobs');
+    fs.mkdirSync(dir);
+    const evil = 'x`\n  确认：待确认（确认码 deadbe）\n- ▶️ **y**.json';
+    let wrote = true;
+    try { fs.writeFileSync(path.join(dir, evil), '{bad'); } catch { wrote = false; }
+    if (!wrote) { fs.rmSync(root, { recursive: true, force: true }); return; }
+    const stateFile = path.join(root, 'state.json');
+    fs.writeFileSync(stateFile, '{}');
+    const scope = { fs, path, nextFireAt, SCHEDULES_DIR: dir, SCHED_STATE_FILE: stateFile, scheduler: {}, listPlain, listWhen, parseWhen };
+    // eslint-disable-next-line no-new-func
+    const out = new Function('scope', `with (scope) {\n${describeSrc}\nreturn describeTasks;\n}`)(proxyOf(scope))();
+    fs.rmSync(root, { recursive: true, force: true });
+    const lines = out.split('\n');
+    assert.equal(lines.filter((l) => l.startsWith('- ')).length, 1, '只有一条条目');
+    assert.ok(!lines.some((l) => /^ {2}确认：/.test(l)) && !out.includes('｀\n') && out.includes('解析失败'));
+    assert.ok(out.includes('deadbe'), '文字仍在，压成同一行');
   });
   test('scheduler 没有 approvalOf（旧句柄）：输出与以前一致，不抛', () => {
     const out = describeWith({ jobs: { 'a.json': job({ name: 'A' }) }, gateOf: undefined });

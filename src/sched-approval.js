@@ -218,6 +218,22 @@ export function createApprovalStore({ file, keyFile, log = console.error, now = 
 /** /tasks 列表里输出任务名 / 时间写法 / 动作时用，与通知同一套纯文本化（压成一行、中和 markdown）。 */
 export const listPlain = (s, max = 60) => plain(s, max);
 
+/**
+ * /tasks 列表里的时间写法：调度器认得的写法（cron / 宏 / 一次性时间）原样输出，与改动前逐字节相同；
+ * 认不出来的才走 listPlain（压成一行、中和 markdown）。没写 when → 空。
+ * 认得的写法里若带控制字符 / 换行 / 反引号（Date 的宽松解析会放过括号注释之类），也不原样输出：
+ * 正常的 cron / 日期写法不会有这些字符，它们只可能用来在列表里伪造独立的一行或跳出代码段。
+ * parse 由调用方传入（index.js 传 scheduler.js 的 parseWhen；这里不能反向 import，scheduler.js 已 import 本文件）。
+ */
+export function listWhen(when, parse) {
+  if (typeof when === 'string') {
+    let ok = false;
+    try { ok = parse(when).kind !== 'bad'; } catch { ok = false; }
+    if (ok && !/[\p{Cc}\u2028\u2029`]/u.test(when)) return when;
+  }
+  return listPlain(when);
+}
+
 /** 发给 owner 的「待确认」通知。任务文件里来的字符串一律过 plain；不含完整 chat_id。 */
 export function pendingNoticeText({ job, code, destUnknown }) {
   const name = plain(job?.name ?? job?._file ?? '', 60);
