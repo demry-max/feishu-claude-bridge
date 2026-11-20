@@ -39,7 +39,7 @@ const approvedFixture = (t) => {
 const reopen = (e, logs = []) => createApprovalStore({ file: e.file, keyFile: e.keyFile, log: (m) => logs.push(m) });
 
 describe('K1 哈希与确认码', () => {
-  test('五项任一变化 → 哈希和确认码都变；prompt 型任务的 model / effort、enabled、last_run 不影响；文件名不同哈希不同', () => {
+  test('五项任一变化 → 哈希和确认码都变；enabled、last_run 不影响；文件名不同哈希不同', () => {
     const base = mkJob();
     const h0 = approvalHash(FILE, base);
     const c0 = approvalCode(FILE, h0);
@@ -48,15 +48,18 @@ describe('K1 哈希与确认码', () => {
       assert.notEqual(approvalHash(FILE, j), h0, JSON.stringify(ch));
       assert.notEqual(approvalCode(FILE, approvalHash(FILE, j)), c0, JSON.stringify(ch));
     }
-    for (const ch of [{ model: 'x' }, { effort: 'high' }, { exec_model: 'x' }, { enabled: false }, { last_run: '2026-01-01' }]) {
+    for (const ch of [{ enabled: false }, { last_run: '2026-01-01' }]) {
       assert.equal(approvalHash(FILE, mkJob(ch)), h0, JSON.stringify(ch));
+    }
+    for (const ch of [{ model: 'x' }, { effort: 'high' }, { exec_model: 'x' }, { exec_effort: 'high' }]) {
+      assert.notEqual(approvalHash(FILE, mkJob(ch)), h0, `model / effort 也进哈希：${JSON.stringify(ch)}`);
     }
     assert.notEqual(approvalHash('b.json', base), h0);
     assert.match(c0, /^[0-9a-f]{6}$/);
-    assert.deepEqual(approvalFields({ chat_id: 'c' }), ['c', null, null, null, null]);
+    assert.deepEqual(approvalFields({ chat_id: 'c' }), ['c', null, null, null, null, null, null, null, null]);
     assert.deepEqual(approvalFields({ chat_id: 'c', name: 'n', action: 'set-model', model: 'm' }), ['c', null, null, 'set-model', 'n', 'm', null, null, null]);
   });
-  test('动作型任务：model / effort / exec_model / exec_effort 也进哈希；prompt 型不进', () => {
+  test('动作型与 prompt 型任务：model / effort / exec_model / exec_effort 都进哈希', () => {
     const act = mkJob({ action: 'set-model', prompt: undefined, model: 'm1', effort: 'low', exec_model: 'e1', exec_effort: 'low' });
     const h0 = approvalHash(FILE, act);
     for (const ch of [{ model: 'm2' }, { effort: 'high' }, { exec_model: 'e2' }, { exec_effort: 'high' }]) {
@@ -68,7 +71,7 @@ describe('K1 哈希与确认码', () => {
     const pj = mkJob({ model: 'm1', effort: 'low', exec_model: 'e1', exec_effort: 'low' });
     const p0 = approvalHash(FILE, pj);
     for (const ch of [{ model: 'm2' }, { effort: 'high' }, { exec_model: 'e2' }, { exec_effort: 'high' }]) {
-      assert.equal(approvalHash(FILE, { ...pj, ...ch }), p0, `prompt 型：${JSON.stringify(ch)}`);
+      assert.notEqual(approvalHash(FILE, { ...pj, ...ch }), p0, `prompt 型：${JSON.stringify(ch)}`);
     }
     assert.notEqual(approvalHash(FILE, { ...pj, name: '改名' }), p0, 'prompt 型改名要重新确认');
   });
@@ -432,4 +435,94 @@ test('K0 记录文件里的 mac 确实是 HMAC-SHA256(key, v1\\nfile\\nhash\\nde
   const key = Buffer.from(fs.readFileSync(e.keyFile, 'utf8').trim(), 'hex');
   const en = d.entries[FILE];
   assert.equal(en.mac, crypto.createHmac('sha256', key).update(['v1', FILE, en.hash, en.decision, en.at].join('\n')).digest('hex'));
+});
+
+describe('K7 构造时发现不合格条目：重写记录文件、invalidated', () => {
+  const seed = (t) => {
+    const e = mkStore(t);
+    e.store.decide(FILE, H, 'approved');
+    e.store.decide('b.json', H, 'rejected');
+    return e;
+  };
+  test('invalidated 真值表：缺文件 false；全部合格 false；有不合格 true', (t) => {
+    const e0 = mkStore(t);
+    assert.equal(e0.store.invalidated, false);
+    assert.equal(fs.existsSync(e0.file), false, '缺文件不写');
+    const e = seed(t);
+    assert.equal(reopen(e).invalidated, false);
+    const d = readRecords(e.file);
+    d.entries['b.json'].decision = 'approved';
+    fs.writeFileSync(e.file, JSON.stringify(d));
+    const s = reopen(e);
+    assert.equal(s.invalidated, true);
+    assert.equal(s.invalidCount, 1);
+  });
+  test('重写后文件里只剩合格条目，权限 0600；再开一次 invalidCount 回到 0、无日志', (t) => {
+    const e = seed(t);
+    const d = readRecords(e.file);
+    d.entries['b.json'].decision = 'approved';
+    fs.writeFileSync(e.file, JSON.stringify(d), { mode: 0o644 });
+    fs.chmodSync(e.file, 0o644);
+    reopen(e);
+    const after = readRecords(e.file);
+    assert.deepEqual(Object.keys(after.entries), [FILE]);
+    assert.equal(fs.statSync(e.file).mode & 0o777, 0o600);
+    assert.deepEqual(fs.readdirSync(e.dir).filter((f) => f.endsWith('.tmp')), []);
+    const logs = [];
+    const again = reopen(e, logs);
+    assert.equal(again.invalidCount, 0);
+    assert.equal(again.invalidated, false);
+    assert.equal(again.lookup(FILE, H)?.decision, 'approved');
+    assert.deepEqual(logs, []);
+  });
+  test('密钥重建：旧条目全部作废、文件重写成空 entries', (t) => {
+    const e = seed(t);
+    fs.rmSync(e.keyFile);
+    const s = reopen(e);
+    assert.equal(s.invalidated, true);
+    assert.equal(s.lookup(FILE, H), null);
+    assert.deepEqual(readRecords(e.file), { version: 1, entries: {} });
+    assert.equal(reopen(e).invalidated, false);
+  });
+  for (const [tag, make] of Object.entries({
+    '不是 JSON': (f) => fs.writeFileSync(f, '{oops'),
+    '格式不对': (f) => fs.writeFileSync(f, JSON.stringify({ version: 1, entries: [] })),
+    '过大': (f) => fs.writeFileSync(f, ' '.repeat(300 * 1024)),
+  })) {
+    test(`整份文件读不了（${tag}）：重写成空 entries，invalidated 为 true`, (t) => {
+      const e = mkStore(t);
+      make(e.file);
+      const s = reopen(e);
+      assert.equal(s.invalidated, true);
+      assert.equal(s.invalidCount, 1);
+      assert.deepEqual(readRecords(e.file), { version: 1, entries: {} });
+      assert.equal(reopen(e).invalidated, false);
+    });
+  }
+  test('整份文件是软链：重写成普通文件，软链目标不被改动', (t) => {
+    const e = mkStore(t);
+    const target = path.join(e.dir, 'target.json');
+    fs.writeFileSync(target, '{"keep":1}');
+    fs.symlinkSync(target, e.file);
+    const s = reopen(e);
+    assert.equal(s.invalidated, true);
+    assert.equal(fs.lstatSync(e.file).isSymbolicLink(), false);
+    assert.deepEqual(readRecords(e.file), { version: 1, entries: {} });
+    assert.equal(fs.readFileSync(target, 'utf8'), '{"keep":1}');
+  });
+  test('记录目录只读：不抛错、只多一行日志（不含内容），invalidated 仍为 true', (t) => {
+    if (process.getuid?.() === 0) return t.skip('root 下目录权限不生效');
+    const e = seed(t);
+    const d = readRecords(e.file);
+    d.entries['b.json'].decision = 'approved';
+    fs.writeFileSync(e.file, JSON.stringify(d));
+    fs.chmodSync(e.dir, 0o555);
+    const logs = [];
+    const s = reopen(e, logs);
+    assert.equal(s.invalidated, true);
+    assert.equal(s.lookup(FILE, H)?.decision, 'approved');
+    const rewrite = logs.filter((m) => m.includes('重写失败'));
+    assert.equal(rewrite.length, 1);
+    assert.ok(!rewrite[0].includes(H) && !rewrite[0].includes('b.json'));
+  });
 });

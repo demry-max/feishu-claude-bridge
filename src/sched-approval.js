@@ -4,7 +4,7 @@
 // - 确认记录只在构造时读盘一次，逐条验签，不合格的按「待确认」处理（失败时关闭）；运行中以内存为准，不再读盘。
 // - 签名密钥在仓库根的 .env.sched-approval-key（被 .env.* 拒读规则与 .gitignore 覆盖），缺了自动生成。
 // - signParts / verifyParts / loadOrCreateKey 与确认记录的字段无关，可供别的落盘文件复用。
-// - 内容哈希：目的地 / 时间 / 提示词 / 动作 / 任务名；动作型任务再加 model / effort / exec_model / exec_effort（见 approvalFields）。
+// - 内容哈希：目的地 / 时间 / 提示词 / 动作 / 任务名 / model / effort / exec_model / exec_effort（见 approvalFields）。
 // 本模块加载时没有副作用，不读 process.env。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,14 +25,13 @@ const DECISIONS = new Set(['approved', 'rejected']);
 // ---------- 内容哈希与确认码 ----------
 
 /**
- * 进内容哈希的字段：「目的地 / 时间 / 提示词 / 动作 / 任务名」五项；动作型任务（job.action 为真）再加
- * model / effort / exec_model / exec_effort（它们就是动作的参数，决定用什么模型跑）。
- * prompt 型任务的 model / effort 与 enabled 不算（换模型不必重新确认）。undefined 一律记成 null。
- * 原则：会到达目的会话、或会改变「发到哪儿 / 发什么 / 何时发 / 用什么模型跑」的字段都要进哈希。
+ * 进内容哈希的字段：目的地 / 时间 / 提示词 / 动作 / 任务名 / model / effort / exec_model / exec_effort。
+ * 只有 enabled 与 last_run 之类不影响「发到哪儿 / 发什么 / 何时发 / 怎么跑」的字段不算。undefined 一律记成 null。
+ * 原则：任务文件里凡会影响「发到哪儿 / 发什么 / 何时发 / 怎么跑」的字段都进哈希，宁可多问。
  */
 export const approvalFields = (job) => [
   job?.chat_id ?? null, job?.when ?? null, job?.prompt ?? null, job?.action ?? null, job?.name ?? null,
-  ...(job?.action ? [job?.model ?? null, job?.effort ?? null, job?.exec_model ?? null, job?.exec_effort ?? null] : []),
+  job?.model ?? null, job?.effort ?? null, job?.exec_model ?? null, job?.exec_effort ?? null,
 ];
 
 export function approvalHash(file, job) {
@@ -183,8 +182,22 @@ export function createApprovalStore({ file, keyFile, log = console.error, now = 
   };
   try { loadDisk(); } catch { failWhole('unreadable'); }
 
+  // 有不合格的条目（或整份读不了）：用当前密钥把合格条目重写回去，旧条目不再留着，
+  // 否则每次重启都会再报一遍；写失败只记一行（不含内容），不抛错
+  if (invalid > 0) {
+    let ok = false;
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // 目录挡在路径上（整份文件是目录）时 rename 会失败，这里不删它，按写失败处理
+      ok = writeFileAtomic(file, JSON.stringify({ version: 1, entries: Object.fromEntries(entries) }, null, 2));
+    } catch { ok = false; }
+    if (!ok) say('[sched-approval] 确认记录重写失败：不合格的旧条目还留在磁盘上');
+  }
+
   return {
     get invalidCount() { return invalid; },
+    /** 构造时发现过不合格的条目（含密钥重建后旧签名失效）：之前的确认已作废 */
+    get invalidated() { return invalid > 0; },
     lookup(f, hash) {
       const e = entries.get(f);
       return e && e.hash === hash ? { decision: e.decision, at: e.at } : null;

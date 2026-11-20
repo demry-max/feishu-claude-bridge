@@ -234,20 +234,30 @@ describe('G4 已拒绝；G5 内容变了重新确认', () => {
       } finally { a.h.stop(); env.cleanup(); }
     });
   }
-  test('prompt 型任务只改 model / effort 不影响已确认', async (t) => {
-    quiet(t); mockClock(t);
-    const env = mkEnv();
-    env.write('a.json', jobOf());
-    const a = start(env);
-    try {
-      await settle();
-      decide(a.h, 'approved');
-      env.write('a.json', jobOf({ model: 'x', effort: 'high' }));
-      await adv(t, 30_000);
-      assert.equal(cand(a.h).state, 'approved');
-      assert.equal(a.notes.length, 1, '没有再通知');
-    } finally { a.h.stop(); env.cleanup(); }
-  });
+  for (const [tag, ch] of [['model', { model: 'x' }], ['effort', { effort: 'high' }]]) {
+    test(`prompt 型任务只改 ${tag}：重新待确认、再通知一次、到点不跑`, async (t) => {
+      quiet(t); mockClock(t);
+      const env = mkEnv();
+      env.write('a.json', jobOf());
+      const a = start(env);
+      try {
+        await settle();
+        const old = cand(a.h);
+        decide(a.h, 'approved');
+        env.write('a.json', jobOf(ch));
+        await adv(t, 30_000);
+        const now = cand(a.h);
+        assert.equal(now.state, 'pending');
+        assert.notEqual(now.code, old.code);
+        assert.equal(a.notes.length, 2, '再通知一次');
+        assert.ok(a.notes[1].includes(`/tasks approve ${now.code}`));
+        await adv(t, 60_000);
+        assert.equal(a.notes.length, 2, '不重复');
+        await adv(t, 60 * MIN);
+        assert.deepEqual(a.fired, []);
+      } finally { a.h.stop(); env.cleanup(); }
+    });
+  }
 });
 
 describe('G5b 已确认的任务只改名 / 动作型改参数：回到待确认、再通知、到点不跑', () => {
@@ -378,6 +388,99 @@ describe('G7 重启与篡改', () => {
       await adv(t, 31 * MIN);
       assert.deepEqual(b.fired, ['a.json']);
     } finally { b.h.stop(); env.cleanup(); }
+  });
+});
+
+const HEAD = (n) => `定时任务的确认记录有 ${n} 条校验不通过（或签名密钥已重建），之前的确认已作废。下面这些发往别处的任务需要你重新确认：`;
+
+describe('G8 确认记录作废后重新问 owner，同一次作废只问一次', () => {
+  test('密钥被删：重启首拍合并成一条（标题行 + 新通知），任务不执行；再重启不再通知，记录里没有旧条目', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv();
+    env.write('a.json', jobOf());
+    const a = start(env);
+    await settle();
+    decide(a.h, 'approved');
+    a.h.stop();
+    const recFile = path.join(env.data, SCHED_APPROVALS_FILE_NAME);
+    assert.equal(Object.keys(JSON.parse(fs.readFileSync(recFile, 'utf8')).entries).length, 1);
+    fs.rmSync(env.key);
+    const b = start(env);
+    try {
+      await settle();
+      assert.equal(b.notes.length, 1, '首拍恰好一条私聊');
+      assert.ok(b.notes[0].startsWith('⚠️ 定时任务调度器有 2 项需要你知道：'));
+      // 合并时每行去掉开头的 ⚠️，所以这里核对去掉前缀后的原文
+      assert.ok(b.notes[0].includes(HEAD(1)), b.notes[0]);
+      const c = cand(b.h);
+      assert.equal(c.state, 'pending');
+      assert.ok(b.notes[0].includes(`/tasks approve ${c.code}`));
+      assert.ok(b.notes[0].indexOf(HEAD(1)) < b.notes[0].indexOf('/tasks approve'), '标题行在前');
+      await adv(t, 40 * MIN);
+      assert.deepEqual(b.fired, []);
+      assert.equal(b.notes.length, 1);
+    } finally { b.h.stop(); }
+    const d = start(env);
+    try {
+      await adv(t, 30_000);
+      assert.equal(d.notes.length, 0, '密钥已稳定：不再问');
+      assert.equal(d.h.approvalStore.invalidCount, 0);
+      assert.equal(d.h.approvalStore.invalidated, false);
+      assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(recFile, 'utf8')).entries), [], '旧条目已清掉');
+      assert.equal(cand(d.h).state, 'pending');
+      assert.equal(cand(d.h).announced, true);
+    } finally { d.h.stop(); env.cleanup(); }
+  });
+  test('密钥重建时没有受闸任务：不发标题行', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv();
+    env.write('a.json', jobOf());
+    const a = start(env);
+    await settle();
+    decide(a.h, 'approved');
+    a.h.stop();
+    fs.rmSync(env.key);
+    fs.rmSync(path.join(env.jobs, 'a.json'));
+    const b = start(env);
+    try {
+      await adv(t, 30_000);
+      assert.equal(b.notes.length, 0);
+    } finally { b.h.stop(); env.cleanup(); }
+  });
+  test('G8b 一条被篡改、另一条合法：只有被篡改的重新通知；合法的照常执行；重写后再重启无通知', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv();
+    env.write('a.json', jobOf());
+    env.write('b.json', jobOf({ name: '晚报' }));
+    const a = start(env);
+    await settle();
+    decide(a.h, 'rejected', 'a.json');
+    decide(a.h, 'approved', 'b.json');
+    a.h.stop();
+    const recFile = path.join(env.data, SCHED_APPROVALS_FILE_NAME);
+    const d0 = JSON.parse(fs.readFileSync(recFile, 'utf8'));
+    d0.entries['a.json'].decision = 'approved';
+    fs.writeFileSync(recFile, JSON.stringify(d0));
+    const b = start(env);
+    try {
+      await settle();
+      assert.equal(b.notes.length, 1);
+      assert.ok(b.notes[0].includes(HEAD(1)));
+      assert.ok(b.notes[0].includes(`/tasks approve ${cand(b.h, 'a.json').code}`));
+      assert.ok(!b.notes[0].includes(`/tasks approve ${cand(b.h, 'b.json').code}`), '合法那条不重新通知');
+      assert.equal(cand(b.h, 'a.json').state, 'pending');
+      assert.equal(cand(b.h, 'b.json').state, 'approved');
+      await adv(t, 40 * MIN);
+      assert.deepEqual(b.fired, ['b.json'], '合法的照常执行，被篡改的不跑');
+    } finally { b.h.stop(); }
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(recFile, 'utf8')).entries), ['b.json']);
+    const c = start(env);
+    try {
+      await adv(t, 30_000);
+      assert.equal(c.notes.length, 0);
+      assert.equal(c.h.approvalStore.invalidCount, 0);
+      assert.equal(cand(c.h, 'b.json').state, 'approved');
+    } finally { c.h.stop(); env.cleanup(); }
   });
 });
 

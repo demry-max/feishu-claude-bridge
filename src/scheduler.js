@@ -292,7 +292,8 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
   const notices = (() => {
     try {
       const j = JSON.parse(fs.readFileSync(noticeFile, 'utf8'));
-      return { days: { ...(j?.days ?? {}) }, files: { ...(j?.files ?? {}) }, approvals: { ...(j?.approvals ?? {}) } };
+      // 确认记录作废过（密钥重建 / 验签不过）：通知去重记录从空开始，受闸的待确认任务首拍各重新通知一次
+      return { days: { ...(j?.days ?? {}) }, files: { ...(j?.files ?? {}) }, approvals: approvals?.invalidated === true ? {} : { ...(j?.approvals ?? {}) } };
     } catch {
       return { days: {}, files: {}, approvals: {} };
     }
@@ -398,6 +399,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     return { state: rec?.decision ?? 'pending', at: rec?.at ?? null, hash, code: approvalCode(job._file, hash), destUnknown: t?.destUnknown === true };
   };
   const announcedLog = new Set();
+  let invalidatedSaid = false; // 作废提示整个进程只说一次，排在第一条待确认通知之前
   // 同一文件同一内容只通知一次（持久化），并进同一拍的合并通知；先记再发，发送失败也算用掉（/tasks 里仍看得到）
   const announce = (job, g) => {
     const file = job._file;
@@ -409,6 +411,10 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     if (!notifyOwner || notices.approvals[file] === g.hash) return;
     notices.approvals[file] = g.hash;
     saveNotices();
+    if (approvals?.invalidated === true && !invalidatedSaid) {
+      invalidatedSaid = true;
+      queueLine(`⚠️ 定时任务的确认记录有 ${approvals.invalidCount} 条校验不通过（或签名密钥已重建），之前的确认已作废。下面这些发往别处的任务需要你重新确认：`);
+    }
     queueLine(pendingNoticeText({ job, code: g.code, destUnknown: g.destUnknown }));
   };
   const approvalCandidates = () => {
