@@ -3,7 +3,8 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession, routeTurn } from './claude.js';
-import { buildPrompt, cleanIncoming, describeError } from './messages.js';
+import { buildPrompt, cleanIncoming, describeError, stripLocalPaths, lookupBotOpenId, botIdFailureCount } from './messages.js';
+import { createInboundGuard } from './inbound-guard.js'; // BRIDGE-INBOUND-1
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler, fireJob, nextFireAt, parseWhen } from './scheduler.js';
 import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY, inQuietHours } from './heartbeat.js';
@@ -174,6 +175,9 @@ function isDuplicate(messageId) {
   }
   return false;
 }
+// BRIDGE-INBOUND-1：入口兜底（src/inbound-guard.js）——进模型前出错的消息撤掉去重、回一句固定的话、记一行日志；挂在事件注册处
+const forgetMessage = (messageId) => { seen.delete(messageId); };
+const inboundGuard = createInboundGuard({ reply, forget: forgetMessage, log: console.error });
 
 // ---- 每个会话串行处理，避免并发 resume 冲突 ----
 const chatQueues = new Map();
@@ -232,17 +236,11 @@ async function react(messageId, emoji) {
 }
 
 // ---- 机器人自身 open_id（用于识别群聊 @提及） ----
-let botOpenId = null;
+// 与 messages.js 的附件解析共用一份查询与缓存（BRIDGE-INBOUND-1）；这里是入口模式：无视失败后的 60 秒闸、网络类失败有界重试
 async function getBotOpenId() {
-  if (botOpenId) return botOpenId;
-  try {
-    const res = await client.request({ method: 'GET', url: '/open-apis/bot/v3/info' });
-    botOpenId = res?.bot?.open_id ?? null;
-    if (botOpenId) console.log(`[bot] open_id = ${botOpenId}`);
-  } catch (e) {
-    console.error('[bot] 获取机器人信息失败:', e?.message ?? e);
-  }
-  return botOpenId;
+  const id = await lookupBotOpenId(client, { entry: true });
+  if (!id) console.error(`[bot] 取不到机器人自身 open_id（连续第 ${botIdFailureCount(client)} 次），这条群消息暂按未 @ 处理`);
+  return id;
 }
 
 async function handleMessage(data, seq = ++arrivalSeq) {
@@ -253,6 +251,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
 
   // 群聊仅在 @机器人 时响应
   if (message.chat_type !== 'p2p') {
+    if (!message.mentions?.length) return; // 没 @ 任何人就不可能 @ 机器人，不必去查机器人 id
     const bot = await getBotOpenId();
     const mentioned = (message.mentions ?? []).some(
       (m) => m?.id?.open_id && m.id.open_id === bot
@@ -453,7 +452,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
         if (!/^(off|none|无|关闭)$/i.test(args[1])) {
           const pre = checkCliEnvironment(MODEL_ALIASES[args[1].toLowerCase()] ?? args[1]);
           if (pre.problem) {
-            await reply(message.message_id, `⚠️ 未切换：${pre.problem}`);
+            await reply(message.message_id, `⚠️ 未切换：${stripLocalPaths(pre.problem)}`);
             return;
           }
         }
@@ -465,7 +464,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
             : `✅ 已关闭模型分工，所有轮次都用 \`${next.model || 'CLI 默认'}\`。`
         );
       } catch (e) {
-        await reply(message.message_id, `⚠️ ${e?.message ?? e}`);
+        await reply(message.message_id, `⚠️ ${stripLocalPaths(e?.message ?? e)}`);
       }
       return;
     }
@@ -477,7 +476,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
         const resolved = MODEL_ALIASES[first] ?? args[0];
         const pre = checkCliEnvironment(resolved);
         if (pre.problem) {
-          await reply(message.message_id, `⚠️ 未切换：${pre.problem}`);
+          await reply(message.message_id, `⚠️ 未切换：${stripLocalPaths(pre.problem)}`);
           return;
         }
       }
@@ -489,7 +488,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
         `✅ 已切换：模型 \`${next.model || 'CLI 默认'}\`，思考深度 \`${next.effort || 'CLI 默认'}\`\n下一条消息即生效（无需重启）。`
       );
     } catch (e) {
-      await reply(message.message_id, `⚠️ ${e?.message ?? e}`);
+      await reply(message.message_id, `⚠️ ${stripLocalPaths(e?.message ?? e)}`);
     }
     return;
   }
@@ -600,6 +599,9 @@ async function runTurn(spec) {
       '请先检查这段对话里有哪些值得长期保留的事实、决定、偏好还没写进 memory/——稳定偏好就地合入 USER.md，长期事实建独立文件并更新 MEMORY.md 索引，过程细节追加进 memory/journal/ 当日文件；' +
       '没有就忽略本提示，正常回答用户的问题。不要因为这条提示改变回答的语气或结构。）';
     console.log(`[context] 已向 ${message.chat_id} 注入固化记忆提醒`);
+    // 只有带这个标记的那次调用，才算「带提醒的那一轮」：成功才转成已固化，失败才重新排上；取到提醒后没跑到模型，提醒仍待注入
+    const plainTurn = toolTurn.runClaude;
+    toolTurn.runClaude = (a, b, c, d, e, o) => plainTurn(a, b, c, d, e, { ...o, memoryNudge: true });
   }
 
   enqueue(sessionKey, async () => {
@@ -644,7 +646,7 @@ async function runTurn(spec) {
 }
 
 const eventDispatcher = new lark.EventDispatcher({}).register({
-  'im.message.receive_v1': trackedHandleMessage,
+  'im.message.receive_v1': (data) => inboundGuard(data, trackedHandleMessage), // BRIDGE-INBOUND-1：进模型前出错不再没反应
   // 机器人事件 → 「owner 对心跳消息的操作」信号（BRIDGE-EV-1）：表情 / 已读 / 撤回原本到达即丢，卡片按钮回调是新增的。
   // 全部由桥接按确定规则处理：不调模型、永不抛出；按钮回调同步校验后立即回 toast，回写异步排队
   ...(() => {
@@ -755,6 +757,7 @@ function tasksDecision(text) {
 // 启动通知：进程崩溃/重启此前完全静默，owner 无从知道自己发的消息其实没人接
 const STARTUP_STAMP = path.join(DATA_DIR, 'last-startup-notice');
 let cliProblem = null; // 启动自检发现的 CLI 问题，随启动通知发给 owner
+let botIdStartupMissing = false; // 启动自检没取到机器人自身 open_id（BRIDGE-INBOUND-1）
 
 async function announceStartup() {
   const owner = OWNER_OPEN_ID || loadOwner();
@@ -778,7 +781,8 @@ async function announceStartup() {
           text:
             `🤖 桥接已启动（${new Date().toLocaleString('zh-CN')}）。若此前发过消息没收到回复，请重发一次。` +
             (cliProblem ? `\n\n⚠️ 启动自检发现问题，现在发消息会失败：\n${cliProblem}` : '') +
-            (scopeProblem ? `\n\n⚠️ ${scopeProblem}` : ''),
+            (scopeProblem ? `\n\n⚠️ ${scopeProblem}` : '') +
+            (botIdStartupMissing ? '\n\n⚠️ 取不到机器人自身的 open_id，群里 @ 机器人暂时不会有反应；收到下一条 @ 消息时会自动再试。' : ''),
         }),
       },
     });
@@ -1010,7 +1014,11 @@ async function scopeSelfCheck() {
 
 // 启动通知放在全部自检之后：此前 announceStartup() 在 config 块之前调用，
 // cliProblem 在发通知那一刻永远是 null，「启动自检发现问题」那段文案从未真正发出过
-scopeSelfCheck().finally(() => announceStartup());
+const botCheck = lookupBotOpenId(client, { entry: true }).then((id) => { // BRIDGE-INBOUND-1：与 scope 自检并行取一次机器人自身 open_id；取不到就在启动通知里说一句
+  botIdStartupMissing = !id;
+  if (!id) console.error(`[bot] 启动时取不到机器人自身 open_id（连续第 ${botIdFailureCount(client)} 次）`);
+}).catch(() => { botIdStartupMissing = true; });
+scopeSelfCheck().finally(() => botCheck.finally(() => announceStartup()));
 
 // BRIDGE-PERM-1：audit/strict 档每天 TOOL_AUDIT_SUMMARY_AT（默认 21:30）私信 owner 一份工具审计日报——
 // 只列被拒/需确认的命令名与次数；legacy 档不启用。进度存 data/tool-audit-state.json，发送失败不推进、下次补上。

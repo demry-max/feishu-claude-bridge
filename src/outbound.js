@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { withUuid, outboxPart, contentPart } from './send-key.js'; // BRIDGE-SEND-1 / SEND-2
 import { defaultKeepDir, keepEntry, displayName, unsentNote } from './outbox-keep.js'; // BRIDGE-SEND-2
+import { stripRenewedNote } from './renewed-note.js'; // BRIDGE-INBOUND-1
+import { stripLocalPaths } from './messages.js'; // BRIDGE-INBOUND-1（messages.js 不 import 本文件，无环）
 
 
 // ---- 出站脱敏：回复送出前抹掉密钥/令牌/内网地址，避免误发到群里 ----
@@ -329,16 +331,20 @@ const execFileP = promisify(execFile);
 const TTS_VOICE = process.env.TTS_VOICE || 'Tingting'; // 中文女声；英文可用 Samantha
 const TTS_MAX_CHARS = Number(process.env.TTS_MAX_CHARS || 500);
 
-export async function sendVoice(client, text, sendRaw) {
-  if (process.platform !== 'darwin') return false;
-  // 去掉 markdown 记号，长文截断（语音过长反而难用）
-  const plain = redact(text)
+/** 语音朗读的文本：去掉换新会话附注、脱敏、去 markdown 记号、压空白、截断（语音过长反而难用） */
+export function voiceText(text) {
+  return redact(stripRenewedNote(text))
     .replace(/```[\s\S]*?```/g, '（代码块略）')
     .replace(/[*_`#>|]/g, '')
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, TTS_MAX_CHARS);
+}
+
+export async function sendVoice(client, text, sendRaw) {
+  if (process.platform !== 'darwin') return false;
+  const plain = voiceText(text);
   if (!plain) return false;
 
   const base = path.join(os.tmpdir(), `tts-${Date.now()}`);
@@ -444,7 +450,7 @@ export async function claudeFailureReply(msg, { checkKeychain = isLoginKeychainL
   if (kind === 'transient_refresh') {
     return '⚠️ Claude 的登录令牌正在由另一个 claude 进程刷新（瞬时状态，不是登录失效）。过半分钟再发一次。';
   }
-  if (!isClaudeLoginFailure(kind)) return `⚠️ Claude 调用失败：${msg}`;
+  if (!isClaudeLoginFailure(kind)) return `⚠️ Claude 调用失败：${stripLocalPaths(msg)}`;
   const variant = loginFixVariant(msg);
   if (variant === 'subscription') {
     return ['⚠️ Claude 的订阅访问被组织停用了。', `报错：\`${errHead(msg)}\``, '', ...loginFixLines({ kind, variant }), '', '恢复后重发这条消息。'].join('\n');

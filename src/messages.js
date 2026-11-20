@@ -64,18 +64,37 @@ async function withRetry(label, fn, attempts = 2) {
 }
 
 /**
- * 把文本里的本机绝对路径换成固定占位 <本机路径>：POSIX（/…）、~/…、Windows 盘符路径，
- * 含单 / 双引号括起、带空格或中文的路径。网址（https://…）、错误码、不含路径的文本逐字不变。
+ * 把文本里的本机绝对路径换成固定占位 <本机路径>：POSIX（/…）、~/…、Windows 盘符路径、file:// 写法，
+ * 含单 / 双引号、反引号、中文引号「」“” 括起的（可含空格 / 中文）。网址（https://…）、错误码、不含路径的文本逐字不变。
+ *
+ * 不带引号的裸路径至少要两段（/a/b、~/a、盘符）：单独一段的 /logout、/new 是斜杠命令，不当路径
+ * （代价：单独的 /tmp 这类根目录片段不替换，它们不含用户信息）。引号括起的照旧一段就算。
+ * 以测试为准、不追求穷尽；紧跟在路径后面的中文会被一并吞掉（过度替换，宁可多去不漏）。
  */
 export const LOCAL_PATH_PLACEHOLDER = '<本机路径>';
+const PATH_END = `\\s'"\`)\\]},;，；）`; // 裸路径到空白或这些收尾符为止
 export function stripLocalPaths(text) {
   let out = String(text ?? '');
   // 引号括起的路径：引号内可含空格 / 中文；只在引号内以 / ~/ 或盘符开头时才算路径
   out = out.replace(/(['"`])((?:~\/|\/|[A-Za-z]:[\\/])[^'"`\n]*)\1/g, `$1${LOCAL_PATH_PLACEHOLDER}$1`);
-  // 裸路径：前面是行首 / 空白 / 括号 / 冒号等（不是 URL 里的 // 或词中的 /），一直到空白或常见收尾符
-  out = out.replace(/(^|[\s(\[{,;=:：（])((?:~\/|\/(?!\/)|[A-Za-z]:[\\/])[^\s'"`)\]},;，；）]*)/g, (m, pre, p) => {
-    if (pre === ':' && /^\/\//.test(p)) return m;
-    return `${pre}${LOCAL_PATH_PLACEHOLDER}`;
+  // 中文引号括起的
+  out = out.replace(/([「“])((?:~\/|\/|[A-Za-z]:[\\/])[^」”\n]*)([」”])/g, `$1${LOCAL_PATH_PLACEHOLDER}$3`);
+  // file:// 写法
+  out = out.replace(new RegExp(`file:\\/\\/(?:localhost)?\\/[^${PATH_END}]*`, 'g'), LOCAL_PATH_PLACEHOLDER);
+  // 只有开引号、到行尾都没有闭引号（输出被截断时会出现）：开引号后至少两段才算
+  out = out.replace(/(['"`])((?:~\/|\/[^\s'"`\/]+\/|[A-Za-z]:[\\/])[^'"`\n]*)$/gm, `$1${LOCAL_PATH_PLACEHOLDER}`);
+  // 裸路径：前面是行首 / 空白 / 括号 / 冒号 / 中文等（不是 URL 里的 // 或词中的 /），一直到空白或常见收尾符
+  out = out.replace(
+    new RegExp(`(^|[\\s(\\[{,;=:：（\\u3000-\\u303f\\u4e00-\\u9fff\\uff00-\\uffef])((?:~\\/|\\/(?!\\/)[^${PATH_END}\\/]+\\/|[A-Za-z]:[\\\\/])[^${PATH_END}]*)`, 'g'),
+    (m, pre, p) => {
+      if (pre === ':' && /^\/\//.test(p)) return m;
+      return `${pre}${LOCAL_PATH_PLACEHOLDER}`;
+    }
+  );
+  // 被截断后不以 / 开头的路径尾段（如 ffmpeg stderr 只取尾部）：三段以上、紧跟一个前面没有配对的引号
+  out = out.replace(/(^|\s)([^\s'"`\/]+(?:\/[^\s'"`\/]+){2,})(['"`])/g, (m, pre, p, q, off, all) => {
+    const before = all.slice(0, off + pre.length);
+    return (before.split(q).length - 1) % 2 === 0 ? `${pre}${LOCAL_PATH_PLACEHOLDER}${q}` : m;
   });
   return out;
 }
@@ -194,28 +213,40 @@ function stripMentions(text, mentions = null, botId = null) {
     .trim();
 }
 
-// 机器人自身 open_id：按 client 缓存，成功后到进程结束；失败 60 秒内不再查。
-// index.js 里有同一个接口的 getBotOpenId，但 buildPrompt 的调用点不传它，所以这里自己查一次。
+// 机器人自身 open_id：按 client 缓存，成功后到进程结束；并发查询共享同一次请求。
+// buildPrompt 一侧（botIdFor）失败后 60 秒内不再查；index.js 的群消息入口（entry 模式）无视这个闸、立即查
+// （BRIDGE-INBOUND-1：入口取不到 id 时群消息整条被丢，不能再等 60 秒）。两侧共用这一份查询与缓存。
+// 查询本身对网络类失败有界重试（再试 2 次，间隔 1s / 3s）；非网络类失败不重试。
 const BOT_ID_RETRY_MS = 60_000;
 const botIdState = new WeakMap();
-async function lookupBotOpenId(client) {
-  if (typeof client?.request !== 'function') return null;
+const botIdStateOf = (client) => {
   let st = botIdState.get(client);
-  if (!st) { st = { id: null, retryAt: 0, pending: null }; botIdState.set(client, st); }
+  if (!st) { st = { id: null, retryAt: 0, pending: null, failures: 0 }; botIdState.set(client, st); }
+  return st;
+};
+/** 连续查询失败的次数（成功清零）；入口写日志用 */
+export const botIdFailureCount = (client) => (client && typeof client === 'object' ? botIdState.get(client)?.failures ?? 0 : 0);
+export async function lookupBotOpenId(client, { entry = false } = {}) {
+  if (typeof client?.request !== 'function') return null;
+  const st = botIdStateOf(client);
   if (st.id) return st.id;
   if (st.pending) return st.pending;
-  if (Date.now() < st.retryAt) return null;
+  if (!entry && Date.now() < st.retryAt) return null;
   st.pending = (async () => {
     // 先让出一次：client.request 同步抛错时，finally 也要等到 st.pending 赋值之后才跑，
     // 否则已完成的 promise 会被写回 st.pending，之后的重试永远 return 它。
     await null;
     try {
-      const res = await client.request({ method: 'GET', url: '/open-apis/bot/v3/info' });
+      const res = await withRetry('bot', () => client.request({ method: 'GET', url: '/open-apis/bot/v3/info' }));
       st.id = res?.bot?.open_id ?? null;
       if (!st.id) throw new Error('接口没有返回 bot.open_id');
+      st.failures = 0;
+      console.log(`[bot] open_id 已取到（…${String(st.id).slice(-6)}）`);
     } catch (e) {
       st.retryAt = Date.now() + BOT_ID_RETRY_MS;
-      console.error('[bot] 获取机器人 open_id 失败，按不保留 @ 人名处理:', e?.message ?? e);
+      st.failures += 1;
+      // 入口模式发起的失败由 index.js 打一行（带「连续第 N 次」）；这里只管 buildPrompt 一侧发起的，同一次失败只一行
+      if (!entry) console.error('[bot] 获取机器人 open_id 失败，按不保留 @ 人名处理:', e?.message ?? e);
     } finally {
       st.pending = null;
     }

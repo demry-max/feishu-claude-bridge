@@ -1,4 +1,5 @@
 // BRIDGE-MISC-3（V05）：带固化提醒的那一轮没跑成，不能被当成「已固化」。
+// BRIDGE-INBOUND-1 起：只有带 opts.memoryNudge === true 的那次调用才算「带提醒的那一轮」（index.js 取到提醒后给 runClaude 包一层加上这个标记），所以带提醒的轮在这里显式传。
 // 隔离目录 + 假 claude CLI（test/fixtures/fake-claude-run.mjs，按 FAKE_PLAN 演），不联网、不碰线上数据。
 import { test, describe, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,7 +39,7 @@ async function assertRequeued(m, chat, cap) {
   assert.equal(m.shouldRecycleSession(chat), false, '提醒那轮没跑成，不能算已固化');
   assert.equal(m.consumeMemoryNudge(chat), true, '提醒应重新排上');
   SB.plan(okPlan());
-  await within(m.runClaude(chat, 'turn4 带提醒', true, [], null), 15_000);
+  await within(m.runClaude(chat, 'turn4 带提醒', true, [], null, { memoryNudge: true }), 15_000);
   assert.equal(m.shouldRecycleSession(chat), true, '正常路径不变：带提醒的轮成功后回收');
   assert.equal(count(cap.lines, NOTICE), 1, '「再提醒」日志恰好 1 行');
 }
@@ -50,7 +51,7 @@ describe('V05 固化提醒', () => {
     try {
       await primed(m, 'oc_n1');
       SB.plan({ events: [init(), errResult('boom')], exit: 1 });
-      const r = await settle(within(m.runClaude('oc_n1', 'turn2', true, [], null), 15_000));
+      const r = await settle(within(m.runClaude('oc_n1', 'turn2', true, [], null, { memoryNudge: true }), 15_000));
       assert.equal(r.ok, false);
       await assertRequeued(m, 'oc_n1', cap);
     } finally { cap.restore(); }
@@ -62,7 +63,7 @@ describe('V05 固化提醒', () => {
     try {
       await primed(m, 'oc_n2');
       SB.plan({ events: [init(), bigText('想一想')], hang: true });
-      const p = settle(within(m.runClaude('oc_n2', 'turn2', true, [], null), 15_000));
+      const p = settle(within(m.runClaude('oc_n2', 'turn2', true, [], null, { memoryNudge: true }), 15_000));
       await sleep(400);
       m.cancelRun('oc_n2');
       const r = await p;
@@ -78,7 +79,7 @@ describe('V05 固化提醒', () => {
     try {
       await primed(m, 'oc_n3');
       SB.plan({ events: [init()], hang: true });
-      const r = await settle(within(m.runClaude('oc_n3', 'turn2', true, [], null), 20_000));
+      const r = await settle(within(m.runClaude('oc_n3', 'turn2', true, [], null, { memoryNudge: true }), 20_000));
       assert.equal(r.ok, false);
       assert.match(String(r.e.message), /超时/);
       await assertRequeued(m, 'oc_n3', cap);
@@ -91,7 +92,7 @@ describe('V05 固化提醒', () => {
     try {
       await primed(m, 'oc_n4');
       SB.plan({ events: [errResult('API Error: 529 Overloaded')], exit: 1 }, okPlan());
-      const r = await settle(within(m.runClaude('oc_n4', 'turn2 带提醒', true, [], null), 20_000));
+      const r = await settle(within(m.runClaude('oc_n4', 'turn2 带提醒', true, [], null, { memoryNudge: true }), 20_000));
       assert.equal(r.ok, true);
       assert.equal(m.shouldRecycleSession('oc_n4'), true, '重试后成功＝已固化');
       // 注意：成功那一轮的上下文仍 ≥ 阈值，noteContext 会照常重新排上「下一次」提醒（与本卡无关）；
@@ -107,7 +108,7 @@ describe('V05 固化提醒', () => {
     try {
       await primed(m, 'oc_n5');
       SB.plan({ events: [errResult('API Error: 529 Overloaded')], exit: 1 });
-      const p = settle(within(m.runClaude('oc_n5', 'turn2 带提醒', true, [], null), 20_000));
+      const p = settle(within(m.runClaude('oc_n5', 'turn2 带提醒', true, [], null, { memoryNudge: true }), 20_000));
       await sleep(800); // 第一次失败后进入退避等待
       assert.equal(m.abortRetries('oc_n5'), true, '应处于重试等待中');
       const r = await p;

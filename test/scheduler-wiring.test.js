@@ -8,7 +8,13 @@ import fs from 'node:fs';
 import { resolveTurn } from '../src/turn-context.js';
 import { schedDestOf } from '../src/biz-wiring.js';
 import { fireJob } from '../src/scheduler.js';
-import { schedDiagPrompt, OWNER_TOOL_PROFILE } from '../src/claude.js';
+
+// BRIDGE-INBOUND-1（S08）：schedDiagPrompt 在模块加载时读 OWNER_TOOL_PROFILE。围栏断言按 legacy 档写，所以这里自己把档位设成 legacy
+// 再另 import 一份（带查询串，不影响其它测试用的那份），导入后还原环境变量——非 legacy 环境下也不再跳过。
+const prevProfile = process.env.OWNER_TOOL_PROFILE;
+process.env.OWNER_TOOL_PROFILE = 'legacy';
+const { schedDiagPrompt } = await import(`../src/claude.js?scheduler-wiring-legacy-${process.pid}`);
+if (prevProfile === undefined) delete process.env.OWNER_TOOL_PROFILE; else process.env.OWNER_TOOL_PROFILE = prevProfile;
 
 const SRC = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
 const DM = 'oc_ownerdm0000000001';
@@ -50,7 +56,6 @@ function build({ runClaudeImpl } = {}) {
   return { rec, opts: captured.opts, scope };
 }
 const mkJob = (extra = {}) => ({ _file: 'daily.json', name: '晨报', prompt: 'SECRET-PROMPT', chat_id: DM, ...extra });
-const legacy = OWNER_TOOL_PROFILE === 'legacy' ? {} : { skip: '围栏断言按 legacy 档写（OWNER_TOOL_PROFILE 非 legacy 时 schedDiagPrompt 一律围栏）' };
 
 describe('S11 index.js 的 startScheduler 接线', () => {
   test('turnFor 按引用传、notifyOwner 接 sendToOwner', async () => {
@@ -87,7 +92,7 @@ describe('S11 index.js 的 startScheduler 接线', () => {
     assert.match(rec.sendToChat[0].text, /因重启补跑/);
   });
 
-  test('失败自诊断：发往 owner 私聊的不围栏，发往群的围栏（删掉 fence 参数会被这条抓住）', legacy, async () => {
+  test('失败自诊断：发往 owner 私聊的不围栏，发往群的围栏（删掉 fence 参数会被这条抓住）', async () => {
     const fail = (args) => { if (String(args[0]).startsWith('sched:')) throw new Error('model down'); return 'DIAG'; };
     const dm = build({ runClaudeImpl: fail });
     await dm.opts.onFire(mkJob(), {});
