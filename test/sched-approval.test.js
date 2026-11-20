@@ -337,7 +337,7 @@ function run(text, { candidates = [cand()], store = fakeStore(), busy = 0 } = {}
   const reply = tasksCommandReply({ text, candidates, store, busy, log: (m) => logs.push(m) });
   return { reply, store, logs };
 }
-const P1 = '✅ 已确认定时任务「晨报」（发往会话 id 末 4 位 0123，时间 0 8 ＊ ＊ ＊）。之后按时执行；目的地 / 时间 / 提示词 / 动作 / 任务名再变会重新等你确认。';
+const P1 = '✅ 已确认定时任务「晨报」（发往会话 id 末 4 位 0123，时间 0 8 ＊ ＊ ＊）。之后按时执行；任务内容（目的地 / 时间 / 提示词 / 动作 / 任务名 / 模型 / 思考档）再变会重新等你确认。';
 
 describe('C1–C8 tasksCommandReply（权限表 P1–P8）', () => {
   test('C1（P1）确认码确认：记已确认；一次性已过点追加一行；写盘失败追加一行；大小写不敏感', () => {

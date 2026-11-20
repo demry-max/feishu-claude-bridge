@@ -47,6 +47,16 @@ export function approvalCode(file, hash) {
 export const needsApproval = (job, toOwnerDm) =>
   typeof job?.chat_id === 'string' && job.chat_id !== '' && toOwnerDm !== true;
 
+/** BRIDGE-PRIV-3：SCHED_APPROVAL_MODE 只认 command / button；空串与 command → command，其余按 command 处理并记一行（不回显值）。 */
+export function approvalModeOf(v, log = console.log) {
+  const t = String(v ?? '').trim().toLowerCase();
+  if (t === 'button') return 'button';
+  if (t !== '' && t !== 'command') {
+    try { log('[sched] SCHED_APPROVAL_MODE 只认 command / button，按 command 处理'); } catch { /* 日志失败不影响 */ }
+  }
+  return 'command';
+}
+
 // ---------- 可复用的签名与密钥 ----------
 
 export function signParts(keyHex, parts) {
@@ -176,7 +186,9 @@ export function createApprovalStore({ file, keyFile, log = console.error, now = 
     }
     if (invalid) say(`[sched-approval] 确认记录里有 ${invalid} 条校验不通过，已按待确认处理`);
   };
+  let transient = false; // BRIDGE-PRIV-3 LOW-3：整份文件读不了（可能是暂时的）时不重写，免得把读不到的旧条目覆盖掉
   const failWhole = (reason) => {
+    if (reason === 'unreadable') transient = true;
     invalid = 1;
     say(`[sched-approval] ${path.basename(file)} ${FILE_REASON[reason] ?? reason}，确认记录按待确认处理`);
   };
@@ -184,7 +196,7 @@ export function createApprovalStore({ file, keyFile, log = console.error, now = 
 
   // 有不合格的条目（或整份读不了）：用当前密钥把合格条目重写回去，旧条目不再留着，
   // 否则每次重启都会再报一遍；写失败只记一行（不含内容），不抛错
-  if (invalid > 0) {
+  if (invalid > 0 && !transient) {
     let ok = false;
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -248,7 +260,7 @@ export function listWhen(when, parse) {
 }
 
 /** 发给 owner 的「待确认」通知。任务文件里来的字符串一律过 plain；不含完整 chat_id。 */
-export function pendingNoticeText({ job, code, destUnknown }) {
+export function pendingNoticeText({ job, code, destUnknown, fallback = false }) {
   const name = plain(job?.name ?? job?._file ?? '', 60);
   const tail = plain(String(job?.chat_id ?? '').slice(-4), 8);
   const note = destUnknown ? '（桥接还不知道你的私聊会话；如果这是发给你自己的，私聊我任意一句，它会自动放行）' : '';
@@ -260,7 +272,9 @@ export function pendingNoticeText({ job, code, destUnknown }) {
     `- 发往：会话 id 末 4 位 ${tail}${note}`,
     `- 时间：${plain(job?.when, 60)}`,
     what,
-    `- 确认：私聊发 \`/tasks approve ${code}\`；拒绝：\`/tasks reject ${code}\``,
+    fallback
+      ? `- 确认卡发不出去，先用文字通知：回 \`/tasks approve ${code}\` 可重发确认卡；拒绝：\`/tasks reject ${code}\``
+      : `- 确认：私聊发 \`/tasks approve ${code}\`；拒绝：\`/tasks reject ${code}\``,
   ].join('\n');
 }
 
@@ -271,20 +285,46 @@ const NOT_FOUND = '没找到等你确认的这个任务（确认码或任务名�
 const NOT_ANNOUNCED = '这个任务的内容刚变过，新的确认通知还没发出。请稍等半分钟，用最新通知里的确认码确认。';
 const STATE_LABEL = { approved: '已确认', rejected: '已拒绝' };
 
+const RESEND_SENT = (name) => `请点确认卡上的［确认］按钮：已把「${name}」的确认卡重新发给你。`;
+const RESEND_RECENT = (name) => `请点确认卡上的［确认］按钮：「${name}」的确认卡 2 分钟内刚发过，请往上翻一翻。`;
+
+/**
+ * 记下确认 / 拒绝之后给 owner 的文字回复（文字命令与卡片按钮两条路径共用同一个函数，原文一致）。
+ * candidate：approvalCandidates() 里的一项；approve：true 确认 / false 拒绝；result：store.decide 的返回。
+ */
+export function decisionReply({ candidate: c, approve, result: r }) {
+  const name = plain(c?.name, 60);
+  if (r?.ok === false) {
+    return approve
+      ? '没能记下这次确认（任务文件名不合规），任务仍待确认。'
+      : '没能记下这次拒绝（任务文件名不合规），任务仍待确认、不会执行。';
+  }
+  if (!approve) {
+    return `🚫 已拒绝定时任务「${name}」：它不会执行，/tasks 里标「已拒绝」。内容改了会重新问你；要恢复就发 /tasks approve ${c.code}。`;
+  }
+  return [
+    `✅ 已确认定时任务「${name}」（发往会话 id 末 4 位 ${plain(c.destTail, 8)}，时间 ${plain(c.when, 60)}）。之后按时执行；任务内容（目的地 / 时间 / 提示词 / 动作 / 任务名 / 模型 / 思考档）再变会重新等你确认。`,
+    ...(c.expired ? ['这是一次性任务，原定时间已过，不会再执行。'] : []),
+    ...(r?.persisted === false ? ['⚠️ 确认记录写不进磁盘：本次运行内有效，重启后需要重新确认。'] : []),
+  ].join('\n');
+}
+
 /**
  * owner 私聊里的 `/tasks approve|reject <参数>`（调用方已经判过 owner 与私聊）。返回回复文本。
  * candidates：调度器的 approvalCandidates() 结果；store：确认记录（可为 null）；busy：当前带 owner 工具的回合数。
+ * BRIDGE-PRIV-3：mode === 'button' 时 approve 不记确认，只补发确认卡（resend(c) 返回 'sent' / 'recent'）；reject 不分模式。
  */
-export function tasksCommandReply({ text, candidates, store, busy, log = console.error }) {
+export function tasksCommandReply({ text, candidates, store, busy, log = console.error, mode, resend }) {
   const say = (m) => { try { log(m); } catch { /* 日志失败不影响回复 */ } };
   const m = /^\/tasks\s+(\S+)(?:\s+([\s\S]*))?$/.exec(String(text ?? '').trim());
   const sub = m?.[1]?.toLowerCase();
   const arg = (m?.[2] ?? '').trim();
   if ((sub !== 'approve' && sub !== 'reject') || !arg) return USAGE;
   const approve = sub === 'approve';
+  const button = mode === 'button';
 
   const n = Number(busy);
-  if (approve && n > 0) {
+  if (approve && !button && n > 0) {
     say(`[tasks] 确认被拒：有 ${n} 个 owner 回合在跑`);
     return `现在有 ${n} 个带你权限的任务在跑。为防止它们冒充你确认，请等跑完再发一次（发 /tasks 可看状态）。`;
   }
@@ -301,26 +341,23 @@ export function tasksCommandReply({ text, candidates, store, busy, log = console
     return `有 ${hits.length} 个任务都叫这个名字，请改用确认码：\n${hits.map((c) => `- ${plain(c.name, 60)}：${c.code}`).join('\n')}`;
   }
   const c = hits[0];
-  if (approve && by !== 'code' && c.announced !== true) return NOT_ANNOUNCED;
-
   const name = plain(c.name, 60);
   const want = approve ? 'approved' : 'rejected';
+  if (approve && button) {
+    // 按钮模式：文字命令不能放行，只补发确认卡（补发是安全方向，不套忙判断与「还没通知过」判断）
+    if (c.state === want) return `「${name}」已经是${STATE_LABEL[want]}。`;
+    let r = null;
+    try { r = resend?.(c); } catch { r = null; }
+    if (r === 'sent') { say(`[tasks] button 模式：补发了确认卡（${c.file}）`); return RESEND_SENT(name); }
+    if (r === 'recent') return RESEND_RECENT(name);
+    return NOT_FOUND;
+  }
+  if (approve && by !== 'code' && c.announced !== true) return NOT_ANNOUNCED;
+
   if (c.state === want) return `「${name}」已经是${STATE_LABEL[want]}。`;
 
   const r = store.decide(c.file, c.hash, want);
-  if (r?.ok === false) {
-    say(`[tasks] 没能记下${approve ? '确认' : '拒绝'}（文件名不合规）`);
-    return approve
-      ? '没能记下这次确认（任务文件名不合规），任务仍待确认。'
-      : '没能记下这次拒绝（任务文件名不合规），任务仍待确认、不会执行。';
-  }
-  say(`[tasks] owner ${approve ? '确认' : '拒绝'}了 ${c.file}`);
-  if (!approve) {
-    return `🚫 已拒绝定时任务「${name}」：它不会执行，/tasks 里标「已拒绝」。内容改了会重新问你；要恢复就发 /tasks approve ${c.code}。`;
-  }
-  return [
-    `✅ 已确认定时任务「${name}」（发往会话 id 末 4 位 ${plain(c.destTail, 8)}，时间 ${plain(c.when, 60)}）。之后按时执行；目的地 / 时间 / 提示词 / 动作 / 任务名再变会重新等你确认。`,
-    ...(c.expired ? ['这是一次性任务，原定时间已过，不会再执行。'] : []),
-    ...(r?.persisted === false ? ['⚠️ 确认记录写不进磁盘：本次运行内有效，重启后需要重新确认。'] : []),
-  ].join('\n');
+  if (r?.ok === false) say(`[tasks] 没能记下${approve ? '确认' : '拒绝'}（文件名不合规）`);
+  else say(`[tasks] owner ${approve ? '确认' : '拒绝'}了 ${c.file}`);
+  return decisionReply({ candidate: c, approve, result: r });
 }

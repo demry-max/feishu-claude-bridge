@@ -88,7 +88,7 @@ const parseValue = (v) => {
  * 事件处理函数。heartbeat 可以是心跳对象或返回它的函数（index.js 里心跳在注册事件之后才创建）。
  * 返回 { reaction, read, recalled, cardAction }，分别注册到对应事件上。
  */
-export function createEventHandlers({ getOwner = () => '', heartbeat, log = console.log } = {}) {
+export function createEventHandlers({ getOwner = () => '', heartbeat, schedApproval, log = console.log } = {}) {
   const hb = () => {
     try {
       return (typeof heartbeat === 'function' ? heartbeat() : heartbeat) ?? null;
@@ -182,13 +182,18 @@ export function createEventHandlers({ getOwner = () => '', heartbeat, log = cons
   let invalidClicks = 0;
   async function cardAction(data) {
     try {
-      const h = hb();
-      if (!h) return TOAST_STALE;
       const own = owner();
       const op = data?.operator?.open_id ?? (typeof data?.operator_id === 'string' ? data.operator_id : data?.operator_id?.open_id);
       const isOwner = Boolean(own) && op === own;
       const mid = data?.context?.open_message_id ?? data?.open_message_id ?? data?.message_id;
       const value = parseValue(data?.action?.value ?? data?.action_value);
+      // BRIDGE-PRIV-3：定时任务确认卡的按钮交给确认卡模块（只认桥接自己发的卡）；其余回调一字不改走心跳
+      if (value && typeof value === 'object' && value.k === 'sched-approval') {
+        const sa = typeof schedApproval === 'function' ? schedApproval() : schedApproval;
+        return (sa ? sa.handleClick({ isOwner, messageId: mid, value }) : null) ?? TOAST_STALE;
+      }
+      const h = hb();
+      if (!h) return TOAST_STALE;
       const r = h.validateCardAction({ isOwner, messageId: mid, value });
       if (!r?.ok) {
         // 「已失效」不改任何文件（卡片原文）：连计数也不落盘，只记进程内次数

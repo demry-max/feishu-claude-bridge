@@ -18,10 +18,11 @@ import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-
 import { OWNER_TOOL_PROFILE, BIZ_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 import { schedDestOf } from './biz-wiring.js';
-import { tasksCommandReply, listPlain, listWhen } from './sched-approval.js'; // BRIDGE-PRIV-2
+import { tasksCommandReply, listPlain, listWhen, SCHED_APPROVAL_KEY_FILE } from './sched-approval.js'; // BRIDGE-PRIV-2
+import { createApprovalCards } from './sched-approval-card.js'; // BRIDGE-PRIV-3
 import { resolveTurn } from './turn-context.js'; // BRIDGE-PRIV-1：一轮的「身份 × 场合」只在入口算一次
 import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.js';
-import { OWNER_DM_FILE_NAME, loadOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
+import { OWNER_DM_FILE_NAME, bootOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
 import { childRegistryFor, CHILD_REGISTRY_FILE, deferUntilAwake, orphanNoticeText } from './child-registry.js'; // BRIDGE-RUN-2
 import { readEnvFileKeys, registerEnvFileKeys } from './child-env.js'; // BRIDGE-RUN-2
 
@@ -121,7 +122,7 @@ const OWNER_OPEN_ID = (process.env.OWNER_OPEN_ID ?? '').trim();
 // BRIDGE-DMID-1：学到时落盘 data/owner-dm.json（绑定 owner open_id），启动时读回——重启后不用等 owner 再私聊一次。
 // 读回失败 / owner 不一致一律按未知（＝落盘之前的行为）
 const OWNER_DM_FILE = path.join(DATA_DIR, OWNER_DM_FILE_NAME);
-const ownerDmBoot = loadOwnerDm(OWNER_DM_FILE, OWNER_OPEN_ID || loadOwner(), { log: console.error });
+const ownerDmBoot = await bootOwnerDm({ file: OWNER_DM_FILE, ownerId: OWNER_OPEN_ID || loadOwner(), keyFile: SCHED_APPROVAL_KEY_FILE, send: (payload) => client.im.v1.message.create(payload), log: console.error }); // BRIDGE-PRIV-3：验签；不采信时按 owner 的 open_id 发一条，用应答里的会话 id 恢复（最多等 10 秒）
 let ownerDmChatId = ownerDmBoot.chatId;
 console.log(ownerDmBootLine(ownerDmBoot));
 // BRIDGE-RUN-2：以下两件事必须在调度、心跳、长连接和任何 claude 子进程之前做完（都是同步的）：
@@ -668,7 +669,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
   // 机器人事件 → 「owner 对心跳消息的操作」信号（BRIDGE-EV-1）：表情 / 已读 / 撤回原本到达即丢，卡片按钮回调是新增的。
   // 全部由桥接按确定规则处理：不调模型、永不抛出；按钮回调同步校验后立即回 toast，回写异步排队
   ...(() => {
-    const ev = createEventHandlers({ getOwner: () => OWNER_OPEN_ID || loadOwner(), heartbeat: () => heartbeat, log: console.log });
+    const ev = createEventHandlers({ getOwner: () => OWNER_OPEN_ID || loadOwner(), heartbeat: () => heartbeat, schedApproval: () => approvalCards, log: console.log });
     return {
       'im.message.reaction.created_v1': ev.reaction,
       'im.message.message_read_v1': ev.read,
@@ -705,6 +706,13 @@ async function sendMarkdown(receiveIdType, receiveId, text, opts = {}) {
   const chunk = redact(text).slice(0, 20000);
   return sendCardWithFallback(body, chunk, opts, (e) =>
     console.error(`[send] 卡片发送失败（${receiveIdType}），降级纯文本:`, e?.message ?? e));
+}
+
+// BRIDGE-PRIV-3：确认卡以应用身份发给 owner（open_id），返回飞书应答（取 message_id）
+async function sendApprovalCardToOwner(card) {
+  const owner = OWNER_OPEN_ID || loadOwner();
+  if (!owner) throw new Error('还没有 owner open_id');
+  return client.im.v1.message.create({ params: { receive_id_type: 'open_id' }, data: { receive_id: owner, msg_type: 'interactive', content: JSON.stringify(card) } });
 }
 
 const SCHEDULES_DIR = path.join(WORKSPACE_DIR, 'schedules');
@@ -748,7 +756,11 @@ function describeTasks() {
       if (gate && gate.state !== 'approved') lines.push(`  下次：不执行（${gate.state === 'rejected' ? '已拒绝' : '待确认'}）`);
       else if (next) lines.push(`  下次：${next.toLocaleString('zh-CN')}`);
     }
-    if (pendingN) lines.splice(1, 0, `有 ${pendingN} 个任务要把结果发往别处，等你确认：私聊发 \`/tasks approve <确认码>\``);
+    if (pendingN) {
+      lines.splice(1, 0, scheduler.approvalMode === 'button'
+        ? `有 ${pendingN} 个任务要把结果发往别处，等你确认：点确认卡上的［确认］按钮（找不到卡片就发 \`/tasks approve <确认码>\` 重发）`
+        : `有 ${pendingN} 个任务要把结果发往别处，等你确认：私聊发 \`/tasks approve <确认码>\``);
+    }
     return lines.join('\n');
   } catch (e) {
     return `读取定时任务失败：${e?.message ?? e}`;
@@ -758,7 +770,7 @@ function describeTasks() {
 // BRIDGE-PRIV-2：/tasks approve|reject。有带 owner 工具的回合在跑时不认确认（防模型以 owner 身份发命令）
 function tasksDecision(text) {
   const busy = runningKeysWithPrefix('').filter((k) => !k.startsWith('guest:')).length;
-  return tasksCommandReply({ text, candidates: scheduler.approvalCandidates?.() ?? [], store: scheduler.approvalStore, busy });
+  return tasksCommandReply({ text, candidates: scheduler.approvalCandidates?.() ?? [], store: scheduler.approvalStore, busy, mode: scheduler.approvalMode, resend: (c) => scheduler.resendApprovalCard?.(c) });
 }
 
 // 启动通知：进程崩溃/重启此前完全静默，owner 无从知道自己发的消息其实没人接
@@ -807,11 +819,16 @@ function schedTurnFor(source, job) {
   });
 }
 
+// BRIDGE-PRIV-3：确认卡的索引与点击处理（SCHED_APPROVAL_MODE=button 时才发卡；点击只认本进程发出的卡）
+const approvalCards = createApprovalCards({ send: (card) => sendApprovalCardToOwner(card), notify: (text) => sendToOwner(text), getOwner: () => OWNER_OPEN_ID || loadOwner(), scheduler: () => scheduler, redact, log: console.log }); // BRIDGE-PRIV-3
+
 const scheduler = startScheduler({
   schedulesDir: SCHEDULES_DIR,
   stateFile: SCHED_STATE_FILE,
   turnFor: schedTurnFor, // 按引用传：启动补跑只补「目的地是 owner 私聊」的任务，判定与上面同一处
   requireApproval: true, // BRIDGE-PRIV-2：结果不是发往 owner 私聊的任务，要 owner 在私聊确认后才执行
+  approvalMode: process.env.SCHED_APPROVAL_MODE, // BRIDGE-PRIV-3：command（缺省）| button
+  sendApprovalCard: (info) => approvalCards.issue(info), // BRIDGE-PRIV-3：button 时发确认卡
   notifyOwner: (text) => sendToOwner(text), // 迟到跳过 / 被重启打断 / when 写错等私聊 owner（与启动通知同一条路）
   onFire: async (job, ctx) => {
     const chatId = job.chat_id;
