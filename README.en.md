@@ -32,7 +32,8 @@ Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-
 - 🔀 **Switch models on the fly**: `/model fable high` changes model and thinking effort instantly — no restart — and jobs can switch automatically on a schedule
 - 🚦 **Separate models for chat/planning and execution**: `CLAUDE_MODEL` handles everyday chat and planning, `CLAUDE_EXEC_MODEL` handles execution — say 执行 / "do it" or send `/do <task>` and the next turn switches to the exec model with the session context intact; scheduled jobs default to the exec model. Leave it empty to disable the split
 - 📄 **Feishu Docs / Bitable / Sheets read & write**: built-in MCP tools using the **bot app's own tenant permissions** — what it can touch is governed by the scopes you enable; owner-only
-- 🖼️ **Send images and files back**: anything the bot writes into `workspace/outbox/` is uploaded and sent automatically (images preview inline)
+- 🖼️ **Send images and files back**: anything the bot writes into `workspace/outbox/` is uploaded and sent automatically (images preview inline); files that fail to send, or belong to a failed turn, are no longer deleted silently — they are kept under `data/outbox-unsent/` and the chat says so
+- 📏 **Long replies are split, not truncated**: a long reply is sent as up to 10 consecutive messages sized to Feishu's card limit; code fences and tables are re-opened across segments
 - 🎫 **In-place progress card**: long-running steps update a single card instead of spamming messages, then collapse when done
 - 🛂 **Access control**: `ALLOW_USERS` / `ALLOW_CHATS` allowlists (empty = unrestricted); group messages carry the sender's name
 - 🖼️ **Rich message types**: text / images (Claude reads them directly) / files / voice (Feishu transcript field, with an ffmpeg + speech-API fallback) / rich posts / merged forwards / share cards

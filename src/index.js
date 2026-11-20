@@ -213,30 +213,9 @@ let dailySession = { beforeTurn: ({ prompt }) => prompt, failureNote: () => '', 
 let ownerDm = { remember: () => {}, statusLine: () => '' };
 
 async function reply(messageId, text) {
-  const safe = redact(text);
-  const chunks = [];
-  for (let i = 0; i < safe.length; i += 20000) chunks.push(safe.slice(i, i + 20000));
-  for (const chunk of chunks) {
-    try {
-      await client.im.v1.message.reply({
-        path: { message_id: messageId },
-        data: {
-          msg_type: 'interactive',
-          content: JSON.stringify({
-            config: { wide_screen_mode: true },
-            elements: [{ tag: 'markdown', content: chunk }],
-          }),
-        },
-      });
-    } catch (e) {
-      // markdown 卡片失败时降级纯文本
-      console.error('[reply] card failed, fallback to text:', e?.message ?? e);
-      await client.im.v1.message.reply({
-        path: { message_id: messageId },
-        data: { msg_type: 'text', content: JSON.stringify({ text: chunk }) },
-      });
-    }
-  }
+  // BRIDGE-SEND-2：按请求体字节分段（超过一段放得下的才分），段间串行；卡片失败降级文本，与定时任务 / 心跳同一条路
+  if (!redact(text)) return; // 空文本从前一条都不发（分段循环里没有块），保持
+  await sendCardWithFallback((data) => client.im.v1.message.reply({ path: { message_id: messageId }, data }), redact(text), {}, (e) => console.error('[reply] card failed, fallback to text:', e?.message ?? e));
 }
 
 async function react(messageId, emoji) {
@@ -652,14 +631,14 @@ async function runTurn(spec) {
     } catch (e) {
       // 无论取消还是失败，都要把进度卡收尾，否则它永远停在「🔄 处理中」
       await progress.finish(e?.cancelled ? 'cancelled' : 'failed').catch(() => {});
-      // 失败轮里模型可能已经写了文件；不清掉会挂到下一次成功回答上一起发出
-      await flushOutbox(client, outboxDirFor(sessionKey, isOwner), (data) =>
+      // 取消轮只清不发；失败轮不发，挪到保留目录并在报错里列出文件名（BRIDGE-SEND-2）
+      const held = await flushOutbox(client, outboxDirFor(sessionKey, isOwner), (data) =>
         client.im.v1.message.reply({ path: { message_id: message.message_id }, data })
-      ).catch(() => {});
+      , { mode: e?.cancelled ? 'discard' : 'hold' }).catch(() => null);
       if (e?.cancelled) return; // /cancel 主动终止，不报错
       console.error('[claude]', e);
       // 登录类失败（含钥匙串锁住）给确定性修复步骤；瞬时刷新不算登录失效；其余原样报错
-      await reply(message.message_id, (await claudeFailureReply(String(e.message ?? e))) + dailySession.failureNote(e));
+      await reply(message.message_id, (await claudeFailureReply(String(e.message ?? e))) + dailySession.failureNote(e) + (held?.note ? `\n\n${held.note}` : ''));
     }
   });
 }
@@ -703,7 +682,7 @@ async function sendToOwner(text, opts) {
 async function sendMarkdown(receiveIdType, receiveId, text, opts = {}) {
   const body = (data) =>
     client.im.v1.message.create({ params: { receive_id_type: receiveIdType }, data: { receive_id: receiveId, ...data } });
-  const chunk = redact(text).slice(0, 20000);
+  const chunk = redact(text); // BRIDGE-SEND-2：不再截断；按字节分段在 sendCardWithFallback 里做
   return sendCardWithFallback(body, chunk, opts, (e) =>
     console.error(`[send] 卡片发送失败（${receiveIdType}），降级纯文本:`, e?.message ?? e));
 }
@@ -895,8 +874,9 @@ const scheduler = startScheduler({
             { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low', turn: diagTurn }
           ),
         });
-        // 失败时也要清空本任务的回传目录，否则残留文件会搭下一次报告一起发出
-        await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate).catch(() => {});
+        // 失败时不发回传文件：挪到保留目录，另发一行列出文件名（BRIDGE-SEND-2）；取消的只清不发
+        const held = await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate, { mode: e?.cancelled ? 'discard' : 'hold' }).catch(() => null);
+        if (held?.note) await sendToChat(chatId, held.note).catch(() => {});
       },
     });
   },

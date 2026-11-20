@@ -240,7 +240,7 @@ describe('K4 index.js 真接线 + 真 fireJob + 假飞书客户端', () => {
     assert.equal(c.flushCalls[0][3], undefined);
   });
 
-  test('W6 模型调用失败走自诊断：自诊断发送没有 uuid；onRunFailure 里的 flushOutbox 第 4 参 undefined', async () => {
+  test('W6 模型调用失败走自诊断：自诊断发送没有 uuid；onRunFailure 里的 flushOutbox 第 4 参只有 mode: \'hold\'、不带幂等键', async () => {
     const { reqs, flushCalls, opts } = build(() => okRes, {
       runClaudeImpl: (a) => { if (String(a[0]).startsWith('sched:')) throw new Error('model down'); return 'DIAG'; },
     });
@@ -248,7 +248,7 @@ describe('K4 index.js 真接线 + 真 fireJob + 假飞书客户端', () => {
     assert.ok(reqs.length >= 1);
     for (const r of reqs) assert.deepEqual(Object.keys(r.data), ['receive_id', 'msg_type', 'content']);
     assert.ok(flushCalls.length >= 1);
-    for (const c of flushCalls) assert.equal(c[3], undefined);
+    assert.deepEqual(flushCalls.map((c) => c[3]), [{ mode: 'hold' }]);
   });
 
   test('W7 set-model 动作任务：发出的请求没有 uuid', async () => {
