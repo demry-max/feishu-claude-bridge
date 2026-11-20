@@ -51,7 +51,7 @@ function fakeCreate(failIf = () => null) {
 }
 const cardText = (req) => JSON.parse(req.content).elements?.[0]?.content ?? JSON.parse(req.content).body?.elements?.[0]?.content;
 const BUTTONS = [{ label: '好', type: 'primary', value: { a: 1 } }, { label: '否', type: 'default', value: { a: 2 } }, { label: '稍后', type: 'default', value: { a: 3 } }];
-const LONG = `机密正文${'汉'.repeat(30_000)}`;
+const LONG = `机密正文${'汉'.repeat(80_000)}`; // 约 240 KB，按 64 000 字节预算 ≥ 4 段
 
 // 夹具：f49b44b 的 sendCardWithFallback（src/events.js:58-71）原文
 async function oldSend(create, chunk, opts = {}, onFallback = () => {}) {
@@ -71,7 +71,7 @@ async function oldSend(create, chunk, opts = {}, onFallback = () => {}) {
 describe('C 多段发送', () => {
   test('C1 差分：单段语料 × {无键, 有键} × {无按钮, 三按钮} × {成功, 卡片 400, 卡片网络错} 与旧实现逐字相同', async (t) => {
     collectLogs(t);
-    const corpus = ['', '短消息', '含"引号"与\\反斜杠\n换行', '汉'.repeat(7_999), '```js\nlet a = 1;\n```\n| a | b |\n|---|---|\n| 1 | 2 |'];
+    const corpus = ['', '短消息', '含"引号"与\\反斜杠\n换行', '汉'.repeat(7_999), '汉'.repeat(20_000), '```js\nlet a = 1;\n```\n| a | b |\n|---|---|\n| 1 | 2 |'];
     const behaviors = { ok: () => null, card400: (d) => (d.msg_type === 'interactive' ? httpErr() : null), cardNet: (d) => (d.msg_type === 'interactive' ? netErr() : null) };
     let n = 0;
     for (const text of corpus) for (const key of [undefined, KEY]) for (const actions of [undefined, BUTTONS]) for (const [bn, fail] of Object.entries(behaviors)) {
@@ -84,7 +84,7 @@ describe('C 多段发送', () => {
       assert.equal(fb, fa);
       n += 1;
     }
-    assert.equal(n, 5 * 2 * 2 * 3);
+    assert.equal(n, 6 * 2 * 2 * 3);
   });
 
   test('C2 多段无键：每段一张卡片、无 uuid、按钮只在最后一段、返回最后一段 id、日志一行不含正文', async (t) => {
@@ -143,7 +143,7 @@ describe('C 多段发送', () => {
 
   test('C4 内容完全相同的两段：uuid 不同（段名带段号）', async (t) => {
     collectLogs(t);
-    const text = `${'汉'.repeat(1_500)}\n\n`.repeat(30);
+    const text = `${'汉'.repeat(1_500)}\n\n`.repeat(60);
     const { segments } = splitMessage(text);
     assert.ok(new Set(segments).size < segments.length, '语料里应有完全相同的段');
     const a = fakeCreate();
@@ -294,7 +294,7 @@ describe('C 多段发送', () => {
     assert.deepEqual(b.reqs[1], { path: { message_id: 'om_2' }, data: { msg_type: 'text', content: JSON.stringify({ text: content }) } });
     assert.ok(b.errs.some((l) => l.startsWith('[reply] card failed, fallback to text:')));
 
-    const long = `${'汉'.repeat(6_000)}\n\n\`\`\`js\n${'let a = 1;\n'.repeat(40)}\`\`\`\n\n| a | b |\n|---|---|\n${'| 1 | 2 |\n'.repeat(20)}\n${'汉'.repeat(6_000)}\n`;
+    const long = `${'汉'.repeat(12_000)}\n\n\`\`\`js\n${'let a = 1;\n'.repeat(40)}\`\`\`\n\n| a | b |\n|---|---|\n${'| 1 | 2 |\n'.repeat(20)}\n${'汉'.repeat(12_000)}\n`;
     const c = replyFn(() => ({}));
     assert.equal(await c.reply('om_3', long), undefined);
     assert.equal(c.reqs.length, 2);
@@ -309,13 +309,13 @@ describe('C 多段发送', () => {
     assert.ok(!JSON.stringify(d.reqs).includes(FAKE), '单段请求体里有假令牌原值');
     assert.ok(JSON.stringify(d.reqs).includes('sk-ant-***'));
     const e = replyFn(() => ({}));
-    await e.reply('om_5', `${'汉'.repeat(6_000)}\n\n密钥 ${FAKE}\n\n${'汉'.repeat(6_000)}`);
+    await e.reply('om_5', `${'汉'.repeat(12_000)}\n\n密钥 ${FAKE}\n\n${'汉'.repeat(12_000)}`);
     assert.ok(e.reqs.length >= 2);
     assert.ok(!JSON.stringify(e.reqs).includes(FAKE), '多段请求体里有假令牌原值');
     assert.ok(JSON.stringify(e.reqs).includes('sk-ant-***'));
   });
 
-  test('C9 sendMarkdown 接线：3 万字定时任务结果 ≥ 4 次 create、目的会话不变、请求体 ≤ 30 000 字节；带四个按钮同样', async (t) => {
+  test('C9 sendMarkdown 接线：8 万字定时任务结果 ≥ 4 次 create、目的会话不变、每次请求体 ≤ 70 000 字节（预算 64 000 + 包装）；带四个按钮同样', async (t) => {
     const logs = collectLogs(t);
     const { reqs, opts } = buildSched({ answer: LONG, createImpl: () => ({ data: { message_id: 'om_1' } }) });
     await opts.onFire(job(), { sendKey: KEY, notifyOnce: async () => {} });
@@ -323,7 +323,7 @@ describe('C 多段发送', () => {
     for (const r of reqs) {
       assert.equal(r.data.receive_id, DM);
       assert.equal(r.params.receive_id_type, 'chat_id');
-      assert.ok(Buffer.byteLength(JSON.stringify({ receive_id: r.data.receive_id, msg_type: r.data.msg_type, content: r.data.content, uuid: r.data.uuid })) <= 30_000);
+      assert.ok(Buffer.byteLength(JSON.stringify({ receive_id: r.data.receive_id, msg_type: r.data.msg_type, content: r.data.content, uuid: r.data.uuid })) <= 70_000);
     }
     // 带验收按钮的长消息
     const sent = [];
@@ -338,7 +338,7 @@ describe('C 多段发送', () => {
     const text = '汉"\n'.repeat(12_000);
     await sendMarkdown('open_id', 'ou_x', text, { actions: four, idempotencyKey: KEY });
     assert.ok(sent.length >= 2);
-    for (const r of sent) assert.ok(Buffer.byteLength(JSON.stringify({ receive_id: r.data.receive_id, msg_type: r.data.msg_type, content: r.data.content, uuid: r.data.uuid })) <= 30_000);
+    for (const r of sent) assert.ok(Buffer.byteLength(JSON.stringify({ receive_id: r.data.receive_id, msg_type: r.data.msg_type, content: r.data.content, uuid: r.data.uuid })) <= 70_000);
     assert.equal(JSON.parse(sent.at(-1).data.content).schema, '2.0');
     assert.ok(logs.every((l) => !l.includes('机密正文') && !l.includes(KEY) && !l.includes(DM)));
   });
