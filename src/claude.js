@@ -312,20 +312,27 @@ export function getContextTokens(chatId) {
 export function getNudgeThreshold() {
   return CONTEXT_NUDGE_TOKENS;
 }
-// 有待提醒则返回 true 并清位（取走即消费，保证只注入一次）
+// 有待提醒则返回 true 并清位（取走即消费，保证只注入一次）。
+// BRIDGE-INBOUND-1：取走之后、带 memoryNudge 标记的那次调用还没起跑时，提醒仍算待注入（取到提醒却在调模型之前出了错，
+// 下一条消息照样再给一次）；起跑之后再取才是 false。
 export function consumeMemoryNudge(chatId) {
-  if (!nudgePending.has(chatId)) return false;
-  nudgePending.delete(chatId);
-  nudgeInFlight.add(chatId); // 只是「已注入」；真正跑成功后才允许回收会话
-  return true;
+  if (nudgePending.has(chatId)) {
+    nudgePending.delete(chatId);
+    nudgeInFlight.set(chatId, false); // 已取走、带标记的那次调用还没起跑
+    return true;
+  }
+  return nudgeInFlight.get(chatId) === false;
 }
 
-// 注入了固化提醒、但还不知道那一轮成没成功
-const nudgeInFlight = new Set();
+// 取走了固化提醒的会话：false = 带标记的那次调用还没起跑；true = 已起跑，还不知道那一轮成没成功。
+// 只有带 opts.memoryNudge === true 的那次 runClaude 才能把它转成已固化（成功）或重新排上（失败），
+// 不带标记的调用（前一轮、普通轮）一律不碰它。
+const nudgeInFlight = new Map();
 
 // 带提醒的那一轮整个 runClaude（含网络重试）最终失败：提醒没被执行，撤掉「已注入」、重新排到下一轮。
 function requeueMemoryNudge(chatId) {
-  if (!nudgeInFlight.delete(chatId)) return;
+  if (nudgeInFlight.get(chatId) !== true) return;
+  nudgeInFlight.delete(chatId);
   nudgePending.add(chatId);
   console.log(`[context] ${chatId} 带固化提醒的那一轮没跑成，下一轮再提醒`);
 }
@@ -889,6 +896,7 @@ import { createToolRecorder, createToolTurn } from './tool-audit.js';
 import { turnFromLegacyCall } from './turn-context.js'; // BRIDGE-PRIV-1：一轮的身份 × 场合判定只认它
 import { fenceUntrusted } from './messages.js'; // BRIDGE-PERM-2：sched-diag 把任务指令/报错围栏起来
 import { DATA_DIR } from './store.js';
+import { SESSION_RENEWED_NOTE } from './renewed-note.js'; // BRIDGE-INBOUND-1
 import { ownerText, OWNER } from './owner-name.js';
 import { parseExtraWriteDirs, extraWriteDenyRules } from './extra-write-dirs.js';
 // BRIDGE-PUB-1：strict 档额外拒写的 owner 目录（OWNER_STRICT_DENY_WRITE_DIRS，默认空）
@@ -1429,8 +1437,6 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       }
       if (finalErr) return reject(mark(finalErr));
       if (finalText !== null) {
-        // 这一轮确实跑完了：若本轮携带过固化提醒，此刻才算固化完成
-        if (nudgeInFlight.delete(chatId)) memoryFlushed.add(chatId);
         return resolve(finalText);
       }
       if (timedOut) {
@@ -1440,7 +1446,6 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
         return reject(err);
       }
       if (pending) {
-        if (nudgeInFlight.delete(chatId)) memoryFlushed.add(chatId);
         return resolve(pending); // 异常缺失 result 时兜底
       }
       reject(mark(new Error(`claude CLI 失败(code ${code}): ${stderr.slice(0, 500)}`)));
@@ -1631,7 +1636,8 @@ const sleepAbortable = (chatId, ms) =>
   });
 
 // BRIDGE-RUN-2：owner 私聊这一轮因为「原会话已失效」换了新会话时，附在答案后面的一句话（只在成功返回时附）
-export const SESSION_RENEWED_NOTE = '（提示：原来的会话已失效，这一轮是在新会话里回答的，之前聊过的上下文已经不在了；需要的话把要点再说一遍。）';
+// 常量本体放在 renewed-note.js（语音朗读与每日会话原话要去掉它，那两处不能 import 本文件），这里继续以同名导出
+export { SESSION_RENEWED_NOTE };
 
 /**
  * 运行 claude 无头模式，网络类失败自动重试（默认最多 2 次，退避 3s / 15s）。
@@ -1643,11 +1649,20 @@ export const SESSION_RENEWED_NOTE = '（提示：原来的会话已失效，这�
  * 模型一个工具都没调、只收到 API Error: 529 Overloaded 的纯网络类失败，被误判成「执行到一半」而放弃重试。
  */
 export async function runClaude(chatId, prompt, isOwner = false, extraTools = [], onProgress = null, opts = {}) {
+  // BRIDGE-INBOUND-1：只有带 memoryNudge 标记、且这个会话确实取走了提醒的那次调用，才是「带提醒的那一轮」
+  const carriesNudge = opts?.memoryNudge === true && nudgeInFlight.get(chatId) === false;
+  if (carriesNudge) nudgeInFlight.set(chatId, true);
   try {
-    return await runClaudeWithRetries(chatId, prompt, isOwner, extraTools, onProgress, opts);
+    const out = await runClaudeWithRetries(chatId, prompt, isOwner, extraTools, onProgress, opts);
+    // 整个 runClaude（含重试与换账号）成功才算固化完成；中途 /new 重置过的不算
+    if (carriesNudge && nudgeInFlight.get(chatId) === true) {
+      nudgeInFlight.delete(chatId);
+      memoryFlushed.add(chatId);
+    }
+    return out;
   } catch (e) {
     // 整个 runClaude（含重试与重试等待）以抛错结束才算这一轮没跑成；中途重试后成功的不走这里
-    requeueMemoryNudge(chatId);
+    if (carriesNudge) requeueMemoryNudge(chatId);
     throw e;
   }
 }

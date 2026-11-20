@@ -17,6 +17,7 @@ import { BARE_EXEC_PROMPT } from './lanes.js';
 import { msUntilNext } from './digest.js';
 import { MERGED_CONFIRM_NOTE } from './message-queue.js';
 import { detectConfirm } from './tool-policy.js';
+import { stripRenewedNote } from './renewed-note.js'; // BRIDGE-INBOUND-1：换新会话附注不进原话记录（本文件不 import claude.js）
 
 export const ROUNDS_KEEP = 30; // 环形原话文件最多留几轮
 export const HANDOFF_TIMEOUT_MS = 5 * 60_000; // 交接轮硬超时
@@ -710,7 +711,7 @@ export function createDailySession({
   function recordRound(key, text, answer) {
     try {
       const sid = getSessionId(key);
-      appendRound(roundsFile(key), makeRound({ ts: now(), sid, user: text, answer, redact }), io);
+      appendRound(roundsFile(key), makeRound({ ts: now(), sid, user: text, answer: stripRenewedNote(answer), redact }), io);
       if (!sid) return;
       const state = load();
       const st = state[key];
