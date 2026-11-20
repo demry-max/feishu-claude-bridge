@@ -23,6 +23,21 @@ const { promptFileName, diskFileName } = await import('../src/file-names.js');
 const { buildPrompt } = await import('../src/messages.js');
 const checks = await import('../scripts/lib/checks.js');
 const { buildPlist } = await import('../src/launchd.js');
+const { stripSecretsDeny, hasSecretsDeny, secretsDenyOf, disallowedOf } = await import('./helpers/strip-secrets-deny.js');
+
+// BRIDGE-PRIV-1：.env / security 的 4 条拒绝规则现对所有带工具的档常开。逐字比对基线夹具前，只把它们从 argv 里拿掉
+// （夹具不改）；「有这 4 条」由 assertArgvDeny 另行断言。
+const stripArgvJson = (json) => ({
+  ...json,
+  argv: Object.fromEntries(Object.entries(json.argv).map(([p, cases]) => [p, Object.fromEntries(Object.entries(cases)
+    .map(([c, v]) => [c, Array.isArray(v) ? stripSecretsDeny(v) : v]))])),
+});
+const normText = (json) => `${JSON.stringify(stripArgvJson(json), null, 1)}\n`;
+const assertArgvDeny = (json) => {
+  for (const p of ['legacy', 'audit', 'strict']) {
+    for (const c of ['chat', 'chatConfirm', 'sched']) assert.ok(hasSecretsDeny(json.argv[p][c]), `${p}/${c} 应带 4 条 .env / security 拒绝规则`);
+  }
+};
 
 function render(extraEnv = {}) {
   const env = { ...process.env, TZ: 'Asia/Shanghai' };
@@ -46,7 +61,9 @@ const UNSET = () => once('unset', {});
 
 describe('PUB-1 OWNER_NAME 设成原称呼：消息与提示词与基线逐字相同', () => {
   test('心跳 prompt、升级阶梯、日结、验收卡片 / 提示词、排队合并前言与确认提示、确认默认 prompt、审计日报、失败通知、台账回写、外部增量、三档 argv 全部逐字', () => {
-    const { text } = SET();
+    const { json } = SET();
+    assertArgvDeny(json);
+    const text = normText(json);
     assert.ok(text === FIXTURE_TEXT, firstDiff(text, FIXTURE_TEXT));
   });
   test('夹具本身覆盖到了带称呼的模板（防止夹具空转）', () => {
@@ -77,7 +94,9 @@ describe('PUB-2 未设：所有模板输出无原称呼字样', () => {
   test('换一个称呼（王总）：输出等于把基线里的原称呼逐处换成它——除称呼外一个字都不差', () => {
     const r = render({ OWNER_NAME: '王总', PUB1_EXTRA_DIRS_UNDER_HOME: 'code/ias-ops' });
     const want = FIXTURE_TEXT.replaceAll(NAME, '王总');
-    assert.ok(r.text === want, firstDiff(r.text, want));
+    assertArgvDeny(r.json);
+    const rt = normText(r.json);
+    assert.ok(rt === want, firstDiff(rt, want));
     assert.equal(r.stderr, '');
   });
 });
@@ -172,16 +191,20 @@ describe('PUB-4 .env 回写权限', { skip: process.platform === 'win32' && 'Win
 describe('PUB-5 OWNER_STRICT_DENY_WRITE_DIRS', () => {
   test('设成等价目录：legacy / audit / strict 的 argv 与基线逐字相同', () => {
     const { json } = SET();
-    for (const p of ['legacy', 'audit', 'strict']) assert.deepEqual(json.argv[p], FIXTURE.argv[p], p);
+    assertArgvDeny(json);
+    const stripped = stripArgvJson(json);
+    for (const p of ['legacy', 'audit', 'strict']) assert.deepEqual(stripped.argv[p], FIXTURE.argv[p], p);
     const deny = FIXTURE.argv.strict.chat[FIXTURE.argv.strict.chat.indexOf('--disallowedTools') + 1];
     assert.ok(deny.includes('/<tmp>/home/code/ias-ops/**)'), '基线 strict 拒绝清单里本来就有这条（对照有效）');
   });
   test('未设：legacy / audit argv 仍与基线逐字相同；strict 拒绝清单不再含该目录、其余不变', () => {
     const { json } = UNSET();
     const norm = (a) => JSON.stringify(a).replaceAll(NAME, '').replaceAll('owner ', '').replaceAll(' owner', '');
-    for (const p of ['legacy', 'audit']) assert.equal(norm(json.argv[p]), norm(FIXTURE.argv[p]), p);
+    assertArgvDeny(json);
+    const stripped = stripArgvJson(json);
+    for (const p of ['legacy', 'audit']) assert.equal(norm(stripped.argv[p]), norm(FIXTURE.argv[p]), p);
     for (const c of ['chat', 'chatConfirm', 'sched']) {
-      const now = json.argv.strict[c][json.argv.strict[c].indexOf('--disallowedTools') + 1].split(',');
+      const now = disallowedOf(json.argv.strict[c]).filter((r) => !secretsDenyOf(json.argv.strict[c]).includes(r));
       const base = FIXTURE.argv.strict[c][FIXTURE.argv.strict[c].indexOf('--disallowedTools') + 1].split(',');
       assert.deepEqual(now, base.filter((r) => !r.includes('ias-ops')), c);
       assert.ok(!JSON.stringify(json.argv).includes('ias-ops'), c);

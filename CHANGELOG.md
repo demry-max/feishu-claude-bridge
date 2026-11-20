@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### BRIDGE-PRIV-1：非私密场合不再带 owner 的私密记忆（权限卡）
+
+- **问题**：owner 在群里发消息、定时任务把结果发往群，都被当成「owner 私聊」跑——owner 工作区与画像、记忆召回、lark-cli / 飞书工具全带上，回答又发给整个群。
+- **现在**：新模块 `src/turn-context.js`（纯函数 `resolveTurn`）在 `index.js` 入口算出每一轮的「身份 × 场合」，`claude.js` 只读它，不再自己按 chat_id 前缀 / chatType 猜。判定主线：回答发给谁。只回 owner 私聊（或不外发）的回合才算私密。
+  - **owner 在群里**（legacy / audit / strict 三档一致）：访客工作区、访客工具、不做记忆召回与会话回收、附件进 `workspace-guest/incoming/`、outbox 按非私密；提示词多两行说明（发言人是 owner 但按访客权限运行）。桥接命令权限仍按 owner 判。`/tasks` 在群里只回「定时任务只在私聊里查看」，`/status` 按访客档显示。
+  - **定时任务与失败自诊断按目的地分档**：目的地判定只有 `schedDestOf` 一处；发往 owner 私聊 → 与以前逐字相同；发往群 / 别的会话 / owner 私聊 ID 未知 → 访客档（自诊断是零工具档，工作区用访客的）。ID 未知时日志一行 `[sched] 「<任务名>」owner 私聊目的地未知，按非私密档运行`，不打印 chat_id。
+  - **`src/scheduler.js` `readJobs`**：`chat_id` 写了但不是 `oc_` + 16–64 位小写字母数字的任务直接跳过，日志只记文件名。没写 `chat_id` 的行为不变。
+  - **`.env` 与钥匙串拒绝规则常开**：`Read(//<仓库>/.env)`、`Read(//<仓库>/.env.*)`、`Bash(security:*)`、`Bash(/usr/bin/security:*)` 加进每个带工具的回合（owner 私聊三档、定时、心跳、交接、访客含群里的 owner、legacy 自诊断），不再只在 `BMS_TOOL_ENABLED` 开时才有。零工具回合（验收；audit / strict 自诊断；发往别处的自诊断）不加，参数与以前逐字相同。`BMS_TOOL_ENABLED` 开时 owner 私聊 / 心跳 / 发往私聊的定时任务的参数与 3c2d3ae 逐字相同。
+- **迁移说明（需要知道）**：
+  - owner 在群里的会话键从「群 chat_id」改为 `guest:<群 chat_id>:<owner open_id>`。**旧的群会话不再被续用**——owner 在群里的下一条消息会开新会话；`data/sessions.json` 里旧条目原样留着（不删、不改），不影响任何东西，可自行清理。
+  - **线上有 1 个发往别的会话的定时任务**，升级后它按访客档运行，不再有 lark-cli / 飞书工具；若它依赖这些工具，需要把任务改成发往 owner 私聊，或把它要的数据改由别的方式提供。其余定时任务目的地是 owner 私聊或本来就是访客档，不受影响。
+  - 首次安装后、owner 还没私聊过之前，定时任务的目的地按「未知」处理（与 BRIDGE-DMID-1 的落盘文件一致），按访客档运行；owner 私聊一次后即恢复（之后重启由 `data/owner-dm.json` 读回）。
+- 不在本卡范围：「模型新建 / 修改发往别处的定时任务需要先在私聊确认」——评估见交付报告（预计远超 80 行、动调度器加载逻辑、与 SCHED-1 重叠，建议在 SCHED-1 之后另开 BRIDGE-PRIV-2）。
+- 测试：新增 `test/turn-context.test.js`（T1：判定表与不变量）、`test/turn-argv.test.js`（T2 / T7：按 turn 的 argv 与「带工具必有 4 条拒绝规则」不变量）、`test/turn-wiring.test.js`（T3 / T4 / T5：真实 `handleMessage` / `runTurn` 接线、旧会话不续用、群里 `/tasks`、定时分档、每个 `runClaude(` 都带 `turn`）、`test/turn-sched-chatid.test.js`（T6）；`test/helpers/strip-secrets-deny.js` 与 `test/fixtures/biz-on-matrix.mjs` / `owner-args-biz-on-3c2d3ae.json`。既有测试里凡是比对 owner 带工具 argv 的，都在比对前剥掉这 4 条并加一条「确有这 4 条」的正向断言，夹具一概不动。
+
 ### owner 私聊目的地落盘（重启后定时任务立即恢复业务查询工具）
 
 - **问题**：owner 私聊的 chat_id 只记在内存里，桥接重启后、owner 没再私聊之前，「结果发 owner 私聊」的定时任务判不出目的地，没有 `mcp__biz__biz_get`（11/20 07:30 的定时任务因此报找不到工具）。

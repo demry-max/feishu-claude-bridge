@@ -164,6 +164,8 @@ describe('心跳工具档 toolProfile=heartbeat（测试 10）', () => {
     }));
 });
 
+const { stripSecretsDeny, hasSecretsDeny } = await import('./helpers/strip-secrets-deny.js');
+
 describe('回归：普通 owner 与定时任务参数除新增 Edit(./tasks/**) 外逐字不变（测试 11）', () => {
   // 冻结期望 = 改动前（基线 d58037c）buildClaudeArgs 的真实输出，来源见 fixtures 文件 _source 字段
   const baseline = JSON.parse(readFileSync(new URL('./fixtures/owner-args-baseline.json', import.meta.url), 'utf8'));
@@ -202,7 +204,9 @@ describe('回归：普通 owner 与定时任务参数除新增 Edit(./tasks/**) 
         const want = name === 'schedJob'
           ? plusTasks(baseline[name]).map((x) => x.replaceAll('claude-haiku-4-5-20251001', 'claude-haiku-5-5'))
           : plusTasks(baseline[name]);
-        assert.deepEqual(norm(r.args), want);
+        // BRIDGE-PRIV-1：4 条 .env / security 拒绝规则对带工具的 argv 常开——先断言有，再从实际 argv 拿掉后逐字比对基线（夹具不改）
+        assert.ok(hasSecretsDeny(r.args), `${name} 应带 4 条拒绝规则`);
+        assert.deepEqual(norm(stripSecretsDeny(r.args)), want);
         assert.equal(r.cwd, m.WORKSPACE_DIR);
       }));
   }

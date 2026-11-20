@@ -208,7 +208,7 @@ describe('index.js 接线（源码断言——只证明写法，不证明行为�
     const redirectAt = src.indexOf("if (text.startsWith('/redirect'))");
     const routeAt = src.indexOf('routeTurn(prompt)');
     assert.ok(redirectAt > 0 && routeAt > redirectAt, 'routeTurn 必须作用在 /redirect 处理后的 prompt 上');
-    assert.match(src, /runClaude\(sessionKey, prompt, isOwner, extraTools, progress\.update, \{ lane: route\.lane \}\)/);
+    assert.match(src, /runClaude\(sessionKey, prompt, isOwner, extraTools, progress\.update, \{ lane: route\.lane, turn \}\)/);
   });
 
   test('/model 支持查看与切换执行模型；/help 与 /status 提到执行车道', () => {

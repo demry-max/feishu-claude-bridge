@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CronExpressionParser } from 'cron-parser';
+import { OWNER_DM_CHAT_ID_RE } from './owner-dm-store.js'; // BRIDGE-PRIV-1：chat_id 的写法校验与 owner 私聊 id 同一个正则
 
 const TICK_MS = 30_000;
 // 迟到窗口：错过的任务只在这个窗口内补跑。机器休眠一夜后醒来，
@@ -31,6 +32,13 @@ function readJobs(dir) {
       const job = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
       job._file = f;
       if (job.enabled === false || !job.when) continue;
+      // BRIDGE-PRIV-1：chat_id 决定回答发往哪、跑在哪一档。写法不是飞书会话 id（oc_ 开头的小写字母数字）的任务不执行，
+      // 免得一个写坏的目的地被当成「别的会话」悄悄发出去；日志只记文件名，不记值。没写 chat_id 的照旧（执行时再报缺）
+      if (job.chat_id !== undefined && job.chat_id !== null && job.chat_id !== '' &&
+          !(typeof job.chat_id === 'string' && OWNER_DM_CHAT_ID_RE.test(job.chat_id))) {
+        console.error(`[sched] 任务 ${f} 的 chat_id 格式不对，已跳过`);
+        continue;
+      }
       if (job.action && !ALLOWED_ACTIONS.has(job.action)) {
         console.error(`[sched] 拒绝未知 action「${job.action}」(${f})，已跳过`);
         continue;

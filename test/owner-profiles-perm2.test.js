@@ -16,6 +16,7 @@ import {
   BASE_ENV, LEGACY_PROFILES, CASES,
   seedSkillWorkspace, makeNorm, snapArgs, treeOf,
 } from './fixtures/perm2-legacy-matrix.mjs';
+import { stripSnap, hasSecretsDeny } from './helpers/strip-secrets-deny.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -72,8 +73,10 @@ test('测PERM2-A legacy 全矩阵：四种 legacy 写法下 buildClaudeArgs 与�
     for (const profile of LEGACY_PROFILES) {
       const m = await load({ ...c.env, OWNER_TOOL_PROFILE: profile });
       assert.equal(m.OWNER_TOOL_PROFILE, 'legacy', `${name}/${String(profile)} 应判为 legacy`);
-      const got = snapArgs(m.buildClaudeArgs(...structuredClone(c.call)), NORM);
-      assert.deepEqual(got, expected, `${name}/${String(profile)}`);
+      const raw = snapArgs(m.buildClaudeArgs(...structuredClone(c.call)), NORM);
+      // BRIDGE-PRIV-1：.env / security 4 条拒绝规则对带工具的 argv 常开：先断言有，再从实际 argv 拿掉后逐字比对夹具（夹具不改）
+      assert.ok(hasSecretsDeny(raw.args), `${name}/${String(profile)} 应带 4 条 .env / security 拒绝规则`);
+      assert.deepEqual(stripSnap(raw), expected, `${name}/${String(profile)}`);
     }
   }
 });

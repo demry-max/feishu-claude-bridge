@@ -25,6 +25,8 @@ const {
   GUEST_WORKSPACE_DIR,
 } = await import('../src/claude.js');
 
+const { secretsDenyOf, disallowedOf, hasSecretsDeny } = await import('./helpers/strip-secrets-deny.js');
+
 const argVal = (args, flag) => {
   const i = args.indexOf(flag);
   return i >= 0 ? args[i + 1] : undefined;
@@ -106,7 +108,10 @@ describe('访客隔离（行为断言）', () => {
 
   test('owner 不受访客那套限制影响', () => {
     assert.ok(!owner.args.includes('--strict-mcp-config'));
-    assert.ok(!owner.args.includes('--disallowedTools'));
+    // BRIDGE-PRIV-1：owner 也常带 .env / security 的 4 条拒绝规则，但仅此 4 条，没有访客那套黑名单
+    assert.ok(hasSecretsDeny(owner.args), 'owner 必须带 4 条 .env / security 拒绝规则');
+    assert.equal(disallowedOf(owner.args).length, 4, 'owner 的 --disallowedTools 只能是这 4 条');
+    assert.deepEqual(disallowedOf(owner.args), secretsDenyOf(owner.args));
   });
 
   test('访客发附件时放行 Read，但仍限定在 incoming 路径', () => {
@@ -236,9 +241,15 @@ describe('结构约束（源码断言——只证明写法，不证明行为）'
     assert.match(read('index.js'), /text === '\/voice on' \? true/);
   });
 
-  test('会话键按身份分离，且访客再按发言人细分', () => {
+  test('会话键按身份分离，且访客再按发言人细分', async () => {
     const src = read('index.js');
-    assert.match(src, /guest:\$\{message\.chat_id\}:\$\{senderOpenId\}/, '同群访客不得共用一条会话');
+    // BRIDGE-PRIV-1：会话键公式搬进 turn-context.js；index.js 只取 turn.sessionKey
+    assert.match(src, /const sessionKey = turn\.sessionKey;/);
+    assert.match(read('turn-context.js'), /`guest:\$\{chatId\}:\$\{senderOpenId\}`/, '同群访客不得共用一条会话');
+    const { resolveTurn } = await import('../src/turn-context.js');
+    const k = (who) => resolveTurn({ source: 'chat', isOwner: false, chatType: 'group', chatId: 'oc_g', senderOpenId: who }).sessionKey;
+    assert.notEqual(k('ou_a'), k('ou_b'), '同群不同访客不得共用一条会话');
+    assert.equal(k('ou_a'), 'guest:oc_g:ou_a');
     assert.ok(!/runClaude\(message\.chat_id/.test(src));
   });
 

@@ -15,9 +15,10 @@ import { setAccountNotifier, verifyFallbackAtStartup } from './account-fallback.
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
-import { OWNER_TOOL_PROFILE, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
+import { OWNER_TOOL_PROFILE, BIZ_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 import { schedDestOf } from './biz-wiring.js';
+import { resolveTurn } from './turn-context.js'; // BRIDGE-PRIV-1：一轮的「身份 × 场合」只在入口算一次
 import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.js';
 import { OWNER_DM_FILE_NAME, loadOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
 
@@ -317,19 +318,22 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   if (isOwner && message.chat_type === 'p2p') ownerDmChatId = message.chat_id;
   if (isOwner && message.chat_type === 'p2p') ownerDm.remember(message.chat_id, owner); // BRIDGE-DMID-1：同一条件下落盘（值没变不写；失败只记日志）
 
-  // 会话键必须区分身份：群里 owner 与访客共用一个 chat_id，但现在两者的 cwd 不同
-  // （workspace vs workspace-guest）。若共用同一个 session，访客一次 --resume 就能
-  // 恢复出 owner 那条带私有记忆的会话历史——工作区隔离会被整个绕过。
-  const sessionKey = isOwner
-    ? message.chat_id
-    // 再按发言人细分：同一个群里访客 A 的历史不该出现在访客 B 的上下文里，
-    // 也避免任一访客往共用会话里植入长效指令
-    : `guest:${message.chat_id}:${senderOpenId}`;
+  // BRIDGE-PRIV-1：这一轮「回答会发给谁」只在这里判一次。owner 在群里与访客同一个数据边界（访客工作区、访客工具、无私密记忆）；
+  // isOwner 只留给桥接命令的权限判定，工作区 / 工具 / 记忆 / 会话键一律看 turn
+  const turn = resolveTurn({
+    source: 'chat', isOwner, chatType: message.chat_type, chatId: message.chat_id, senderOpenId,
+    profile: OWNER_TOOL_PROFILE, bizOn: BIZ_ON,
+  });
+  // 会话键必须区分身份：群里 owner 与访客共用一个 chat_id，但两者的 cwd 曾经不同（workspace vs workspace-guest）。
+  // 若共用同一个 session，访客一次 --resume 就能恢复出 owner 那条带私有记忆的会话历史——工作区隔离会被整个绕过。
+  // 现在 owner 在群里也按访客边界跑，键与访客同一公式：按发言人细分，同一个群里 A 的历史不该出现在 B 的上下文里，
+  // 也避免任一人往共用会话里植入长效指令；owner 私聊键仍是私聊的 chat_id
+  const sessionKey = turn.sessionKey;
   if (ownerQueue.applies(isOwner, message.chat_type)) ownerQueue.arrivalStarted(sessionKey, seq); // BRIDGE-MQ-1：登记「已到达、还没交给队列」，出队等它（R1）
 
   // ---- 消息 → 提示词（文本/图片/文件/富文本/合并转发/卡片） ----
   // 附件落在各自工作区：非 owner 的文件不该出现在 owner 的工作区里，反之亦然
-  const myWorkspace = workspaceFor(isOwner);
+  const myWorkspace = workspaceFor(turn.private);
   let built;
   try {
     built = await buildPrompt(client, message, myWorkspace, senderOpenId);
@@ -382,6 +386,10 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       await reply(message.message_id, '只有 owner 可以查看定时任务。');
       return;
     }
+    if (!turn.private) { // BRIDGE-PRIV-1：任务清单含目的地与提示词，群里不展示
+      await reply(message.message_id, '定时任务只在私聊里查看');
+      return;
+    }
     await reply(message.message_id, describeTasks());
     return;
   }
@@ -416,7 +424,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   }
   if (text === '/status') {
     // 每日新会话开着时（owner 私聊）末尾再多一行：本会话从何时起、下次何时换新；off 时为空串
-    await reply(message.message_id, sessionInfo(sessionKey, isOwner) + ownerQueue.statusLine(sessionKey, isOwner, message.chat_type) + dailySession.statusLine(sessionKey, { isOwner, chatType: message.chat_type }) + ownerDm.statusLine({ isOwner, chatType: message.chat_type })); // BRIDGE-DMID-1：owner 私聊多一行目的地已知 / 未知（不显示 id）；BRIDGE-MQ-1：owner 私聊且开关开时多一行排队条数，其余为空串
+    await reply(message.message_id, sessionInfo(sessionKey, turn.private, turn) + ownerQueue.statusLine(sessionKey, isOwner, message.chat_type) + dailySession.statusLine(sessionKey, { isOwner, chatType: message.chat_type }) + ownerDm.statusLine({ isOwner, chatType: message.chat_type })); // BRIDGE-DMID-1：owner 私聊多一行目的地已知 / 未知（不显示 id）；BRIDGE-MQ-1：owner 私聊且开关开时多一行排队条数，其余为空串
     return;
   }
   if (text === '/help' || text === '帮助') {
@@ -522,7 +530,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
     return;
   }
   // BRIDGE-MQ-1：owner 私聊 + 开关开 + 本会话正忙（含 isRunning 为 false 的起步 / 收尾窗口）→ 入队，当前轮结束后接着办
-  const spec = { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, seq, at: Number(message.create_time) || Date.now() };
+  const spec = { message, senderOpenId, isOwner, turn, sessionKey, text, built, ledgerHint, seq, at: Number(message.create_time) || Date.now() };
   if (ownerQueue.shouldQueue({ key: sessionKey, isOwner, chatType: message.chat_type, text })) {
     await ownerQueue.offer(sessionKey, spec);
     return;
@@ -538,7 +546,10 @@ async function handleMessage(data, seq = ++arrivalSeq) {
 // ---- 起一轮对话（BRIDGE-MQ-1：从 handleMessage 原样拆出。空闲时由 handleMessage 直接调；
 // 排队出队时由 ownerQueue 调——1 条就是那条消息自己的 spec，多条是 mergeQueuedTurns 合并后的 spec，带 merged）----
 async function runTurn(spec) {
-  const { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, merged, queued } = spec;
+  const { message, senderOpenId, isOwner: speakerIsOwner, turn, sessionKey, text, built, ledgerHint, merged, queued } = spec;
+  // BRIDGE-PRIV-1：本函数里的 isOwner 指「这一轮按仓主私密档跑」（= turn.private），不是「发言人是仓主」：
+  // owner 在群里发言时它为 false——工作区 / 工具 / 召回 / 记忆提醒 / outbox 都按访客边界；发言人身份只用于日志里的称呼
+  const isOwner = turn.private;
   // 附件存放于 workspace/incoming/，即使非 owner 也放行该目录的只读访问
   const extraTools = built.attachments.length ? ['Read(./incoming/**)'] : [];
   // 注意：prompt 必须在 /redirect 分支之前声明。此前它声明在分支之后，
@@ -605,7 +616,7 @@ async function runTurn(spec) {
 
   enqueue(sessionKey, async () => {
     console.log(formatInboundLog({
-      who: isOwner ? 'owner' : senderOpenId,
+      who: speakerIsOwner ? 'owner' : senderOpenId,
       chatType: message.chat_type,
       messageType: message.message_type,
       exec: route.lane === 'exec',
@@ -616,7 +627,7 @@ async function runTurn(spec) {
     try {
       prompt = dailySession.beforeTurn({ sessionKey, prompt, text, isOwner, chatType: message.chat_type, confirmed: dsConfirmed, queued, merged, route, toolTurn }); // 每日新会话（off 原样返回；排队轮、带确认提示的合并轮不换）
       const runClaude = toolTurn.runClaude; // BRIDGE-PERM-1：audit/strict 收集工具事件、strict 私聊确认；legacy 下就是原函数
-      const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });
+      const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane, turn });
       await progress.finish();
       await reply(message.message_id, toolTurn.withReceipt(answer || '（Claude 返回了空回复）'));
       // 机器人写进本轮专属 outbox 的图片/文件随本轮一起回传
@@ -779,6 +790,17 @@ async function announceStartup() {
   }
 }
 
+// BRIDGE-PRIV-1：定时任务 / 失败自诊断按「回答发往哪」分档。目的地的判定只有这一处（schedDestOf）：
+// 恰好是 owner 私聊 → 私密档；发往群 / 别的会话 / owner 私聊 id 未知 → 非私密档（访客工作区与访客工具）
+function schedTurnFor(source, job) {
+  const chatId = job.chat_id;
+  return resolveTurn({
+    source, isOwner: true, chatId: `${source}:${job._file}`,
+    schedDest: schedDestOf(chatId, ownerDmChatId), ownerDmKnown: Boolean(ownerDmChatId),
+    profile: OWNER_TOOL_PROFILE, bizOn: BIZ_ON,
+  });
+}
+
 startScheduler({
   schedulesDir: SCHEDULES_DIR,
   stateFile: SCHED_STATE_FILE,
@@ -810,14 +832,16 @@ startScheduler({
     const schedChatId = `sched:${job._file}`;
     // 任务可自带档位，未指定则用全局配置；工具档固定为定时（BRIDGE-PERM-1）
     const schedOpts = { model: job.model, effort: job.effort, toolProfile: 'sched' };
+    const schedTurn = schedTurnFor('sched', job); // 私密档只给「发往 owner 私聊」的任务；其余走访客边界
+    if (schedTurn.private === false && !ownerDmChatId) console.log(`[sched] 「${job.name ?? job._file}」owner 私聊目的地未知，按非私密档运行`);
     try {
       const answer = await runClaude(
         schedChatId,
         job.prompt,
-        true,
+        schedTurn.private,
         [],
         (p) => sendToChat(chatId, `⏳ ${p}`),
-        { ...schedOpts, schedDest: schedDestOf(chatId, ownerDmChatId) } // schedDest 只决定 biz_get 挂不挂：目的地恰好是 owner 私聊才挂
+        { ...schedOpts, turn: schedTurn }
       );
       const late = job._late ? `（迟到补跑 ${Math.round(job._late / 60000)} 分钟）` : '';
       // 无事不报：答案整条就是 HEARTBEAT_OK（或为空）时静默跳过，
@@ -830,7 +854,7 @@ startScheduler({
         await sendToChat(chatId, `⏰ **${job.name ?? '定时任务'}**${late}\n\n${body}`);
       }
       // 定时任务写的文件此前从不发送，会滞留到下一条任意消息被顺手发走
-      await flushOutbox(client, outboxDirFor(schedChatId, true), (data) =>
+      await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), (data) =>
         client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } })
       );
     } catch (e) {
@@ -838,22 +862,23 @@ startScheduler({
       // 登录类故障例外：诊断本身也要调 claude，只会同样失败（9/20–9/21 两天里每次都是
       // 「诊断也失败了」），所以直接发确定性修复步骤。
       const err = String(e?.message ?? e).slice(0, 800);
+      const diagTurn = schedTurnFor('sched-diag', job); // 与上面同一个目的地判定：发往非 owner 私聊的任务，自诊断也不带私密工具
       await handleScheduledFailure({
         err,
         jobName: job.name ?? job._file,
         send: (text) => sendToChat(chatId, text),
         runDiagnosis: () => runClaude(
           `sched-diag:${job._file}`,
-          // 自诊断是模板化的短任务，没必要用旗舰模型；提示词按工具档拼（audit/strict 把任务指令/报错围栏起来）
-          schedDiagPrompt(job, err),
-          true,
+          // 自诊断是模板化的短任务，没必要用旗舰模型；提示词按工具档拼（audit/strict 或非私密档把任务指令/报错围栏起来）
+          schedDiagPrompt(job, err, { fence: diagTurn.private === false }),
+          diagTurn.private,
           [],
           null,
-          { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low' }
+          { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low', turn: diagTurn }
         ),
       });
       // 失败时也要清空本任务的回传目录，否则残留文件会搭下一次报告一起发出
-      await flushOutbox(client, outboxDirFor(schedChatId, true), (data) =>
+      await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), (data) =>
         client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } })
       ).catch(() => {});
     }
