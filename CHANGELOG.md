@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+### BRIDGE-RUN-1：调 claude 子进程的收尾、重试与环境
+
+- **断连后重试按「动过手没有」判断**：原来只要出现过任何 assistant 或 `result` 事件（`producedOutput`）就不再重试，而出错的 `result` 事件也会置位它，于是 529 过载这类错误即使一件事都没做也被当成「已执行到一半」直接报错、不重试。
+  现在按 `acted`（调过工具，或已经发出过进度消息）判断：没动过手的网络类错误照常走原有的退避重试（3 秒、15 秒，`CLAUDE_MAX_RETRIES` 默认 2）；动过手的仍不重放，回复末尾那句「任务已执行到一半……」只在「动过手、且错误属于可重试类」时才加。
+  可重试 / 不重试的两条正则不变；`producedOutput` 的含义不变（每日新会话据它决定能否退回旧会话）。
+- **新增 `CLAUDE_RESULT_GRACE_MS`**（毫秒，默认 10000，范围 100–120000，留空 = 默认）：`result` 事件已经到了、进程却迟迟不退出（孙进程攥着管道、hook 卡住……）时，原来要一直等到整轮超时才收尾；
+  现在宽限一到就结束整个进程组、按已收到的结果落定这一轮，日志一行 `[claude] <会话键> 结果已到但进程 N 秒未退出，已结束`。写错的值按默认处理，启动日志打一行 `[config] ⚠️`（不回显写的值）。
+- **超时 / `/cancel` / 宽限到期都结束整个进程组，收尾只走一个出口**：非 Windows 下 claude 子进程自成进程组（`detached`），上述三种情况都对整组发 SIGTERM，2 秒后这一组还在就补 SIGKILL（原来只杀 claude 自己，它起的 Bash / MCP / hook 会成为孤儿）。
+  收尾收成唯一的 `settle()`：进程 `exit` 之后最多再等 2 秒让输出管道关闭，孙进程还攥着管道也照样落定；临时 MCP 配置目录恰好清一次（原来启动失败时 `error`、`close` 各清一次）。
+  桥接进程自己退出时，仍在跑的 claude 进程组由唯一一个 `process.on('exit')` 监听补一次 SIGTERM（重复加载模块不叠加）。`src/shutdown.js` 没改。
+  边界：桥接被 SIGKILL 时这个监听不会跑，而原来靠 launchd 按服务进程组顺带清同组子进程的兜底，碰不到自成进程组的 claude；前台 `npm start` 时终端的 Ctrl-C 也不再直接送到 claude，靠桥接的优雅退出与退出监听收尾；工具子进程自己另起了进程组的，只是不再被这一轮占着，不会被杀到。
+- **`result` 文本**：`result` 事件的 `result` 字段是非空字符串才用，否则用已累积的文本，再没有才是空串（原来 `String(d.result ?? pending ?? '')`，`result` 是空串时把已累积的文本丢了）。
+- **畸形输出行**：一行解析出来不是普通对象（`null`、数字、数组……），或处理这一行时抛错，只跳过这一行并记 `[claude] 跳过一行无法处理的输出`（不含行内容），不再中断整轮。
+- **交给 claude 的环境变量去掉桥接自己的配置**：新增 `src/child-env.js`。`childEnv()` 去掉桥接自己的配置项（`.env.example` 里的全部键，加上 `src/`、`scripts/` 里读取的环境变量名）和所有 `FEISHU_*`，其余原样透传（`CLAUDE_CODE_OAUTH_TOKEN`、代理、`HOME`、`PATH`、`ANTHROPIC_*` 等）。
+  原来整份 `process.env` 递给 claude，模型一句 `env` 就能读到飞书 App Secret。用在 claude 的 spawn、启动自检的两次 CLI 检查和备用 bin 的 `--version`；飞书 MCP 的凭据本来就走 0600 临时 `mcp.json`，不靠继承。
+  新增配置项时，防漂移测试会在清单里没有归类的名字上变红并列出名字（只列名字，不含值）。
+- **会话不存在（未配置备用时）**：本轮没动过手、没被取消、调用方也没显式给非空 `resumeId`，而会话表里的 id 对应的会话已经没了（`No conversation found`）→ 不带 `--resume` 重试一次，日志一行 `[session] <会话键> 原会话已不存在，已开新会话`。
+  原来只有配了备用账号才这样处理，没配时这个会话键每一轮都报同一个错，要人发现后手动 `/new`。
+- **账号错误分类更准（`src/account-fallback.js`）**：按 `test/fixtures/claude-auth-signatures.js` 的文案补全登录故障（钥匙串不可写、无权访问 Claude、组织停用订阅访问、OAuth 不被允许、外部 auth token 无效……），
+  去掉裸的 `401` / `429`（「工单 WO-401」不再被当成登录失效），数字形态只认 `API Error: 401` / `API Error: 429`；stderr 里常混着 Bash / MCP / lark-cli 等别的工具的输出，只认强信号（额度用完、登录失效的固定话），不认 `rate limit` 与裸状态码。
+  两类信号同时出现时 auth 优先；网络类、临时刷新类错误仍不算账号问题。**这几条正则与另一个桥接的实现不再逐条一致**（这边改了、那边没改），文件头原来那句「改动要两边一起改」已改写，要同步得人工对照夹具。
+- 测试：新增 `test/claude-run.test.js`（假 claude 子进程驱动：重试 / 宽限 / 进程组 / 桥接退出清理 / 结果文本 / 畸形行 / 会话不存在，真进程、不联网）、`test/child-env.test.js`（清单与模板、`src/`、`scripts/` 的防漂移，纯函数，行为）、`test/account-classify.test.js`（夹具驱动 + 反例）；
+  `test/mcp-secret.test.js` 第 4 条由源码形状断言（匹配 `child.on('close'…cleanup()`）改成行为断言（真跑正常 / 错误 result / 启动失败三种收尾，数临时目录与清理次数）。
+
 ### owner 私聊目的地落盘（重启后定时任务立即恢复业务查询工具）
 
 - **问题**：owner 私聊的 chat_id 只记在内存里，桥接重启后、owner 没再私聊之前，「结果发 owner 私聊」的定时任务判不出目的地，没有 `mcp__biz__biz_get`（11/20 07:30 的定时任务因此报找不到工具）。
