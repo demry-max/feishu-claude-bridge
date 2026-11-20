@@ -144,6 +144,14 @@ function readJobs(dir, report = () => {}) {
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * BRIDGE-SEND-1：定时任务一次触发的发送逻辑键（只含哈希）。同一任务文件 + 同一应触发时间 → 同一个键；
+ * 因重启补跑是新的执行（结果可能不同），换键。
+ */
+export function schedSendKey(file, dueIso, resumed = false) {
+  return `sched:${crypto.createHash('sha256').update(`${file}\n${dueIso}\n${resumed ? 'resumed' : 'first'}`).digest('hex').slice(0, 32)}`;
+}
+
+/**
  * 一次 prompt 型任务的编排（依赖全部注入，index.js 的 onFire 只做接线）：
  *   缺 chat_id → 通知 owner、报失败（不调模型）；
  *   调模型（run）失败 → onRunFailure（现有的失败自诊断路径，不变）；
@@ -393,7 +401,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
       ...(lateOver ? { _late: lateMs, _lateOver: true } : {}),
       ...(resumed ? { _resumed: true } : {}),
     };
-    const ctx = { notifyOnce: (reason, text) => noticeOnce(`${file}|${reason}`, text) };
+    const ctx = { notifyOnce: (reason, text) => noticeOnce(`${file}|${reason}`, text), sendKey: schedSendKey(file, due.toISOString(), resumed) };
     const runOne = (async () => {
       let endStatus = 'done';
       try {
