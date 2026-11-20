@@ -107,6 +107,7 @@ function bridge(opts = {}) {
     shutdownGraceSec: () => graceSec,
     replyIfDraining,
     heartbeat: { isInflight: () => false, stop: () => { r.heartbeatStops += 1; } },
+    scheduler: { stop: () => {}, inflightCount: () => 0 },
     HEARTBEAT_KEY: 'sched:heartbeat', VERIFY_KEY: 'sched:verify',
     // 飞书出口
     client: {
@@ -1208,7 +1209,7 @@ describe('BRIDGE-MQ-1 源码断言（index.js 接线写法——只证明写法�
   test('优雅退出：onDrain 回「请重发」（心跳停失败也照发），inflight 计入未发完的通知', () => {
     const sd = cut('const shutdown = createShutdown({', '\n});');
     assert.ok(sd.includes('+ ownerQueue.inflight()'));
-    assert.ok(sd.includes('onDrain: () => { try { heartbeat.stop(); } finally { ownerQueue.flushForShutdown(); } },'));
+    assert.ok(sd.includes("onDrain: () => { try { scheduler.stop(); } catch (e) { console.error('[shutdown] 停定时任务调度出错:', e?.message ?? e); } try { heartbeat.stop(); } finally { ownerQueue.flushForShutdown(); } },"));
   });
 
   test('合并 prompt 照旧作为 runClaude 的 prompt 参数走 stdin，不拼进命令行', () => {
