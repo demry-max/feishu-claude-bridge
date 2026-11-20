@@ -211,7 +211,7 @@ describe('G4 已拒绝；G5 内容变了重新确认', () => {
       assert.equal(cand(a.h).state, 'rejected');
     } finally { a.h.stop(); env.cleanup(); }
   });
-  for (const [tag, ch] of [['提示词', { prompt: 'Q' }], ['时间', { when: '0 11 * * *' }], ['目的地', { chat_id: 'oc_ffffffffffffffffffff' }], ['动作', { action: 'set-model', prompt: undefined }]]) {
+  for (const [tag, ch] of [['提示词', { prompt: 'Q' }], ['时间', { when: '0 11 * * *' }], ['目的地', { chat_id: 'oc_ffffffffffffffffffff' }], ['动作', { action: 'set-model', prompt: undefined }], ['任务名', { name: '改名' }]]) {
     test(`改${tag}：回到待确认、换确认码、再通知一次；旧确认码在候选里已不存在`, async (t) => {
       quiet(t); mockClock(t);
       const env = mkEnv();
@@ -234,7 +234,7 @@ describe('G4 已拒绝；G5 内容变了重新确认', () => {
       } finally { a.h.stop(); env.cleanup(); }
     });
   }
-  test('model / effort / enabled 以外的无关字段变化不影响已确认', async (t) => {
+  test('prompt 型任务只改 model / effort 不影响已确认', async (t) => {
     quiet(t); mockClock(t);
     const env = mkEnv();
     env.write('a.json', jobOf());
@@ -242,9 +242,48 @@ describe('G4 已拒绝；G5 内容变了重新确认', () => {
     try {
       await settle();
       decide(a.h, 'approved');
-      env.write('a.json', jobOf({ model: 'x', effort: 'high', name: '改名' }));
+      env.write('a.json', jobOf({ model: 'x', effort: 'high' }));
       await adv(t, 30_000);
       assert.equal(cand(a.h).state, 'approved');
+      assert.equal(a.notes.length, 1, '没有再通知');
+    } finally { a.h.stop(); env.cleanup(); }
+  });
+});
+
+describe('G5b 已确认的任务只改名 / 动作型改参数：回到待确认、再通知、到点不跑', () => {
+  test('只改 name：待确认、通知第二次、到点不跑', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv();
+    env.write('a.json', jobOf());
+    const a = start(env);
+    try {
+      await settle();
+      const old = cand(a.h);
+      decide(a.h, 'approved');
+      env.write('a.json', jobOf({ name: '<at user_id="all"></at>改名' }));
+      await adv(t, 30_000);
+      const now = cand(a.h);
+      assert.equal(now.state, 'pending');
+      assert.notEqual(now.code, old.code);
+      assert.equal(a.notes.length, 2);
+      await adv(t, 60 * MIN);
+      assert.deepEqual(a.fired, []);
+    } finally { a.h.stop(); env.cleanup(); }
+  });
+  test('动作型任务改 model：待确认、到点不跑', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv();
+    env.write('a.json', jobOf({ action: 'set-model', prompt: undefined, model: 'm1' }));
+    const a = start(env);
+    try {
+      await settle();
+      decide(a.h, 'approved');
+      env.write('a.json', jobOf({ action: 'set-model', prompt: undefined, model: 'm2' }));
+      await adv(t, 30_000);
+      assert.equal(cand(a.h).state, 'pending');
+      assert.equal(a.notes.length, 2);
+      await adv(t, 60 * MIN);
+      assert.deepEqual(a.fired, []);
     } finally { a.h.stop(); env.cleanup(); }
   });
 });

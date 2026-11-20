@@ -18,10 +18,10 @@ import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-
 import { OWNER_TOOL_PROFILE, BIZ_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 import { schedDestOf } from './biz-wiring.js';
+import { tasksCommandReply, listPlain } from './sched-approval.js'; // BRIDGE-PRIV-2
 import { resolveTurn } from './turn-context.js'; // BRIDGE-PRIV-1：一轮的「身份 × 场合」只在入口算一次
 import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.js';
 import { OWNER_DM_FILE_NAME, loadOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
-import { tasksCommandReply } from './sched-approval.js'; // BRIDGE-PRIV-2
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -730,8 +730,8 @@ function describeTasks() {
       const stLabel = { baseline: '已登记', running: '执行中', done: '已完成', failed: '失败', 'skipped-late': '迟到跳过', 'skipped-busy': '等位超时跳过', interrupted: '被重启打断', 'skipped-pending': '确认前已过点，未执行' }[st] ?? '';
       const last = at ? `${new Date(at).toLocaleString('zh-CN')}${stLabel ? `（${stLabel}）` : ''}` : '（尚未触发）';
       const status = job.enabled === false ? '⏸ 已停用' : '▶️ 启用';
-      lines.push(`- ${status} **${job.name ?? f}** — \`${job.when}\``);
-      lines.push(`  上次：${last}${job.action ? ` ｜ 动作：${job.action}` : ''}`);
+      lines.push(`- ${status} **${listPlain(job.name ?? f)}** — \`${listPlain(job.when)}\``);
+      lines.push(`  上次：${last}${job.action ? ` ｜ 动作：${listPlain(job.action)}` : ''}`);
       const gate = job.enabled !== false ? scheduler.approvalOf?.({ ...job, _file: f }) : null;
       if (gate) {
         if (gate.state === 'pending') pendingN += 1;

@@ -39,21 +39,38 @@ const approvedFixture = (t) => {
 const reopen = (e, logs = []) => createApprovalStore({ file: e.file, keyFile: e.keyFile, log: (m) => logs.push(m) });
 
 describe('K1 哈希与确认码', () => {
-  test('四项任一变化 → 哈希和确认码都变；model / effort / enabled / name / last_run 不影响；文件名不同哈希不同', () => {
+  test('五项任一变化 → 哈希和确认码都变；prompt 型任务的 model / effort、enabled、last_run 不影响；文件名不同哈希不同', () => {
     const base = mkJob();
     const h0 = approvalHash(FILE, base);
     const c0 = approvalCode(FILE, h0);
-    for (const ch of [{ chat_id: 'oc_ffffffffffffffffffff' }, { when: '0 9 * * *' }, { prompt: 'Q' }, { action: 'set-model' }]) {
+    for (const ch of [{ chat_id: 'oc_ffffffffffffffffffff' }, { when: '0 9 * * *' }, { prompt: 'Q' }, { action: 'set-model' }, { name: '别的名' }]) {
       const j = mkJob(ch);
       assert.notEqual(approvalHash(FILE, j), h0, JSON.stringify(ch));
       assert.notEqual(approvalCode(FILE, approvalHash(FILE, j)), c0, JSON.stringify(ch));
     }
-    for (const ch of [{ model: 'x' }, { effort: 'high' }, { enabled: false }, { name: '别的名' }, { last_run: '2026-01-01' }]) {
+    for (const ch of [{ model: 'x' }, { effort: 'high' }, { exec_model: 'x' }, { enabled: false }, { last_run: '2026-01-01' }]) {
       assert.equal(approvalHash(FILE, mkJob(ch)), h0, JSON.stringify(ch));
     }
     assert.notEqual(approvalHash('b.json', base), h0);
     assert.match(c0, /^[0-9a-f]{6}$/);
-    assert.deepEqual(approvalFields({ chat_id: 'c' }), ['c', null, null, null]);
+    assert.deepEqual(approvalFields({ chat_id: 'c' }), ['c', null, null, null, null]);
+    assert.deepEqual(approvalFields({ chat_id: 'c', name: 'n', action: 'set-model', model: 'm' }), ['c', null, null, 'set-model', 'n', 'm', null, null, null]);
+  });
+  test('动作型任务：model / effort / exec_model / exec_effort 也进哈希；prompt 型不进', () => {
+    const act = mkJob({ action: 'set-model', prompt: undefined, model: 'm1', effort: 'low', exec_model: 'e1', exec_effort: 'low' });
+    const h0 = approvalHash(FILE, act);
+    for (const ch of [{ model: 'm2' }, { effort: 'high' }, { exec_model: 'e2' }, { exec_effort: 'high' }]) {
+      assert.notEqual(approvalHash(FILE, { ...act, ...ch }), h0, JSON.stringify(ch));
+    }
+    for (const ch of [{ enabled: false }, { last_run: 'x' }]) assert.equal(approvalHash(FILE, { ...act, ...ch }), h0, JSON.stringify(ch));
+    // undefined 与 null 等价
+    assert.equal(approvalHash(FILE, { ...act, exec_model: undefined }), approvalHash(FILE, { ...act, exec_model: null }));
+    const pj = mkJob({ model: 'm1', effort: 'low', exec_model: 'e1', exec_effort: 'low' });
+    const p0 = approvalHash(FILE, pj);
+    for (const ch of [{ model: 'm2' }, { effort: 'high' }, { exec_model: 'e2' }, { exec_effort: 'high' }]) {
+      assert.equal(approvalHash(FILE, { ...pj, ...ch }), p0, `prompt 型：${JSON.stringify(ch)}`);
+    }
+    assert.notEqual(approvalHash(FILE, { ...pj, name: '改名' }), p0, 'prompt 型改名要重新确认');
   });
   test('needsApproval 真值表', () => {
     assert.equal(needsApproval({ chat_id: CHAT }, false), true);
@@ -112,6 +129,40 @@ describe('K2 密钥', () => {
     assert.equal(e.store.decide(FILE, H, 'approved').persisted, false);
     assert.equal(e.store.lookup(FILE, H)?.decision, 'approved');
   });
+  test('密钥文件权限不是 0600（如从备份恢复成 0644）：读取时收紧成 0600、记一行日志（不含内容），密钥不变、原有记录仍有效', (t) => {
+    if (process.platform === 'win32') return t.skip('Windows 无 POSIX 权限位');
+    const e = approvedFixture(t);
+    const txt = fs.readFileSync(e.keyFile, 'utf8');
+    fs.chmodSync(e.keyFile, 0o644);
+    const logs = [];
+    const again = reopen(e, logs);
+    assert.equal(fs.statSync(e.keyFile).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(e.keyFile, 'utf8'), txt, '密钥没变');
+    assert.equal(again.lookup(FILE, H)?.decision, 'approved');
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /权限.*0600/);
+    assert.ok(!logs[0].includes(txt.trim()), '日志不含密钥');
+    // 已经是 0600 时不记
+    const quiet2 = [];
+    reopen(e, quiet2);
+    assert.deepEqual(quiet2, []);
+  });
+  test('收紧失败：按签名不可用处理——换内存新密钥，原有记录一律待确认，不用那把宽权限密钥', (t) => {
+    if (process.platform === 'win32') return t.skip('Windows 无 POSIX 权限位');
+    const e = approvedFixture(t);
+    const txt = fs.readFileSync(e.keyFile, 'utf8');
+    fs.chmodSync(e.keyFile, 0o644);
+    const orig = fs.chmodSync;
+    t.mock.method(fs, 'chmodSync', (f, m) => { if (f === e.keyFile) throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); return orig(f, m); });
+    const logs = [];
+    const again = reopen(e, logs);
+    assert.equal(again.lookup(FILE, H), null, '原记录不再有效');
+    assert.equal(again.invalidCount, 1);
+    assert.ok(logs.some((l) => l.includes('收紧') && !l.includes(txt.trim())));
+    // 本进程内新的确认仍可用
+    assert.equal(again.decide(FILE, H, 'approved').ok, true);
+    assert.equal(again.lookup(FILE, H)?.decision, 'approved');
+  });
   test('signParts / verifyParts 与记录字段无关，可复用；loadOrCreateKey 独立可用', (t) => {
     const k = loadOrCreateKey(path.join(mkDir(t), 'k'), { log: () => {} });
     const mac = signParts(k, ['x', 'y']);
@@ -158,6 +209,24 @@ describe('K3 记录读回与篡改', () => {
       assert.match(logs[0], new RegExp(`^\\[sched-approval\\] 确认记录里有 ${again.invalidCount} 条校验不通过，已按待确认处理$`));
     });
   }
+  test('mac 只改最后一位 / 第 32 个字符：verifyParts 为 false，读回 pending（防 MAC 被截短比较）', (t) => {
+    const flip = (m, i) => `${m.slice(0, i)}${m[i] === '0' ? '1' : '0'}${m.slice(i + 1)}`;
+    for (const i of [63, 31]) {
+      const e = mkStore(t);
+      e.store.decide(FILE, H, 'approved');
+      const d = readRecords(e.file);
+      const en = d.entries[FILE];
+      const key = fs.readFileSync(e.keyFile, 'utf8').trim();
+      const parts = ['v1', FILE, en.hash, en.decision, en.at];
+      assert.equal(verifyParts(key, parts, en.mac), true, '原 mac 合法');
+      en.mac = flip(en.mac, i);
+      assert.equal(verifyParts(key, parts, en.mac), false, `改第 ${i + 1} 个字符`);
+      fs.writeFileSync(e.file, JSON.stringify(d));
+      const again = reopen(e);
+      assert.equal(again.lookup(FILE, H), null, `改第 ${i + 1} 个字符`);
+      assert.equal(again.invalidCount, 1, `改第 ${i + 1} 个字符`);
+    }
+  });
   test('整份读不了：不是 JSON / 软链 / 超过 256KB / version 不对 / 格式不对 → 全部按待确认，只记一行（不含内容）', (t) => {
     const cases = {
       '不是 JSON': (e) => fs.writeFileSync(e.file, 'SECRET-CONTENT{{{'),
@@ -265,7 +334,7 @@ function run(text, { candidates = [cand()], store = fakeStore(), busy = 0 } = {}
   const reply = tasksCommandReply({ text, candidates, store, busy, log: (m) => logs.push(m) });
   return { reply, store, logs };
 }
-const P1 = '✅ 已确认定时任务「晨报」（发往会话 id 末 4 位 0123，时间 0 8 ＊ ＊ ＊）。之后按时执行；目的地 / 时间 / 提示词 / 动作再变会重新等你确认。';
+const P1 = '✅ 已确认定时任务「晨报」（发往会话 id 末 4 位 0123，时间 0 8 ＊ ＊ ＊）。之后按时执行；目的地 / 时间 / 提示词 / 动作 / 任务名再变会重新等你确认。';
 
 describe('C1–C8 tasksCommandReply（权限表 P1–P8）', () => {
   test('C1（P1）确认码确认：记已确认；一次性已过点追加一行；写盘失败追加一行；大小写不敏感', () => {
@@ -340,6 +409,15 @@ describe('C1–C8 tasksCommandReply（权限表 P1–P8）', () => {
     r = run('/tasks reject abc123', { candidates: [cand({ state: 'rejected' })] });
     assert.equal(r.reply, '「晨报」已经是已拒绝。');
     assert.equal(r.store.calls.length, 0);
+  });
+  test('decide 没记下来（ok:false，如任务文件名不合规）：不回「已确认 / 已拒绝」，说明仍待确认；日志不含 id', () => {
+    const bad = () => ({ calls: [], decide() { return { ok: false, persisted: false }; } });
+    let r = run('/tasks approve abc123', { store: bad() });
+    assert.equal(r.reply, '没能记下这次确认（任务文件名不合规），任务仍待确认。');
+    assert.ok(r.logs.every((l) => !l.includes('a.json') && !l.includes(H) && !l.includes('abc123') && !l.includes('确认了')), JSON.stringify(r.logs));
+    r = run('/tasks reject abc123', { store: bad() });
+    assert.equal(r.reply, '没能记下这次拒绝（任务文件名不合规），任务仍待确认、不会执行。');
+    assert.ok(r.logs.every((l) => !l.includes('a.json') && !l.includes('拒绝了')), JSON.stringify(r.logs));
   });
   test('回复里任务名经 plain 中和；日志不含 chat_id 与提示词', () => {
     const r = run('/tasks approve abc123', { candidates: [cand({ name: '<at id=all>[x](y)' })] });

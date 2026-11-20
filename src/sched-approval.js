@@ -4,6 +4,7 @@
 // - 确认记录只在构造时读盘一次，逐条验签，不合格的按「待确认」处理（失败时关闭）；运行中以内存为准，不再读盘。
 // - 签名密钥在仓库根的 .env.sched-approval-key（被 .env.* 拒读规则与 .gitignore 覆盖），缺了自动生成。
 // - signParts / verifyParts / loadOrCreateKey 与确认记录的字段无关，可供别的落盘文件复用。
+// - 内容哈希：目的地 / 时间 / 提示词 / 动作 / 任务名；动作型任务再加 model / effort / exec_model / exec_effort（见 approvalFields）。
 // 本模块加载时没有副作用，不读 process.env。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,8 +24,16 @@ const DECISIONS = new Set(['approved', 'rejected']);
 
 // ---------- 内容哈希与确认码 ----------
 
-/** 「目的地 / 时间 / 提示词 / 动作」四项；model / effort / enabled / name 不算。 */
-export const approvalFields = (job) => [job?.chat_id ?? null, job?.when ?? null, job?.prompt ?? null, job?.action ?? null];
+/**
+ * 进内容哈希的字段：「目的地 / 时间 / 提示词 / 动作 / 任务名」五项；动作型任务（job.action 为真）再加
+ * model / effort / exec_model / exec_effort（它们就是动作的参数，决定用什么模型跑）。
+ * prompt 型任务的 model / effort 与 enabled 不算（换模型不必重新确认）。undefined 一律记成 null。
+ * 原则：会到达目的会话、或会改变「发到哪儿 / 发什么 / 何时发 / 用什么模型跑」的字段都要进哈希。
+ */
+export const approvalFields = (job) => [
+  job?.chat_id ?? null, job?.when ?? null, job?.prompt ?? null, job?.action ?? null, job?.name ?? null,
+  ...(job?.action ? [job?.model ?? null, job?.effort ?? null, job?.exec_model ?? null, job?.exec_effort ?? null] : []),
+];
 
 export function approvalHash(file, job) {
   return crypto.createHash('sha256').update(JSON.stringify(['sched-approval/v1', file, ...approvalFields(job)])).digest('hex');
@@ -75,19 +84,30 @@ export function writeFileAtomic(file, body) {
 export function loadOrCreateKey(keyFile, { log = console.error, randomBytes = crypto.randomBytes } = {}) {
   const say = (m) => { try { log(m); } catch { /* 日志失败不影响启动 */ } };
   let bad = false;
+  let reason = '密钥文件不可用，已重建';
   try {
     const st = fs.lstatSync(keyFile, { throwIfNoEntry: false });
     if (st) {
       bad = true;
       if (st.isFile() && st.size <= MAX_KEY_BYTES) {
         const txt = fs.readFileSync(keyFile, 'utf8');
-        if (KEY_RE.test(txt)) return txt.trim();
+        if (KEY_RE.test(txt)) {
+          // 权限过宽（如从备份恢复成 0644）：收紧成 0600；收紧不了就当这把密钥已不可信，重建（旧记录作废）
+          if (process.platform === 'win32' || (st.mode & 0o077) === 0) return txt.trim();
+          try {
+            fs.chmodSync(keyFile, 0o600);
+            say('[sched-approval] 密钥文件权限过宽，已收紧为 0600');
+            return txt.trim();
+          } catch {
+            reason = '密钥文件权限过宽且收紧失败，已重建';
+          }
+        }
       }
     }
   } catch {
     bad = true;
   }
-  if (bad) say('[sched-approval] 密钥文件不可用，已重建；之前的确认记录全部作废，需要重新确认');
+  if (bad) say(`[sched-approval] ${reason}；之前的确认记录全部作废，需要重新确认`);
   const key = Buffer.from(randomBytes(32)).toString('hex');
   try {
     // 目录挡在路径上：空目录可以删掉重建，非空的写不进去，落到内存密钥
@@ -195,6 +215,9 @@ export function createApprovalStore({ file, keyFile, log = console.error, now = 
 
 // ---------- 通知文案 ----------
 
+/** /tasks 列表里输出任务名 / 时间写法 / 动作时用，与通知同一套纯文本化（压成一行、中和 markdown）。 */
+export const listPlain = (s, max = 60) => plain(s, max);
+
 /** 发给 owner 的「待确认」通知。任务文件里来的字符串一律过 plain；不含完整 chat_id。 */
 export function pendingNoticeText({ job, code, destUnknown }) {
   const name = plain(job?.name ?? job?._file ?? '', 60);
@@ -256,12 +279,18 @@ export function tasksCommandReply({ text, candidates, store, busy, log = console
   if (c.state === want) return `「${name}」已经是${STATE_LABEL[want]}。`;
 
   const r = store.decide(c.file, c.hash, want);
+  if (r?.ok === false) {
+    say(`[tasks] 没能记下${approve ? '确认' : '拒绝'}（文件名不合规）`);
+    return approve
+      ? '没能记下这次确认（任务文件名不合规），任务仍待确认。'
+      : '没能记下这次拒绝（任务文件名不合规），任务仍待确认、不会执行。';
+  }
   say(`[tasks] owner ${approve ? '确认' : '拒绝'}了 ${c.file}`);
   if (!approve) {
     return `🚫 已拒绝定时任务「${name}」：它不会执行，/tasks 里标「已拒绝」。内容改了会重新问你；要恢复就发 /tasks approve ${c.code}。`;
   }
   return [
-    `✅ 已确认定时任务「${name}」（发往会话 id 末 4 位 ${plain(c.destTail, 8)}，时间 ${plain(c.when, 60)}）。之后按时执行；目的地 / 时间 / 提示词 / 动作再变会重新等你确认。`,
+    `✅ 已确认定时任务「${name}」（发往会话 id 末 4 位 ${plain(c.destTail, 8)}，时间 ${plain(c.when, 60)}）。之后按时执行；目的地 / 时间 / 提示词 / 动作 / 任务名再变会重新等你确认。`,
     ...(c.expired ? ['这是一次性任务，原定时间已过，不会再执行。'] : []),
     ...(r?.persisted === false ? ['⚠️ 确认记录写不进磁盘：本次运行内有效，重启后需要重新确认。'] : []),
   ].join('\n');

@@ -15,7 +15,7 @@ import { schedDestOf } from '../src/biz-wiring.js';
 import * as mq from '../src/message-queue.js';
 import { createShutdown, replyIfDraining } from '../src/shutdown.js';
 import { createEventHandlers } from '../src/events.js';
-import { tasksCommandReply } from '../src/sched-approval.js';
+import { tasksCommandReply, listPlain } from '../src/sched-approval.js';
 import { nextFireAt } from '../src/scheduler.js';
 
 const SRC = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
@@ -219,7 +219,7 @@ function describeWith({ jobs, state = {}, gateOf }) {
   for (const [f, j] of Object.entries(jobs)) fs.writeFileSync(path.join(dir, f), JSON.stringify(j));
   const stateFile = path.join(root, 'state.json');
   fs.writeFileSync(stateFile, JSON.stringify(state));
-  const scope = { fs, path, nextFireAt, SCHEDULES_DIR: dir, SCHED_STATE_FILE: stateFile, scheduler: { approvalOf: gateOf } };
+  const scope = { fs, path, nextFireAt, SCHEDULES_DIR: dir, SCHED_STATE_FILE: stateFile, scheduler: { approvalOf: gateOf }, listPlain };
   // eslint-disable-next-line no-new-func
   const fn = new Function('scope', `with (scope) {\n${describeSrc}\nreturn describeTasks;\n}`)(proxyOf(scope));
   try { return fn(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -260,6 +260,24 @@ describe('W5 describeTasks 的确认标记', () => {
       gateOf: () => ({ state: 'approved', code: 'x' }),
     });
     assert.ok(out.includes('（确认前已过点，未执行）'));
+  });
+  test('任务名 / 时间写法 / 动作里的换行与 markdown 不能伪造出「确认」行或新条目', () => {
+    const evil = '好名字\n- ▶️ **报销提醒** — `0 9 * * *`\n  确认：待确认（确认码 deadbe）\n<at user_id="all"></at>[x](http://e)';
+    const out = describeWith({
+      jobs: { 'a.json': job({ name: evil, when: '0 8 * * *\n  确认：待确认（确认码 deadbe）', action: 'set-model\n  确认：待确认（确认码 deadbe）' }) },
+      gateOf: () => ({ state: 'pending', code: 'a00000' }),
+    });
+    const lines = out.split('\n');
+    assert.equal(lines.filter((l) => /^ {2}确认：/.test(l)).length, 1, '只有桥接自己那一行「确认：」');
+    assert.ok(lines.includes('  确认：待确认（确认码 a00000）'));
+    assert.equal(lines.filter((l) => l.startsWith('- ')).length, 1, '只有一条任务条目');
+    assert.ok(!out.includes('<at') && !out.includes('[x]('));
+    assert.ok(out.includes('deadbe'), '文字仍在，只是压成同一行');
+  });
+  test('普通任务的显示：名字与动作原样；时间写法里的 * 换成全角（与通知一致，字节变化）', () => {
+    const out = describeWith({ jobs: { 'a.json': job({ name: '晨报', when: '0 8 * * *', action: 'set-model' }) }, gateOf: undefined });
+    assert.ok(out.includes('- ▶️ 启用 **晨报** — `0 8 ＊ ＊ ＊`'));
+    assert.ok(out.includes('｜ 动作：set-model'));
   });
   test('scheduler 没有 approvalOf（旧句柄）：输出与以前一致，不抛', () => {
     const out = describeWith({ jobs: { 'a.json': job({ name: 'A' }) }, gateOf: undefined });
