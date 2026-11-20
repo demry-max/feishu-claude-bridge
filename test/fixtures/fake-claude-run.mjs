@@ -13,11 +13,21 @@
 //   hang        事件写完后不退出（上限 hangMs，默认 60 秒，防测试漏收尸）
 //   exit        退出码（默认 0）
 //
+// 锚点：环境变量 FAKE_ANCHOR_PID 是测试文件进程的 pid（run-helpers 的 sandboxEnv 设）。本进程每 500 毫秒探一次它，
+// 只在报 ESRCH（锚点已不存在）时退出，这样测试被中断 / 被杀后不会留下假 CLI 与孙进程。没有这个变量时不做任何事。
+//
 // 只把环境变量的「键名」写进 FAKE_LOG，从不写值。
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 
 const argv = process.argv.slice(2);
+
+const anchor = Number(process.env.FAKE_ANCHOR_PID);
+if (Number.isInteger(anchor) && anchor > 1) {
+  setInterval(() => {
+    try { process.kill(anchor, 0); } catch (e) { if (e?.code === 'ESRCH') process.exit(0); } // EPERM：还活着
+  }, 500).unref();
+}
 
 if (argv[0] === '--version') {
   console.log('2.1.999 (fake)');
@@ -51,7 +61,12 @@ function run() {
   process.stdin.resume();
   process.stdin.on('data', () => {});
   process.stdin.on('error', () => {});
-  if (plan.ignoreTerm) process.on('SIGTERM', () => {});
+  if (plan.ignoreTerm) {
+    process.on('SIGTERM', () => {});
+    // 「杀不动的进程」：读端没了也不该自己死（否则 EPIPE 会让它在 SIGTERM 之后自己退出）
+    process.stdout.on('error', () => {});
+    process.stderr.on('error', () => {});
+  }
   setTimeout(() => go(plan), plan.delayMs ?? 0);
 }
 
@@ -62,6 +77,8 @@ function writeEvents(events) {
 }
 
 function go(plan) {
+  let grandPidfile = null;
+  let grandPid = null;
   if (plan.grandchild) {
     const g = plan.grandchild;
     const gc = spawn(process.execPath, [process.argv[1], '--gc', String(g.sec ?? 30)], {
@@ -69,9 +86,12 @@ function go(plan) {
       detached: Boolean(g.detached),
     });
     gc.unref(); // 孙进程不拖住本进程的事件循环
-    if (g.pidfile) fs.writeFileSync(g.pidfile, String(gc.pid));
+    grandPidfile = g.pidfile;
+    grandPid = gc.pid;
   }
   writeEvents(plan.events ?? []);
+  // pid 文件最后写：它一出现，事件行就已经进了管道（reap-driver 见到它就打 READY，随后被 SIGKILL）
+  if (grandPidfile) fs.writeFileSync(grandPidfile, String(grandPid));
   if (plan.stderr) process.stderr.write(plan.stderr);
   if (plan.lateEvents) {
     // 先静默一阵再补一批事件（测「已发出终止信号、结果却在之后才到」）

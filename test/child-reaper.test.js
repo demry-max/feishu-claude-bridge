@@ -131,11 +131,28 @@ describe('B1–B6 真进程：上一代被强杀之后的清理', { skip: IS_WIN
       if (!(await orphaned(t, childPid))) return;
 
       const lines = logSink();
-      const t0 = Date.now();
-      const r = nextGeneration(registryFileOf(sb), lines).reapPrevious({ log: lines, escalateMs: 500 });
-      const took = Date.now() - t0;
+      const calls = []; // [target, sig]
+      const sleeps = []; // 注入的睡眠毫秒数（用它算「等满 escalateMs」，不看墙钟）
+      const kill = (target, sig) => { calls.push([target, sig]); return process.kill(target, sig); };
+      const sleepSync = (ms) => {
+        sleeps.push(ms);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      };
+      const r = nextGeneration(registryFileOf(sb), lines).reapPrevious({ log: lines, escalateMs: 500, pollMs: 100, kill, sleepSync });
       assert.deepEqual(r, { killed: 1, dropped: 0, unreadable: false });
-      assert.ok(took >= 400, `SIGTERM 杀不掉它，所以要等满 escalateMs 才补刀（实际 ${took}ms）`);
+      assert.deepEqual(
+        calls.filter(([, sig]) => sig !== 0),
+        [[-childPid, 'SIGTERM'], [-childPid, 'SIGKILL']],
+        'SIGTERM 杀不掉它，所以之后要补一发 SIGKILL（信号序列恰为这两发）',
+      );
+      const iTerm = calls.findIndex(([, sig]) => sig === 'SIGTERM');
+      const iKill = calls.findIndex(([, sig]) => sig === 'SIGKILL');
+      assert.ok(
+        calls.slice(iTerm + 1, iKill).some(([target, sig]) => target === -childPid && sig === 0),
+        'SIGTERM 与 SIGKILL 之间至少探活过一次，组在 SIGTERM 之后仍在',
+      );
+      const slept = sleeps.reduce((a, b) => a + b, 0);
+      assert.ok(slept >= 500, `要等满 escalateMs 才补刀（注入的睡眠合计 ${slept}ms）`);
       assert.deepEqual(await waitGone([childPid, grandchildPid], 3000), [], 'SIGKILL 之后整组都没了');
     });
   });

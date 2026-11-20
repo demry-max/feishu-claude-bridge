@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "node --test --test-concurrency=4 test/*.test.js",
     "start": "node src/index.js",
     "register": "node scripts/register.js",
     "install-service": "node scripts/install-service.js",
