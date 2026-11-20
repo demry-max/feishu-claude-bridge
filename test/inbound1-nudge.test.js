@@ -117,10 +117,12 @@ describe('第 3 项 固化提醒按轮绑定', () => {
     try {
       await primed(m, 'oc_n14');
       assert.equal(m.consumeMemoryNudge('oc_n14'), true);
-      SB.plan(okPlan(5000, { delayMs: 500 }));
+      // 一次设好两条计划：假 CLI 每启动一次按顺序领走一条（最后一条一直用）。带标记那轮先起，一定领到第一条（成功、慢 500 ms）
+      SB.plan(okPlan(5000, { delayMs: 500 }), { events: [init(), errResult('boom')], exit: 1 });
       const tagged = m.runClaude('oc_n14', 'R2 带提醒', true, [], null, MARK);
-      await sleep(150); // 带标记的那次已起跑（假 CLI 已领走上面的计划）
-      SB.plan({ events: [init(), errResult('boom')], exit: 1 });
+      // 轮询等带标记那次的子进程真的起来了，再起不带标记的那次（不靠固定 sleep，机器再慢也不会抢到第一条计划）
+      for (let i = 0; i < 500 && SB.spawns().length < 1; i++) await sleep(10);
+      assert.ok(SB.spawns().length >= 1, '带标记的那次在 5 秒内起跑');
       const plain = await settle(within(m.runClaude('oc_n14', '同会话普通轮', true, [], null), 15_000)); // 两次调用同一会话键并发：假 CLI 不拦，runClaude 本身不串行
       assert.equal(plain.ok, false, '不带标记的那次失败');
       assert.equal(cap.lines.filter((l) => l.includes(NOTICE)).length, 0, '不带标记的失败不重排提醒（src/claude.js 失败出口只对 carriesNudge）');

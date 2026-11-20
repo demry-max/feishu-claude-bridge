@@ -151,6 +151,43 @@ describe('B 机器人自身 open_id 共用查询', () => {
     assert.equal(errs.length, 0);
   });
 
+  // 测试自己的上限必须用真计时器：beforeEach 里把 ≥1000 ms 的 setTimeout 改成了 0
+  const within = (p, ms, label) => new Promise((resolve, reject) => {
+    const t = realSetTimeout(() => reject(new Error(`超过 ${ms}ms 仍未落定：${label}`)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+  const hang = () => new Promise(() => {});
+
+  test('B7 取机器人 id 的请求永不返回：入口查询有限时间内返回 null、请求 3 次、失败计 1；再查发新请求；恢复后取到 id、计数清零', async () => {
+    let calls = 0; let hung = true;
+    const c = { request() { calls++; return hung ? hang() : ok(); } };
+    assert.equal(await within(lookupBotOpenId(c, { entry: true }), 5000, 'B7 第一次入口查询'), null);
+    assert.equal(calls, 3, '首次 + 重试 2 次');
+    assert.equal(botIdFailureCount(c), 1);
+    assert.ok(logs.some((l) => l.includes('网络失败（ETIMEDOUT）')), 'withRetry 现有的重试日志照旧');
+    // 紧接着再查：不复用挂住的那个，发出新请求
+    assert.equal(await within(lookupBotOpenId(c, { entry: true }), 5000, 'B7 第二次入口查询'), null);
+    assert.equal(calls, 6, '第二次入口查询又发了 3 次新请求');
+    assert.equal(botIdFailureCount(c), 2);
+    hung = false;
+    assert.equal(await within(lookupBotOpenId(c, { entry: true }), 5000, 'B7 恢复后'), BOT);
+    assert.equal(calls, 7);
+    assert.equal(botIdFailureCount(c), 0);
+  });
+
+  test('B7b buildPrompt 一侧遇到挂住的请求：有限时间内结束，prompt 照常生成（不保留 @ 人名），60 秒闸照设', async () => {
+    let calls = 0;
+    const c = { request() { calls++; return hang(); } };
+    const r = await within(buildPrompt(c, textMsg(), ws), 5000, 'B7b buildPrompt');
+    assert.equal(r.prompt, '请通知');
+    assert.equal(calls, 3);
+    assert.equal(botIdFailureCount(c), 1);
+    await within(buildPrompt(c, textMsg(), ws), 5000, 'B7b buildPrompt 闸内');
+    assert.equal(calls, 3, '闸内 buildPrompt 一侧不再查');
+    assert.equal(await within(lookupBotOpenId(c, { entry: true }), 5000, 'B7b 入口'), null);
+    assert.equal(calls, 6, '入口无视闸，发新请求');
+  });
+
   async function startupText(botIdStartupMissing) {
     const src = cutBetween('async function announceStartup() {', '\n}\n');
     const sent = [];

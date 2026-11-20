@@ -218,6 +218,19 @@ function stripMentions(text, mentions = null, botId = null) {
 // （BRIDGE-INBOUND-1：入口取不到 id 时群消息整条被丢，不能再等 60 秒）。两侧共用这一份查询与缓存。
 // 查询本身对网络类失败有界重试（再试 2 次，间隔 1s / 3s）；非网络类失败不重试。
 const BOT_ID_RETRY_MS = 60_000;
+// 单次请求上限：SDK 的 HTTP 请求默认没有超时，挂住的请求会让共用同一份在途查询的所有群 @ 一直等到重启。
+// 到时当作网络类失败（code ETIMEDOUT），交给 withRetry 再试；挂住的原请求取消不了，放着不管，只清自己的计时器。
+// 最坏总等待 ≈ 3 次 × 3 s 上限 + 退避 1 s + 3 s = 13 s。
+const BOT_ID_REQUEST_TIMEOUT_MS = 3000;
+const requestWithTimeout = (client) => new Promise((resolve, reject) => {
+  const timer = setTimeout(
+    () => reject(Object.assign(new Error(`请求机器人信息超过 ${BOT_ID_REQUEST_TIMEOUT_MS} ms 没有返回`), { code: 'ETIMEDOUT' })),
+    BOT_ID_REQUEST_TIMEOUT_MS,
+  );
+  let p;
+  try { p = Promise.resolve(client.request({ method: 'GET', url: '/open-apis/bot/v3/info' })); } catch (e) { p = Promise.reject(e); }
+  p.then((v) => { clearTimeout(timer); resolve(v); }, (e) => { clearTimeout(timer); reject(e); });
+});
 const botIdState = new WeakMap();
 const botIdStateOf = (client) => {
   let st = botIdState.get(client);
@@ -237,7 +250,7 @@ export async function lookupBotOpenId(client, { entry = false } = {}) {
     // 否则已完成的 promise 会被写回 st.pending，之后的重试永远 return 它。
     await null;
     try {
-      const res = await withRetry('bot', () => client.request({ method: 'GET', url: '/open-apis/bot/v3/info' }));
+      const res = await withRetry('bot', () => requestWithTimeout(client));
       st.id = res?.bot?.open_id ?? null;
       if (!st.id) throw new Error('接口没有返回 bot.open_id');
       st.failures = 0;
