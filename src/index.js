@@ -298,7 +298,8 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       return;
     }
     console.log(`[owner] 已锁定 owner open_id = ${owner}`);
-    await replyDone(
+    await reply(
+      message.message_id,
       `✅ 已将你登记为本机器人 owner（open_id: \`${owner}\`）。\n直接发消息即可对话；发送 **/new** 开启新会话，**/status** 查看会话状态。`
     );
     return;
@@ -408,7 +409,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   if (isOwner && message.chat_type === 'p2p' && message.parent_id) {
     const shortcut = await heartbeatReplyShortcut({ message, isOwner, heartbeat });
     if (shortcut?.reply) {
-      await replyDone(shortcut.reply); // 台账已经回写
+      await reply(message.message_id, shortcut.reply);
       return;
     }
     ledgerHint = shortcut?.hint ?? '';
@@ -486,7 +487,8 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       const next = EFFORT_LEVELS.includes(first)
         ? setRuntimeConfig({ effort: first })
         : setRuntimeConfig({ model: args[0], effort: args[1] });
-      await replyDone(
+      await reply(
+        message.message_id,
         `✅ 已切换：模型 \`${next.model || 'CLI 默认'}\`，思考深度 \`${next.effort || 'CLI 默认'}\`\n下一条消息即生效（无需重启）。`
       );
     } catch (e) {

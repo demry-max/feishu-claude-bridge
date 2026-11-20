@@ -257,11 +257,7 @@ describe('C 命令已生效、回复失败：不抛、记一行日志、兜底�
     assert.ok(r.voice.has(DM_CHAT)); noPrompt(r); noted(r);
     await r.send('/voice off'); assert.ok(!r.voice.has(DM_CHAT)); noPrompt(r);
   });
-  test('C4 /model <模型> 与 /model exec：已切换；回复失败后不再发第二条「⚠️」', async () => {
-    const r = cmdBridge(); await r.send('/model fable');
-    assert.ok(r.effects.some((e) => e.startsWith('runtime:'))); noPrompt(r); noted(r);
-    assert.equal(r.attempts.length, 1, '只试了一次回复，没有落到 catch 里再发 ⚠️');
-    const r2 = cmdBridge(); await r2.send('/model high'); noPrompt(r2); assert.equal(r2.attempts.length, 1);
+  test('C4 /model exec：已切换，回复失败不叫重发、不再发第二条「⚠️」', async () => {
     const r3 = cmdBridge(); await r3.send('/model exec sonnet');
     assert.ok(r3.effects.some((e) => e.startsWith('runtime:'))); noPrompt(r3); noted(r3); assert.equal(r3.attempts.length, 1);
   });
@@ -281,14 +277,22 @@ describe('C 命令已生效、回复失败：不抛、记一行日志、兜底�
     await r.send('/session rotate');
     assert.deepEqual(r.effects, ['daily:/session rotate']); noPrompt(r); noted(r);
   });
-  test('C8 引用回复心跳的快捷操作：台账已回写，不叫重发', async () => {
+  // 下面三条是「未修」的现状钉子：这三处的回复字面被既有测试钉住（events.test.js 引用回复块 / inbound1-strip.test.js S4b / owner-dm-store.test.js），
+  // 本返工书没有授权改那些测试，所以仍是 `await reply(...)`——命令生效后回复失败会抛到兜底，用户会看到「请再发一次」。记在交付报告的 Open questions。
+  // 谁修了这三处，这三条会变红，到时把它们改成 noPrompt + noted。
+  test('C8 〔未修·现状〕引用回复心跳的快捷操作：台账已回写，回复失败仍抛到兜底', async () => {
     const r = cmdBridge(); await r.send('知道了', { parent: 'om_hb' });
-    assert.deepEqual(r.effects, ['shortcut']); noPrompt(r); noted(r);
+    assert.deepEqual(r.effects, ['shortcut']); assert.equal(r.guardReplies.length, 1); assert.equal(r.guardReplies[0][1], FIXED);
   });
-  test('C9 首个私聊者认领 owner：已登记，不叫重发', async () => {
+  test('C9 〔未修·现状〕首个私聊者认领 owner：已登记，回复失败仍抛到兜底', async () => {
     const r = cmdBridge({ env: { ALLOW_OWNER_CLAIM: 'true' }, owner: '' });
     await r.send('你好');
-    assert.deepEqual(r.effects, ['saveOwner']); noPrompt(r); noted(r);
+    assert.deepEqual(r.effects, ['saveOwner']); assert.equal(r.guardReplies.length, 1); assert.equal(r.guardReplies[0][1], FIXED);
+  });
+  test('C9b 〔未修·现状〕/model <模型>、/model <思考档>：已切换，回复失败仍抛到兜底', async () => {
+    const r = cmdBridge(); await r.send('/model fable');
+    assert.ok(r.effects.some((e) => e.startsWith('runtime:'))); assert.equal(r.guardReplies.length, 1);
+    const r2 = cmdBridge(); await r2.send('/model high'); assert.equal(r2.guardReplies.length, 1);
   });
   test('C10 日志不含正文 / 路径 / 完整 id', async () => {
     const r = cmdBridge(); await r.send('/new');
