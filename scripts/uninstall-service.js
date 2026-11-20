@@ -17,8 +17,15 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** label 来自哪里（只说来源，不打印 .env 里别的值） */
 function labelSource(root, env) {
+  // 与 planUninstall 合并 label 的口径一致：shell 里有该键且非空才算 shell；空串不算，会盖住 .env 的值
   if (env.LAUNCHD_LABEL) return 'shell 环境变量 LAUNCHD_LABEL';
-  if (readEnvFile(root).values.LAUNCHD_LABEL) return '.env 的 LAUNCHD_LABEL';
+  const fromEnvFile = readEnvFile(root).values.LAUNCHD_LABEL;
+  if (fromEnvFile) {
+    if (Object.hasOwn(env, 'LAUNCHD_LABEL')) {
+      return '默认（com.<用户名>.feishu-claude-bridge；shell 里的 LAUNCHD_LABEL 是空串，盖住了 .env 的值）';
+    }
+    return '.env 的 LAUNCHD_LABEL';
+  }
   return '默认（com.<用户名>.feishu-claude-bridge）';
 }
 

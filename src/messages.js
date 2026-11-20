@@ -64,6 +64,23 @@ async function withRetry(label, fn, attempts = 2) {
 }
 
 /**
+ * 把文本里的本机绝对路径换成固定占位 <本机路径>：POSIX（/…）、~/…、Windows 盘符路径，
+ * 含单 / 双引号括起、带空格或中文的路径。网址（https://…）、错误码、不含路径的文本逐字不变。
+ */
+export const LOCAL_PATH_PLACEHOLDER = '<本机路径>';
+export function stripLocalPaths(text) {
+  let out = String(text ?? '');
+  // 引号括起的路径：引号内可含空格 / 中文；只在引号内以 / ~/ 或盘符开头时才算路径
+  out = out.replace(/(['"`])((?:~\/|\/|[A-Za-z]:[\\/])[^'"`\n]*)\1/g, `$1${LOCAL_PATH_PLACEHOLDER}$1`);
+  // 裸路径：前面是行首 / 空白 / 括号 / 冒号等（不是 URL 里的 // 或词中的 /），一直到空白或常见收尾符
+  out = out.replace(/(^|[\s(\[{,;=:：（])((?:~\/|\/(?!\/)|[A-Za-z]:[\\/])[^\s'"`)\]},;，；）]*)/g, (m, pre, p) => {
+    if (pre === ':' && /^\/\//.test(p)) return m;
+    return `${pre}${LOCAL_PATH_PLACEHOLDER}`;
+  });
+  return out;
+}
+
+/**
  * 从错误里提取「人能看懂且能据此行动」的描述。
  * 飞书 SDK 的 AxiosError 常常 message 为空，直接 ?? 出来是一片空白——
  * 用户看到的就是「处理该消息失败：」后面什么都没有。
@@ -78,18 +95,18 @@ export function describeError(e) {
   if (isTransientNetworkError(e)) {
     return {
       kind: 'network',
-      text: `网络暂时不可达（${code || msg || '连接失败'}）`,
+      text: stripLocalPaths(`网络暂时不可达（${code || msg || '连接失败'}）`),
       hint: '这通常是临时的，请重发一次。',
     };
   }
   if (apiCode || status === 403 || status === 401) {
     return {
       kind: 'permission',
-      text: `飞书接口返回错误${apiCode ? ` ${apiCode}` : ''}${apiMsg ? `：${apiMsg}` : status ? `（HTTP ${status}）` : ''}`,
+      text: stripLocalPaths(`飞书接口返回错误${apiCode ? ` ${apiCode}` : ''}${apiMsg ? `：${apiMsg}` : status ? `（HTTP ${status}）` : ''}`),
       hint: '若是图片/文件，请确认应用已开通 im:resource 权限并发布版本。',
     };
   }
-  return { kind: 'unknown', text: msg || code || String(e).slice(0, 200) || '未知错误', hint: '' };
+  return { kind: 'unknown', text: stripLocalPaths(msg || code || String(e).slice(0, 200) || '未知错误'), hint: '' };
 }
 
 function safeParse(json) {
@@ -189,6 +206,9 @@ async function lookupBotOpenId(client) {
   if (st.pending) return st.pending;
   if (Date.now() < st.retryAt) return null;
   st.pending = (async () => {
+    // 先让出一次：client.request 同步抛错时，finally 也要等到 st.pending 赋值之后才跑，
+    // 否则已完成的 promise 会被写回 st.pending，之后的重试永远 return 它。
+    await null;
     try {
       const res = await client.request({ method: 'GET', url: '/open-apis/bot/v3/info' });
       st.id = res?.bot?.open_id ?? null;
