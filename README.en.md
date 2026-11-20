@@ -280,7 +280,7 @@ workspace/
 Things you hand off to the bot ("keep an eye on the quote by Friday", "tell me when they reply") are recorded in `workspace/tasks/<slug>.json`, one file per item.
 Only items the owner hands off are recorded; it doesn't take over your calendar. The heartbeat ticks every `HEARTBEAT_INTERVAL_MIN` minutes:
 
-1. A script reads the ledger first: broken files, invalid fields, symlinks and macOS `._` shadow files are skipped and logged, never crashing;
+1. A script reads the ledger first: broken files, invalid fields, symlinks and macOS `._` shadow files are skipped and logged, never crashing; `notes` longer than 300 characters are read as their first 300 characters instead of invalidating the whole item, and the owner is notified once;
 2. No due items (`status` is open/waiting and `next_check_at` has arrived or `escalate_after` has passed) and nothing new from external increments → one log line, **no model call**;
 3. Due items → one model call (`HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT`, no session resume, no intermediate progress) whose prompt contains only the due items,
    with title/notes in the untrusted fence; the model edits the ledger to move things along; if the previous tick is still running, this tick is skipped.

@@ -119,7 +119,13 @@ function readJobs(dir, report = () => {}) {
     if (!f.endsWith('.json') || f.startsWith('._')) continue; // 跳过 exFAT 的 AppleDouble 影子文件
     try {
       const raw = fs.readFileSync(path.join(dir, f), 'utf8');
-      const job = JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      // 下划线开头的键是桥接内部标志（_resumed / _lateOver / _late…），任务文件里写的一律不要，免得影响标题前缀等行为。
+      // 读入时新建对象丢掉它们；null / 数组 / 原始值走原路径（后面照旧报错或跳过）
+      let job = parsed;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        job = Object.fromEntries(Object.entries(parsed).filter(([k]) => !k.startsWith('_')));
+      }
       job._file = f;
       if (job.enabled === false || !job.when) continue;
       // BRIDGE-PRIV-1：chat_id 决定回答发往哪、跑在哪一档。写法不是飞书会话 id（oc_ 开头的小写字母数字）的任务不执行，
@@ -597,7 +603,8 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
         if (inflight.size >= MAX_CONCURRENT) {
           const dueIso = due.toISOString();
           let w = waits.get(file);
-          if (!w || w.dueIso !== dueIso) { w = { dueIso, since: Date.now() }; waits.set(file, w); }
+          const startedWaiting = !w || w.dueIso !== dueIso;
+          if (startedWaiting) { w = { dueIso, since: Date.now() }; waits.set(file, w); }
           if (Date.now() - w.since > MAX_LATE_MS) {
             waits.delete(file);
             markFired(file, dueIso, { when: job.when, status: 'skipped-busy' });
@@ -608,7 +615,8 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
             );
             continue;
           }
-          console.log(`[sched] 并发已满（${MAX_CONCURRENT}），「${nameOf(job)}」下一轮再试`);
+          // 同一次等位只记开始那一拍，免得每 30 秒一行
+          if (startedWaiting) console.log(`[sched] 并发已满（${MAX_CONCURRENT}），「${nameOf(job)}」下一轮再试`);
           continue;
         }
         waits.delete(file);

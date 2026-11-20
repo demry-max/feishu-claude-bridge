@@ -337,8 +337,10 @@ export function loadTasks(tasksDir, { log = console.log } = {}) {
     names = fs.readdirSync(tasksDir);
   } catch (e) {
     if (e?.code === 'ENOENT') return { tasks: [], invalid: [] };
-    log(`[heartbeat] 读不了台账目录（${e?.code ?? errText(e)}），本拍不处理台账、保留上次的记录`);
-    return { tasks: [], invalid: [], unreadable: true };
+    // 只用安全的错误码（没有 code 的错误文本可能带本机路径），与 loadState 同一规则
+    const code = /^[A-Z][A-Z0-9_]{1,23}$/.test(String(e?.code)) ? e.code : 'UNKNOWN';
+    log(`[heartbeat] 读不了台账目录（${code}），本拍不处理台账、保留上次的记录`);
+    return { tasks: [], invalid: [], unreadable: true, code };
   }
   const tasks = [];
   const invalid = [];
@@ -625,9 +627,10 @@ export function createHeartbeat(deps) {
   let writeFault = null; // { code, notified }：本次写不进去的故障；persist 恢复成功就清掉（再坏再通知一次）
   // BRIDGE-HBSTATE-1：状态文件读不出来（非 ENOENT、非损坏）得到的空壳：beatOnce / digestNow 见到就整拍跳过，不碰盘
   const unreadableStates = new WeakSet();
+  let ledgerFault = null; // { code, notified }：台账目录读不了的故障（只看 beatOnce 主读取；读得出含 ENOENT 就清掉；进程内）
   let readFault = null; // { code, notified }：本次读不出来的故障；repair 读成功（或 ENOENT）就清掉（再坏再通知一次）
 
-  function loadState(d, { repair = true } = {}) {
+  function loadState(d, { repair = true, digest = false } = {}) {
     let text;
     if (unpersisted !== null) {
       text = unpersisted; // 与「写进去了再读回来」同形：照常走下面的校验与翻日
@@ -642,8 +645,14 @@ export function createHeartbeat(deps) {
         }
         const code = /^[A-Z][A-Z0-9_]{1,23}$/.test(String(e?.code)) ? e.code : 'UNKNOWN';
         if (repair) {
-          logError(`[heartbeat] 读不了状态文件（${code}），本拍跳过：不调模型、不发送、不改状态文件`);
           if (!readFault) readFault = { code, notified: false };
+          if (!digest) {
+            logError(`[heartbeat] 读不了状态文件（${code}），本拍跳过：不调模型、不发送、不改状态文件`);
+          } else if (!readFault.digestLogged) {
+            // 日结窗口内每 60 秒重试一次：同一次读故障只记一行（恢复后再坏再记）
+            readFault.digestLogged = true;
+            logError(`[heartbeat] 台账日结：读不了状态文件（${code}），这次不发，60 秒后再试（同一次故障只记这一行）`);
+          }
         }
         const shell = failClosed(d);
         unreadableStates.add(shell);
@@ -840,6 +849,22 @@ export function createHeartbeat(deps) {
       log('[heartbeat] 已私聊 owner：状态文件读不出来');
     } catch (e) {
       logError(`[heartbeat] 私聊 owner 失败（状态文件读不出来的提醒），下一拍再试：${redact(errText(e)).slice(0, 200)}`);
+    }
+  }
+  // 台账目录读不了：私聊 owner 一次（照 notifyReadFault：固定模板，不含路径与台账内容，直接 send、不带按钮、不走 deliver）。
+  // 免打扰时段内不发，等时段结束后的第一拍（结束前已恢复就不发）；发送失败只记日志、下一拍再试；恢复后再坏再通知一次
+  async function notifyLedgerFault() {
+    const f = ledgerFault;
+    if (!f || f.notified || inQuietHours(now(), config.quietHours)) return;
+    const text = `⚠️ **台账目录读不了**\n\n心跳读取台账目录 tasks/ 失败（错误码 ${f.code}）。`
+      + '在恢复之前心跳每一拍都不处理台账：不调模型、不发到期提醒和坏台账通知；排队的待发消息照常补发。'
+      + '读取恢复后自动接着跑，台账和记录都保留。请检查这个目录的权限或磁盘。';
+    try {
+      await send(text);
+      f.notified = true;
+      log('[heartbeat] 已私聊 owner：台账目录读不了');
+    } catch (e) {
+      logError(`[heartbeat] 私聊 owner 失败（台账目录读不了的提醒），下一拍再试：${redact(errText(e)).slice(0, 200)}`);
     }
   }
   // 状态写不进去：私聊 owner 一次（固定模板，直接 send——deliver 的排队本身要落盘）。免打扰时段内不发，等时段结束后的第一拍；
@@ -1862,12 +1887,14 @@ export function createHeartbeat(deps) {
     const quota = { left: MAX_SENDS_PER_BEAT, paused: checkUnreadPause(st, nowMs), failed: false };
     if (!inQuietHours(d, config.quietHours) && st.pending.length && !quota.paused) await flushPending(st, nowMs, quota);
 
-    const { tasks, invalid, unreadable } = loadTasks(tasksDir, { log });
+    const { tasks, invalid, unreadable, code: tasksCode } = loadTasks(tasksDir, { log });
     if (unreadable) {
+      if (!ledgerFault) ledgerFault = { code: tasksCode ?? 'UNKNOWN', notified: false };
       // 台账目录读不了：这一拍不处理台账，不清任何台账相关记录（验收、阶梯、坏台账通知、history.seen）；前面的补发照常落盘
       persist(st);
       return { action: 'no-due' };
     }
+    ledgerFault = null; // 主读取读得出（含目录不存在）：故障恢复，再坏再通知
     prune(st, new Set([...tasks.map((t) => t.slug), ...invalid.map((i) => i.file.replace(/\.json$/i, ''))]), nowMs);
     applyWatchLocks(st, tasks); // 心跳轮里改过的 watch 按原值（不看外部增量也算原值）
     await noticeInvalid(st, invalid, tasks, nowMs, quota); // 新出现 / 变了的坏台账私聊 owner（不调模型、不占每日次数）
@@ -2055,6 +2082,7 @@ export function createHeartbeat(deps) {
       const r = await beatOnce();
       await notifyWriteFault();
       await notifyReadFault();
+      await notifyLedgerFault();
       return r;
     } catch (e) {
       logError(`[heartbeat] 本拍异常（已拦下，下一拍照常）：${redact(errText(e)).slice(0, 300)}`);
@@ -2080,7 +2108,7 @@ export function createHeartbeat(deps) {
     try {
       const d = now();
       const ms = d.getTime();
-      const st = loadState(d);
+      const st = loadState(d, { digest: true });
       if (unreadableStates.has(st)) return { action: 'unreadable' };
       if (!st.history) st.history = { seen: {}, changes: [], digest_day: null };
       const today = localDay(d);
