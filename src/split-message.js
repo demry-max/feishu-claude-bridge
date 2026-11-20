@@ -6,7 +6,7 @@
 // SEGMENT_MAX_BYTES。
 //
 // 切法：优先在空行（段落）之后切，其次在表格开始之前切，再次在行边界切；单行放不下才在行内按
-// 句末 / 空白、再按字素簇边界切。围栏代码块在段尾补闭合、下一段以原开栏行重开；表格在行间切时下一段
+// 句末 / 空白、再按字素簇边界切；单个字素簇比一段预算还大时才退到码点边界切（不切代理对）。围栏代码块在段尾补闭合、下一段以原开栏行重开；表格在行间切时下一段
 // 重复表头两行。最多 MAX_SEGMENTS 段，超出的在最后一段末尾注明还有多少字没有发出。
 export const SEGMENT_MAX_BYTES = 24_000;
 export const MAX_SEGMENTS = 10;
@@ -166,13 +166,21 @@ export function splitMessage(input, { maxBytes = SEGMENT_MAX_BYTES, maxSegments 
       for (const o of bounds) {
         const piece = window.slice(prev, o);
         const pc = segmentCost(piece);
-        if (acc + pc > budget && fit > 0) break;
+        if (acc + pc > budget) break;
         acc += pc; prev = o; fit = o;
         // 句末 / 空白之后：看刚放进来的那个字素簇的首个字符
         if (SENT_END.test(piece)) sent = o;
-        if (acc > budget) break;
       }
-      const cut = sent > 0 ? sent : fit;
+      let cut = sent > 0 ? sent : fit;
+      if (cut === 0) {
+        // 行首的字素簇本身就比本段预算大：只有这种情况在簇内退到码点边界切（不切代理对），至少前进一个码点
+        let used = 0;
+        for (const ch of lt) {
+          const cc = segmentCost(ch);
+          if (cut > 0 && used + cc > budget) break;
+          used += cc; cut += ch.length;
+        }
+      }
       if (cut >= lt.length) {
         b = s + 1;
       } else {

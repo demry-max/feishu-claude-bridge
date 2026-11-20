@@ -299,6 +299,20 @@ describe('C 多段发送', () => {
     assert.equal(await c.reply('om_3', long), undefined);
     assert.equal(c.reqs.length, 2);
     assert.ok(c.reqs.every((r) => r.path.message_id === 'om_3'));
+
+    // 脱敏：假令牌（沿用 bridge.test.js 的同类假值）不得出现在任何请求体里，单段与多段各一次
+    const FAKE = 'sk-ant-abcdefghijklmno';
+    assert.ok(!redact(`key ${FAKE}`).includes(FAKE));
+    const d = replyFn(() => ({}));
+    await d.reply('om_4', `密钥 ${FAKE} 请勿外传`);
+    assert.equal(d.reqs.length, 1);
+    assert.ok(!JSON.stringify(d.reqs).includes(FAKE), '单段请求体里有假令牌原值');
+    assert.ok(JSON.stringify(d.reqs).includes('sk-ant-***'));
+    const e = replyFn(() => ({}));
+    await e.reply('om_5', `${'汉'.repeat(6_000)}\n\n密钥 ${FAKE}\n\n${'汉'.repeat(6_000)}`);
+    assert.ok(e.reqs.length >= 2);
+    assert.ok(!JSON.stringify(e.reqs).includes(FAKE), '多段请求体里有假令牌原值');
+    assert.ok(JSON.stringify(e.reqs).includes('sk-ant-***'));
   });
 
   test('C9 sendMarkdown 接线：3 万字定时任务结果 ≥ 4 次 create、目的会话不变、请求体 ≤ 30 000 字节；带四个按钮同样', async (t) => {

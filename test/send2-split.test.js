@@ -59,6 +59,25 @@ describe('S 分段（纯函数）', () => {
     for (const [, end] of r.ranges.slice(0, -1)) assert.equal(text.slice(end - 2, end), '\n\n');
   });
 
+  test('S4b 段落优先（多行段落）：每段 30 行 × 30 汉字、段间空行，除最后一段外切点都紧跟空行', () => {
+    const para = `${`${'汉'.repeat(30)}\n`.repeat(30)}\n`; // 每段约 2.8 KB
+    const text = para.repeat(30);
+    const r = splitMessage(text);
+    assert.ok(r.segments.length >= 3);
+    assertShape(text, r);
+    for (const [, end] of r.ranges.slice(0, -1)) assert.equal(text.slice(end - 2, end), '\n\n', `切点 ${end} 没有紧跟空行`);
+  });
+
+  test('S4c 空行太靠前（不到半段）时不切在那里', () => {
+    const text = `${'汉'.repeat(100)}\n\n${`${'汉'.repeat(30)}\n`.repeat(2_000)}`;
+    const r = splitMessage(text);
+    assert.ok(r.segments.length >= 2);
+    assertShape(text, r);
+    const firstEnd = r.ranges[0][1];
+    assert.ok(firstEnd > 102, `第一段在靠前的空行处就切了：${firstEnd}`);
+    assert.ok(segmentCost(text.slice(0, firstEnd)) >= MAX / 2);
+  });
+
   for (const [name, marker] of [['```', '```'], ['~~~', '~~~'], ['四个反引号', '````']]) {
     test(`S5 代码块 ${name}：围栏成对、续段重开带语言标记、闭合在段尾、去掉补的行后拼回原文`, () => {
       const open = `${marker}js\n`;
@@ -144,6 +163,20 @@ describe('S 分段（纯函数）', () => {
     assert.ok(r.segments.slice(0, -1).every((s) => !s.includes('后面还有约')));
   });
 
+  test('S9d omittedChars 按码点计：增补平面字符（😀 / 𠀀）一个算 1 个字', () => {
+    for (const unit of ['😀', '𠀀', '汉😀𠀀']) {
+      const text = unit.repeat(Math.ceil(400_000 / cps(unit)));
+      const r = splitMessage(text);
+      assert.equal(r.segments.length, MAX_SEGMENTS, unit);
+      assertShape(text, r);
+      const n = r.omittedChars;
+      assert.ok(n > 0);
+      assert.equal(n, cps(text) - covered(text, r.ranges), unit);
+      assert.ok(n < text.length - r.ranges.at(-1)[1], '应按码点计，少于 UTF-16 长度');
+      assert.ok(r.segments.at(-1).endsWith(`\n\n（后面还有约 ${n} 字没有发出）`));
+    }
+  });
+
   test('S9b 在围栏内被截断：闭合行在注记之前', () => {
     const text = `\`\`\`py\n${'print("汉字汉字汉字汉字")\n'.repeat(60_000)}`;
     const r = splitMessage(text);
@@ -169,6 +202,43 @@ describe('S 分段（纯函数）', () => {
     assert.ok(r.omittedChars > 0);
     assert.throws(() => splitMessage(text, { maxBytes: 100 }), RangeError);
     assert.throws(() => splitMessage(text, { maxSegments: 0 }), RangeError);
+  });
+
+  test('S12 单个字素簇比一段预算还大：退到码点边界切，不产生空段 / 零长度 range / 超预算段 / 落单代理', () => {
+    const big = [
+      ['e + 3 万个组合符', `e${'\u0301'.repeat(30_000)}`],
+      ['a + 3 万个零宽连接符', `a${'\u200d'.repeat(30_000)}`],
+      ['3 万个韩文初声', '\u1100'.repeat(30_000)],
+      ['中间夹一个 2.6 万字节的簇', `${'正常开头。'.repeat(100)}e${'\u0301'.repeat(13_000)} 结尾`],
+    ];
+    for (const [name, text] of big) {
+      const r = splitMessage(text);
+      assertShape(text, r);
+      assert.ok(r.segments.length >= 2 && r.segments.length <= MAX_SEGMENTS, name);
+      assert.equal(r.omittedChars, 0, name);
+      assert.equal(r.ranges.at(-1)[1], text.length, name);
+      r.ranges.forEach(([a, b], i) => assert.ok(b > a, `${name}：第 ${i + 1} 段 range 长度为 0`));
+      r.segments.forEach((seg, i) => assert.ok(seg.length > 0, `${name}：第 ${i + 1} 段为空`));
+      assert.equal(covered(text, r.ranges), cps(text), name);
+      assert.equal(r.segments.join(''), text, name);
+      for (const [, end] of r.ranges.slice(0, -1)) {
+        const prev = text.charCodeAt(end - 1); const next = text.charCodeAt(end);
+        assert.ok(!(prev >= 0xd800 && prev < 0xdc00), `${name}：段以落单高代理结尾`);
+        assert.ok(!(next >= 0xdc00 && next < 0xe000), `${name}：段以落单低代理开头`);
+      }
+    }
+  });
+
+  test('S12b 超大簇里带增补平面字符：仍不切代理对', () => {
+    const text = `a${'\u200d😀'.repeat(15_000)}`; // 一个簇（ZWJ 序列），约 11 万字节
+    const r = splitMessage(text);
+    assertShape(text, r);
+    assert.ok(r.segments.length >= 4);
+    assert.equal(r.segments.join(''), text);
+    for (const [, end] of r.ranges.slice(0, -1)) {
+      assert.ok(!(text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) < 0xdc00));
+      assert.ok(!(text.charCodeAt(end) >= 0xdc00 && text.charCodeAt(end) < 0xe000));
+    }
   });
 
   test('S11 同输入同输出', () => {
