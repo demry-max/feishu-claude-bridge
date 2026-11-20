@@ -276,7 +276,7 @@ workspace/
 交办给机器人的事（「周五前盯一下报价单」「对方回了告诉我」）记在 `workspace/tasks/<slug>.json`，一事一个文件；
 只记 owner 交办给它的事，不接管日历。心跳每 `HEARTBEAT_INTERVAL_MIN` 分钟一拍：
 
-1. 脚本先读台账：坏文件、非法字段、软链、macOS `._` 影子文件跳过并记日志，不崩；
+1. 脚本先读台账：坏文件、非法字段、软链、macOS `._` 影子文件跳过并记日志，不崩；`notes` 超过 300 字按前 300 字读入，不再整条失效，并会通知一次；
 2. 没有到期项（`status` 为 open/waiting，且 `next_check_at` 已到或 `escalate_after` 已过）、外部增量也没有新东西 → 记一行日志，**不调模型**；
 3. 有到期项 → 调一次模型（`HEARTBEAT_MODEL` / `HEARTBEAT_EFFORT`，不续会话、无中间进度），提示词只含到期条目，
    title/notes 进不可信围栏；模型改写台账推进进度；上一拍没跑完时本拍直接跳过；

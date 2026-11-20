@@ -61,7 +61,7 @@ owner 把一件**需要你过一段时间再跟进**的事交给你时（「周�
 - `watch`：外部增量的线索，如 `{"type":"chat_reply","chat_id":"oc_xxx","after":"om_xxx"}`。
   - type 可选 `chat_reply`、`approval`、`calendar`、`none`。
   - 本版桥接只认 `none`，其他值保留但不会被拉取。
-- 字段写错的整条台账都会被跳过，`/heartbeat status` 里能看到「无效 N」。
+- 字段写错的整条台账都会被跳过，`/heartbeat status` 里能看到「无效 N」。`notes` 超过 300 字按前 300 字读入，不再整条失效，并会通知一次。
 - owner 问「你手上有哪些事」时，列出 `tasks/` 下 status 为 open 或 waiting 的条目。
 ````
 
