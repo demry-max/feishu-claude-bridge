@@ -218,7 +218,7 @@ Hosts, path prefixes and Keychain entry names are hard-coded in `src/biz-targets
   - If the saved owner doesn't match the current one (`OWNER_OPEN_ID` or `data/owner.json`), or the file is damaged or malformed, it is treated as unknown until the owner DMs again.
   - The startup log has a line `[biz] owner 私聊目的地：已从落盘恢复` (restored) or `未知（等 owner 私聊一次）` (unknown); `/status` in the owner's DM adds a line saying whether the destination is known (from disk / this session) or unknown. Neither shows the ID itself.
   - The file doesn't depend on `BMS_TOOL_ENABLED`; it is written even when the switch is off.
-- **Switch**: `BMS_TOOL_ENABLED=1` in `.env`, exactly `1`, then restart. It works under all three tool profiles. When off, every turn's arguments are byte-for-byte the same as without the feature.
+- **Switch**: `BMS_TOOL_ENABLED=1` in `.env`, exactly `1`, then restart. It works under all three tool profiles. When off, no turn gets `mcp__biz__biz_get` or the biz-readonly skill, and the arguments contain nothing related to this tool; the 4 deny rules under "`.env` deny-read" below don't follow this switch and stay on when it is off.
 - **GET only**, and redirects are not followed.
   - The path is normalized before its prefix is checked. `..`, `//`, `\`, `@`, `%`-encoding and full URLs are rejected.
   - Key management, login / auth, export, file download and voucher paths are rejected too.
@@ -231,7 +231,7 @@ Hosts, path prefixes and Keychain entry names are hard-coded in `src/biz-targets
   - The MCP server reads it into memory on each call with `/usr/bin/security find-generic-password … -w`.
   - It is never put in environment variables, command-line arguments, the temporary MCP config, logs, the audit log or error text.
   - If an entry is missing, only that system is unavailable. The tool replies (in Chinese) that the system is not configured because the Keychain has no usable <entry> (account <account>), asks the owner to add it, and includes a command template for adding it.
-- **`.env` deny-read**: turns that have the tool also get `--disallowedTools Read(<repo absolute path>/.env),Read(<repo absolute path>/.env.*)`, and `Bash(security:*)` and `Bash(/usr/bin/security:*)` are denied as well.
+- **`.env` deny-read**: the 4 rules `Read(<repo absolute path>/.env)`, `Read(<repo absolute path>/.env.*)`, `Bash(security:*)` and `Bash(/usr/bin/security:*)` in `--disallowedTools` are always on for every turn that has tools (owner DM under all three profiles, scheduled jobs, heartbeat, handoff, guests and the owner in a group). They don't depend on `BMS_TOOL_ENABLED`, so turns with this tool carry them too. Turns without tools (verification, self-diagnosis under audit / strict) can't read anything anyway and don't get them.
 - **Child-process environment**: the MCP server starts through `/usr/bin/env -u …`, which drops `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS` and `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (lower-case too).
 - **Results** are wrapped whole in the untrusted-data fence, which states they are data, not instructions.
 - **Audit** (audit / strict): only the tool name, the target, GET and the category of the first path segment (`other` outside the allowlist) are recorded. Full paths and queries are not.
