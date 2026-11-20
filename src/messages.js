@@ -153,9 +153,59 @@ export function cleanIncoming(workspaceDir) {
   return removed;
 }
 
-function stripMentions(text) {
-  return (text ?? '').replace(/@_user_\d+/g, '').trim();
+// BRIDGE-MISC-1：群消息里除机器人之外的 @ 保留成 @姓名（以前整个抹掉，模型不知道提到了谁）。
+// 姓名是发送者这句话的一部分，沿用文件名的单行清洗（promptFileName），再截 64 字；不额外加围栏。
+const MENTION_NAME_MAX = 64;
+function mentionName(name) {
+  const clean = [...promptFileName(name)].slice(0, MENTION_NAME_MAX).join('').trim();
+  return `@${clean || '某人'}`;
 }
+
+const mentionOpenId = (m) => m?.id?.open_id ?? (typeof m?.id === 'string' ? m.id : null);
+
+/** 没有 mentions 或认不出机器人是哪个时，退回「全部删掉」：宁可不带名字，也不把机器人名字留在命令前面 */
+function stripMentions(text, mentions = null, botId = null) {
+  const list = Array.isArray(mentions) ? mentions : [];
+  if (!list.length || !botId) return (text ?? '').replace(/@_user_\d+/g, '').trim();
+  const byKey = new Map(list.filter((m) => m?.key).map((m) => [m.key, m]));
+  return (text ?? '')
+    .replace(/@_user_\d+/g, (key) => {
+      const m = byKey.get(key);
+      if (m && mentionOpenId(m) === botId) return '';
+      return mentionName(m?.name);
+    })
+    .trim();
+}
+
+// 机器人自身 open_id：按 client 缓存，成功后到进程结束；失败 60 秒内不再查。
+// index.js 里有同一个接口的 getBotOpenId，但 buildPrompt 的调用点不传它，所以这里自己查一次。
+const BOT_ID_RETRY_MS = 60_000;
+const botIdState = new WeakMap();
+async function lookupBotOpenId(client) {
+  if (typeof client?.request !== 'function') return null;
+  let st = botIdState.get(client);
+  if (!st) { st = { id: null, retryAt: 0, pending: null }; botIdState.set(client, st); }
+  if (st.id) return st.id;
+  if (st.pending) return st.pending;
+  if (Date.now() < st.retryAt) return null;
+  st.pending = (async () => {
+    try {
+      const res = await client.request({ method: 'GET', url: '/open-apis/bot/v3/info' });
+      st.id = res?.bot?.open_id ?? null;
+      if (!st.id) throw new Error('接口没有返回 bot.open_id');
+    } catch (e) {
+      st.retryAt = Date.now() + BOT_ID_RETRY_MS;
+      console.error('[bot] 获取机器人 open_id 失败，按不保留 @ 人名处理:', e?.message ?? e);
+    } finally {
+      st.pending = null;
+    }
+    return st.id;
+  })();
+  return st.pending;
+}
+
+/** 只在这条消息带 mentions 时才查 */
+const botIdFor = (client, message) => (message?.mentions?.length ? lookupBotOpenId(client) : null);
 
 async function download(client, messageId, fileKey, type, incomingDir, fileName) {
   fs.mkdirSync(incomingDir, { recursive: true });
@@ -171,8 +221,10 @@ async function download(client, messageId, fileKey, type, incomingDir, fileName)
 }
 
 // 从 post 富文本节点树提取文字与图片 key
-function walkPost(content) {
+function walkPost(content, mentions = null, botId = null) {
   const texts = [];
+  const list = Array.isArray(mentions) ? mentions : [];
+  const botKey = botId ? list.find((m) => mentionOpenId(m) === botId)?.key : null;
   const imageKeys = [];
   const rows = Array.isArray(content?.content) ? content.content : [];
   for (const row of rows) {
@@ -181,7 +233,13 @@ function walkPost(content) {
       if (node.tag === 'text') line.push(node.text ?? '');
       else if (node.tag === 'a') line.push(`${node.text ?? ''}(${node.href ?? ''})`);
       else if (node.tag === 'img') imageKeys.push(node.image_key);
-      else if (node.tag === 'at') line.push('');
+      else if (node.tag === 'at') {
+        if (!botId || node.user_id === botId || (botKey && node.user_id === botKey)) line.push('');
+        else {
+          const fromMentions = list.find((m) => m?.key && m.key === node.user_id)?.name;
+          line.push(mentionName(node.user_name || fromMentions));
+        }
+      }
     }
     if (line.length) texts.push(line.join(''));
   }
@@ -258,7 +316,10 @@ export async function buildPrompt(client, message, workspaceDir, senderOpenId = 
 
   switch (type) {
     case 'text':
-      return withQuote({ prompt: stripMentions(content.text), attachments: [] });
+      return withQuote({
+        prompt: stripMentions(content.text, message.mentions, await botIdFor(client, message)),
+        attachments: [],
+      });
 
     case 'image': {
       const p = await download(
@@ -287,14 +348,16 @@ export async function buildPrompt(client, message, workspaceDir, senderOpenId = 
     }
 
     case 'post': {
-      const { text, imageKeys } = walkPost(content);
+      const { text, imageKeys } = walkPost(content, message.mentions, await botIdFor(client, message));
       const attachments = [];
+      let lastImgErr = null;
       for (const key of imageKeys) {
         try {
           attachments.push(
             await download(client, message.message_id, key, 'image', incomingDir, `${key}.png`)
           );
         } catch (e) {
+          lastImgErr = e;
           console.error('[post-img]', e?.message ?? e);
         }
       }
@@ -304,6 +367,14 @@ export async function buildPrompt(client, message, workspaceDir, senderOpenId = 
         prompt += `\n\n（消息附带 ${attachments.length} 张图片，已保存为：${attachments
           .map(rel)
           .join('、')}。请用 Read 工具查看后一并回应。）`;
+      }
+      // 只有图片、一张都没取到、也没有标题 / 文字 / 引用：以前 prompt 是空串，index.js 直接丢掉不回复
+      if (imageKeys.length && !attachments.length && !prompt.trim() && !quoted) {
+        return {
+          prompt: null,
+          attachments: [],
+          unsupported: `图片没取到（${describeError(lastImgErr).text}），请重发一次。`,
+        };
       }
       return withQuote({ prompt, attachments });
     }
