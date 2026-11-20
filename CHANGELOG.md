@@ -25,13 +25,14 @@
 - **不互相挡**：`tick` 只扫描、派发，不再等任务跑完；`SCHED_MAX_CONCURRENT`（1–10，默认 2）对所有在跑的任务跨拍有效。并发满时被挡的任务在内存里记等位起点，等过迟到窗口记 `skipped-busy` 并私聊 owner。`startScheduler` 现在返回 `{ stop, whenIdle, idle, inflightCount }`；`whenIdle` 等首拍及启动补跑派发的任务，`idle` 等所有在跑的任务。
 - **重启不丢**：启动时状态里留着 `running` 的任务，目的地是 owner 私聊的 prompt 型任务（`when` 未改、文件还在且启用、在迟到窗口内）补跑一次（状态 `running` 带 `resumed: true`，结果标题「（因重启补跑）」，补跑途中再被打断不再补）；其余记 `interrupted` 并私聊 owner。优雅退出时 `scheduler.stop()` 停调度，`inflightCount()` 计入关停等待。
 - **写盘失败不重跑**：状态写不进去时记进内存表（`loadState` 内存优先），本进程内同一次触发不重跑；盘恢复后写回。每次故障私聊 owner 一次（错误码与数据目录）。
-- **出问题告诉 owner**：迟到跳过、等位超时、被重启打断、prompt 任务缺 `chat_id`、`when` 写错（含 6 段 cron）、任务文件不是合法 JSON、结果发不出去、状态写不进去、`chat_id` 写法不对；同一任务同一原因每个本地日一次（去重记录单独存 `schedule-state-notices.json`，不动任务记录）。通知里任务名截 60 字、不含 prompt、不含完整 chat_id / open_id。`chat_id` 写法不对的任务照旧不执行，日志原文不变但每个文件每个进程一次，另按（文件名 + 内容哈希）通知一次。
+- **出问题告诉 owner**：迟到跳过、等位超时、被重启打断、prompt 任务缺 `chat_id`、`when` 写错（含 6 段 cron）、任务文件不是合法 JSON、结果发不出去、状态写不进去、`chat_id` 写法不对；同一任务同一原因每个本地日一次、同一拍里调度器自己产生的通知（被打断、迟到跳过、等位超时、`when` 写错、坏 JSON、`chat_id` 写法不对）合并成一条私聊（一项一行，最多 10 项，超出写「另有 N 项」；启动恢复与首拍扫描算同一拍；去重在入批时判断，发送失败也算用掉；单项时内容与单发一致；结果发不出去 / 缺 `chat_id` / 状态写不进去仍单独发）（去重记录单独存 `schedule-state-notices.json`，不动任务记录）。通知里任务名截 60 字、不含 prompt、不含完整 chat_id / open_id。`chat_id` 写法不对的任务照旧不执行，日志原文不变但每个文件每个进程一次，另按（文件名 + 内容哈希）通知一次。
 - **结果发送重试**：新增导出 `fireJob`。模型调用失败仍走自诊断；结果发送失败最多 3 次（间隔 5 秒、30 秒），仍失败不做自诊断，私聊 owner（任务名、会话 id 末 6 位、结果正文前 2000 字），状态记 `failed`。定时任务的 `onProgress` 为 `null`。
-- **一次性任务迟到**：一次性 prompt 任务迟到超过窗口不再丢弃，补发一次，标题「（迟到 X 小时 Y 分钟补发）」；action 型（`set-model`）与 cron 任务照旧跳过，现在会通知 owner。
+- **一次性任务迟到**：一次性 prompt 任务迟到超过窗口不再丢弃，补发一次，标题「（迟到 X 小时 Y 分钟补发）」，但迟到超过 24 小时（`scheduler.js` 常量 `ONE_SHOT_CATCHUP_MAX_MS`，不是环境变量）的不再补发，记 `skipped-late` 并按每日去重通知「已迟到超过 24 小时，不再补发」（避免升级那一拍把旧代码从没执行过的几周前任务全部跑一遍）；action 型（`set-model`）与 cron 任务照旧跳过，现在会通知 owner。
 - **时间写法**：先 `parseTime`，不认再 `new Date`（`2026/11/21` 之类照旧可用）；cron 必须 5 段（或 `@` 宏）——6 段会被 cron-parser 当「带秒」，写错一位就变成每小时触发，现在按写法错误处理。`nextFireAt` 移到 `scheduler.js` 导出，`/tasks` 与调度器同一套判定，状态多显示「等位超时跳过」「被重启打断」。
 - **环境变量**：`SCHED_MAX_CONCURRENT`（1–10，默认 2）、`SCHED_MAX_LATE_MS`（60000–86400000，默认 7200000）在 `startScheduler` 里读取；留空按默认（不记日志），写错或越界按默认并记一行启动日志（值最多回显 20 个字）。没有新增变量名。
 - **已知限制**：发送重试（5 秒 + 30 秒）与模型调用自己的重试都算「进行中」，可能超过优雅退出的等待时间；超时被强杀时任务停在 `running`，下次启动按上面的规则补跑或记 `interrupted`（可能重发一次结果）。
-- 测试：新增 `test/scheduler-reliability.test.js`（S1–S10）、`test/scheduler-wiring.test.js`（S11：`index.js` 接线，含自诊断围栏与 `onProgress`）；`test/bridge.test.js` 把「迟到超窗口」拆成一次性 prompt 补发与 action 跳过两条，`test/message-queue.test.js` 补 `scheduler` 桩并更新 `onDrain` 字面。
+- **顺手**：答案静默而回传文件发不出去时，通知写「随附的文件发不出去」；任务落盘结束后日志记一行「结束（done|failed）」。
+- 测试：新增 `test/scheduler-reliability.test.js`（S1–S10、R1-1 通知合并、R1-2 迟到上限、R1-3 顺手项）、`test/scheduler-wiring.test.js`（S11：`index.js` 接线，含自诊断围栏与 `onProgress`）；`test/bridge.test.js` 把「迟到超窗口」拆成一次性 prompt 补发与 action 跳过两条，`test/message-queue.test.js` 补 `scheduler` 桩并更新 `onDrain` 字面。
 
 ### BRIDGE-LEDGER-1 台账坏条目通知 owner；心跳状态写不进去时不重发
 

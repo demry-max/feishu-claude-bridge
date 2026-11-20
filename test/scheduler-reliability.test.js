@@ -795,3 +795,215 @@ describe('S10 既有行为不变', () => {
     } finally { h.stop(); env.cleanup(); }
   });
 });
+
+describe('R1-1 同一拍的调度器通知合并成一条私聊', () => {
+  const OLD = new Date(2026, 7, 5, 9, 0, 0).toISOString(); // 几个月前
+  const stale = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`old${i + 1}.json`, { at: OLD, when: '0 9 * * *', status: 'running' }]));
+  const tickN = async (t, n) => { for (let i = 0; i < n; i++) { t.mock.timers.tick(30_000); await settle(); } };
+
+  test('5 条陈年 running（任务文件都不在）：启动只发 1 条私聊，列出 5 个任务，状态都变 interrupted，之后不再通知', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv(); const notes = [];
+    env.seed(stale(5));
+    const start = () => startScheduler({ schedulesDir: env.jobs, stateFile: env.state, notifyOwner: async (x) => { notes.push(x); }, onFire: async () => {} });
+    let h = start();
+    try {
+      await settle();
+      assert.equal(notes.length, 1, '一拍只发一条');
+      for (let i = 1; i <= 5; i++) assert.match(notes[0], new RegExp(`old${i}\\.json`));
+      assert.ok(!notes[0].includes('另有'), '5 项没超上限');
+      for (let i = 1; i <= 5; i++) assert.equal(env.readState()[`old${i}.json`].status, 'interrupted');
+      await tickN(t, 40);
+      assert.equal(notes.length, 1, '推进几十拍不再通知');
+      h.stop(); h = start(); await tickN(t, 3);
+      assert.equal(notes.length, 1, '重启同日也不再通知');
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('12 条：1 次通知，最多列 10 项，写「另有 2 项」', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv(); const notes = [];
+    env.seed(stale(12));
+    const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, notifyOwner: async (x) => { notes.push(x); }, onFire: async () => {} });
+    try {
+      await settle();
+      assert.equal(notes.length, 1);
+      assert.match(notes[0], /另有 2 项/);
+      assert.equal(notes[0].split('\n').filter((l) => l.startsWith('·')).length, 10);
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('首次启动（无 notices 文件）：when 写错 + 坏 JSON + chat_id 写法不对 + 陈年 running → 首拍 1 次通知含 4 项；之后同日 0 次；重启同日 0 次', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv(); const notes = []; let fired = 0;
+    env.write('sixseg.json', job({ name: 'sixseg', when: '0 0 9 * * *', prompt: 'SECRET-PROMPT-BODY' }));
+    env.write('broken.json', '{"name": "x", "prompt": "SECRET-PROMPT-BODY", ');
+    env.write('badchat.json', job({ name: 'badchat', chat_id: 'oc_x' }));
+    env.seed(stale(1));
+    const start = () => startScheduler({ schedulesDir: env.jobs, stateFile: env.state, notifyOwner: async (x) => { notes.push(x); }, onFire: async () => { fired += 1; } });
+    let h = start();
+    try {
+      await settle();
+      assert.equal(fired, 0);
+      assert.equal(notes.length, 1, '启动恢复 + 首拍扫描算同一拍，合并成一条');
+      for (const re of [/sixseg/, /broken\.json/, /badchat\.json/, /old1\.json/]) assert.match(notes[0], re);
+      assert.ok(!notes[0].includes('SECRET-PROMPT-BODY'));
+      assert.ok(!notes[0].includes(CHAT));
+      await tickN(t, 10);
+      assert.equal(notes.length, 1, '之后同日 0 次');
+      h.stop(); h = start(); await tickN(t, 3);
+      assert.equal(notes.length, 1, '重启同日 0 次');
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('只有 1 项：内容与单发一致（不加汇总头）', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv(); const notes = [];
+    env.seed(stale(1));
+    const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, notifyOwner: async (x) => { notes.push(x); }, onFire: async () => {} });
+    try {
+      await settle();
+      assert.equal(notes.length, 1);
+      assert.match(notes[0], /^⚠️ 定时任务「old1\.json」原定 .* 的这次执行被桥接重启打断了/);
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('不合并：ctx.notifyOnce 仍然单独发，且与同拍的合并通知互不影响', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv(); const notes = [];
+    env.write('a.json', job({ name: 'a' }));
+    env.seed(stale(2));
+    const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, notifyOwner: async (x) => { notes.push(x); },
+      onFire: async (_j, ctx) => { await ctx.notifyOnce('send', 'SEPARATE'); } });
+    try {
+      await h.whenIdle(); await settle();
+      assert.equal(notes.length, 2);
+      assert.ok(notes.includes('SEPARATE'));
+      assert.ok(notes.some((x) => /old1\.json/.test(x) && /old2\.json/.test(x)));
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('发送失败也算用掉：不每拍重试；记一行日志', async (t) => {
+    const errs = [];
+    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'error', (...a) => { errs.push(a.join(' ')); });
+    mockClock(t);
+    const env = mkEnv(); let calls = 0;
+    env.seed(stale(3));
+    const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, notifyOwner: async () => { calls += 1; throw new Error('send failed'); }, onFire: async () => {} });
+    try {
+      await tickN(t, 5);
+      assert.equal(calls, 1);
+      assert.ok(errs.some((l) => l.includes('通知 owner 失败')));
+    } finally { h.stop(); env.cleanup(); }
+  });
+});
+
+describe('R1-2 一次性 prompt 任务迟到补发有 24 小时上限', () => {
+  const H = 3_600_000;
+  const run = async (t, { when, state, extra = {} }) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv(); const fired = []; const notes = [];
+    env.write('once.json', job({ name: 'once', when: typeof when === 'function' ? when() : when })); // 函数：假时钟启用后再算
+    if (state) env.seed(state);
+    const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, maxLateMs: 60_000,
+      notifyOwner: async (x) => { notes.push(x); }, onFire: async (j) => { fired.push(j); }, ...extra });
+    await h.whenIdle(); await settle();
+    return { env, h, fired, notes };
+  };
+
+  test('迟到 3 小时：补发，标题带迟到时长', async (t) => {
+    const { env, h, fired, notes } = await run(t, { when: () => localWhen(-3 * H) });
+    try {
+      assert.equal(fired.length, 1);
+      assert.equal(fired[0]._lateOver, true);
+      assert.equal(notes.length, 0);
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('迟到 25 小时：不触发，状态 skipped-late，通知 1 次（含「超过 24 小时，不再补发」）；之后几拍不再通知', async (t) => {
+    const { env, h, fired, notes } = await run(t, { when: () => localWhen(-25 * H) });
+    try {
+      assert.equal(fired.length, 0);
+      assert.equal(env.readState()['once.json'].status, 'skipped-late');
+      assert.equal(notes.length, 1);
+      assert.match(notes[0], /超过 24 小时/);
+      assert.match(notes[0], /不再补发/);
+      assert.ok(!notes[0].includes(CHAT));
+      for (let i = 0; i < 5; i++) { t.mock.timers.tick(30_000); await settle(); }
+      assert.equal(fired.length, 0);
+      assert.equal(notes.length, 1);
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('when 是 19 天前的「YYYY-MM-DD HH:MM」空格写法、无状态记录：不触发', async (t) => {
+    const d = new Date(NOW.getTime() - 19 * 24 * H);
+    const when = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const { env, h, fired, notes } = await run(t, { when });
+    try {
+      assert.equal(fired.length, 0);
+      assert.equal(env.readState()['once.json'].status, 'skipped-late');
+      assert.equal(notes.length, 1);
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('状态文件丢失 / 坏 JSON 且文件仍 enabled 的几周前一次性任务：不触发', async (t) => {
+    quiet(t); mockClock(t);
+    const env = mkEnv(); let fired = 0;
+    env.write('once.json', job({ name: 'once', when: localWhen(-21 * 24 * H) }));
+    fs.writeFileSync(env.state, '{not json');
+    const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, notifyOwner: async () => {}, onFire: async () => { fired += 1; } });
+    try { await h.whenIdle(); assert.equal(fired, 0); } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('上限边界：oneShotCatchupMaxMs 可注入；上限 4 小时时迟到 3 小时补发、迟到 5 小时跳过；上限 1 小时时迟到 3 小时跳过', async (t) => {
+    for (const [late, cap, expectFire] of [[3, 4, 1], [5, 4, 0], [3, 1, 0]]) {
+      const { env, h, fired } = await run(t, { when: () => localWhen(-late * H), extra: { oneShotCatchupMaxMs: cap * H } });
+      try { assert.equal(fired.length, expectFire, `迟到 ${late}h / 上限 ${cap}h`); } finally { h.stop(); env.cleanup(); t.mock.timers.reset(); }
+    }
+  });
+});
+
+describe('R1-3 顺手项', () => {
+  test('答案静默而回传文件发不出去：通知写「随附的文件发不出去」，不出现「结果发不出去」与 HEARTBEAT_OK', async (t) => {
+    quiet(t);
+    const notes = [];
+    await assert.rejects(fireJob({
+      job: { name: 'n', chat_id: CHAT, prompt: 'P' }, run: async () => 'HEARTBEAT_OK',
+      send: async () => {}, flush: async () => { throw new Error('file'); },
+      notifyOwner: async (x) => { notes.push(x); }, onRunFailure: async () => {}, isQuiet: (b) => b === 'HEARTBEAT_OK', sleep: async () => {}, log: () => {},
+    }), /发送失败/);
+    assert.equal(notes.length, 1);
+    assert.match(notes[0], /随附的文件发不出去/);
+    assert.ok(!notes[0].includes('结果发不出去'));
+    assert.ok(!notes[0].includes('HEARTBEAT_OK'));
+  });
+
+  test('任务结束落盘后记一行日志「结束（done|failed）」，不含 prompt / chat_id', async (t) => {
+    const logs = [];
+    t.mock.method(console, 'log', (...a) => { logs.push(a.join(' ')); });
+    t.mock.method(console, 'error', () => {});
+    mockClock(t);
+    const env = mkEnv();
+    env.write('ok.json', job({ name: 'okjob', prompt: 'SECRET-PROMPT-BODY' }));
+    env.write('bad.json', job({ name: 'badjob', prompt: 'SECRET-PROMPT-BODY' }));
+    const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, maxConcurrent: 2,
+      onFire: async (j) => { if (j.name === 'badjob') throw new Error('x'); } });
+    try {
+      await h.idle();
+      assert.ok(logs.includes('[sched] 「okjob」结束（done）'));
+      assert.ok(logs.includes('[sched] 「badjob」结束（failed）'));
+      assert.ok(!logs.some((l) => l.includes('SECRET-PROMPT-BODY') || l.includes(CHAT)));
+    } finally { h.stop(); env.cleanup(); }
+  });
+
+  test('parseWhen：2026/11/21 09:00、2026-11-21 9:00 认作本地一次性时间；cron 不会被误判', () => {
+    const local = (y, m, d, hh, mm) => new Date(y, m - 1, d, hh, mm).getTime();
+    for (const w of ['2026/11/21 09:00', '2026-11-21 9:00']) {
+      const p = parseWhen(w);
+      assert.equal(p.kind, 'once', w);
+      assert.equal(p.at.getTime(), local(2026, 11, 21, 9, 0), w);
+    }
+    assert.equal(parseWhen('0 9 * * *').kind, 'cron');
+  });
+});

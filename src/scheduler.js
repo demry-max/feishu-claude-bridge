@@ -28,6 +28,11 @@ const TICK_MS = 30_000;
 // 不该把昨天的晨报、已经过期的模型切换全部倒着补一遍。
 const DEFAULT_MAX_LATE_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 2;
+// 一次性 prompt 任务（提醒）超过迟到窗口后仍补发，但有上限：迟到超过这个时长的不再补发。
+// 否则「旧代码从没执行过、文件仍 enabled」的几周前任务会在升级那一拍被全部执行。
+export const ONE_SHOT_CATCHUP_MAX_MS = 86_400_000;
+// 同一拍合并成一条私聊时最多列出的项数
+const NOTICE_BATCH_MAX = 10;
 
 // action 型任务只允许这些动作——任务定义由机器人自己写，
 // 而机器人可能被聊天内容注入，所以这里按白名单严格枚举，未知 action 一律拒绝执行。
@@ -197,7 +202,9 @@ export async function fireJob({
   const tail = String(job.chat_id).slice(-6);
   const resultSent = sent && !quiet;
   await tell(
-    resultSent
+    quiet
+      ? `⚠️ 定时任务「${name}」本次无需汇报，但随附的文件发不出去（会话 id 末 6 位 ${tail}；${plain(lastErr?.message ?? lastErr, 80)}）。`
+      : resultSent
       ? `⚠️ 定时任务「${name}」的结果已发出，但随附的文件发不出去（会话 id 末 6 位 ${tail}；${plain(lastErr?.message ?? lastErr, 80)}）。`
       : `⚠️ 定时任务「${name}」的结果发不出去（原定发往的会话 id 末 6 位 ${tail}；${plain(lastErr?.message ?? lastErr, 80)}）。结果正文如下：\n\n${body.slice(0, 2000)}`,
     'send',
@@ -209,13 +216,15 @@ export async function fireJob({
  * 启动调度器。onFire(job, ctx) 由调用方实现（跑 Claude 并把结果发到会话；ctx.notifyOnce(reason, text) 是同一任务同一原因每个本地日一次的 owner 通知）。
  * 触发状态记录在 data/schedule-state.json，重启不会重复触发或漏触发。
  * 可选：turnFor（判定「结果是否发往 owner 私聊」，与 index.js 的 schedTurnFor 同一个）、notifyOwner(text)、
- * maxConcurrent / maxLateMs（不传则读 SCHED_MAX_CONCURRENT / SCHED_MAX_LATE_MS）。
+ * maxConcurrent / maxLateMs（不传则读 SCHED_MAX_CONCURRENT / SCHED_MAX_LATE_MS）、oneShotCatchupMaxMs（一次性 prompt 任务迟到补发的上限，默认 24 小时，供测试）。
+ * 调度器自己产生的通知（被打断 / 迟到跳过 / 等位超时 / when 写错 / 坏 JSON / chat_id 写法不对）同一拍合并成一条私聊。
  * 返回 { stop, whenIdle, idle, inflightCount }。
  */
-export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notifyOwner, maxConcurrent, maxLateMs }) {
+export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notifyOwner, maxConcurrent, maxLateMs, oneShotCatchupMaxMs }) {
   fs.mkdirSync(schedulesDir, { recursive: true });
   const MAX_CONCURRENT = maxConcurrent ?? intSetting(process.env.SCHED_MAX_CONCURRENT, 'SCHED_MAX_CONCURRENT', DEFAULT_MAX_CONCURRENT, 1, 10, console.log);
   const MAX_LATE_MS = maxLateMs ?? intSetting(process.env.SCHED_MAX_LATE_MS, 'SCHED_MAX_LATE_MS', DEFAULT_MAX_LATE_MS, 60_000, 86_400_000, console.log);
+  const ONE_SHOT_MAX_MS = oneShotCatchupMaxMs ?? ONE_SHOT_CATCHUP_MAX_MS;
 
   // ---- 状态：盘上 + 本进程内存表（写不进去的记录）----
   const memState = {};
@@ -307,6 +316,28 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     await noticeNow(text);
     return true;
   };
+  // 同一拍里调度器自己产生的通知先收集，拍末合并成一条（去重在入批时判断，进了批就算用掉）
+  let batch = [];
+  const queueLine = (line) => { if (notifyOwner) batch.push(line); };
+  const flushBatch = async () => {
+    if (!batch.length) return;
+    const items = batch;
+    batch = [];
+    if (items.length === 1) { await noticeNow(items[0]); return; }
+    const shown = items.slice(0, NOTICE_BATCH_MAX).map((x) => `· ${x.replace(/^[⚠️⏰\s]+/u, '')}`);
+    const more = items.length > NOTICE_BATCH_MAX ? [`另有 ${items.length - NOTICE_BATCH_MAX} 项`] : [];
+    await noticeNow(`⚠️ 定时任务调度器有 ${items.length} 项需要你知道：\n${[...shown, ...more].join('\n')}`);
+  };
+  // 同一任务同一原因每个本地日最多一次，入本拍的合并批（发送失败也算这一天用掉）
+  const batchOnce = (key, text) => {
+    if (!notifyOwner) return false;
+    const day = localDay();
+    if (notices.days[key] === day) return false;
+    notices.days[key] = day;
+    saveNotices();
+    queueLine(text);
+    return true;
+  };
   const loggedDay = new Map();
   const logOnceDaily = (key, fn) => {
     const day = localDay();
@@ -326,11 +357,11 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
       if (notifyOwner && notices.files[f] !== info.hash) {
         notices.files[f] = info.hash;
         saveNotices();
-        void noticeNow(`⚠️ 定时任务文件 ${plain(f, 60)} 的 chat_id 写法不对（要 oc_ 开头的飞书会话 id），这个任务不会执行。改好后自动生效。`);
+        queueLine(`⚠️ 定时任务文件 ${plain(f, 60)} 的 chat_id 写法不对（要 oc_ 开头的飞书会话 id），这个任务不会执行。改好后自动生效。`);
       }
     } else if (kind === 'json') {
       logOnceDaily(`json|${f}|${info.message}`, () => console.error(`[sched] 任务文件解析失败 ${f}:`, info.message));
-      void noticeOnce(`${f}|json`, `⚠️ 定时任务文件 ${plain(f, 60)} 不是合法的 JSON，这个任务不会执行。`);
+      batchOnce(`${f}|json`, `⚠️ 定时任务文件 ${plain(f, 60)} 不是合法的 JSON，这个任务不会执行。`);
     } else if (kind === 'action') {
       logOnceDaily(`action|${f}|${info.action}`, () => console.error(`[sched] 拒绝未知 action「${plain(info.action, 40)}」(${f})，已跳过`));
     }
@@ -364,10 +395,12 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     };
     const ctx = { notifyOnce: (reason, text) => noticeOnce(`${file}|${reason}`, text) };
     const runOne = (async () => {
+      let endStatus = 'done';
       try {
         await onFire(payload, ctx);
         markFired(file, due.toISOString(), { when: job.when, status: 'done' });
       } catch (e) {
+        endStatus = 'failed';
         console.error(`[sched] 执行失败 ${file}:`, e?.message ?? e);
         markFired(file, due.toISOString(), { when: job.when, status: 'failed' });
       } finally {
@@ -385,6 +418,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
             console.error('[sched] 停用一次性任务失败:', e?.message ?? e);
           }
         }
+        console.log(`[sched] 「${nameOf(job)}」结束（${endStatus}）`);
         inflight.delete(file); // 最后才减：发送阶段、自诊断、重试等待都算「进行中」
       }
     })();
@@ -397,7 +431,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     markFired(file, rec.at, { when: rec.when, status: 'interrupted' });
     const at = new Date(rec.at);
     console.log(`[sched] 「${nameOf(job ?? { _file: file })}」上次执行被重启打断，不补跑：${why}`);
-    void noticeOnce(
+    batchOnce(
       `${file}|interrupted`,
       `⚠️ 定时任务「${nameOf(job ?? { _file: file })}」原定 ${isNaN(at) ? '（时间未知）' : fmtLocal(at)} 的这次执行被桥接重启打断了，没有补跑（${why}）。需要的话请手动再跑一次。`,
     );
@@ -451,7 +485,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
         const { due, once, bad } = lastDueAt(job, now);
         if (bad) {
           logOnceDaily(`when|${file}|${bad}`, () => console.error(`[sched] 无效的 when（${nameOf(job)}，${file}）：${bad}`));
-          void noticeOnce(`${file}|when`, `⚠️ 定时任务「${nameOf(job)}」的 when 写法有问题：${bad}。这个任务到点不会触发。`);
+          batchOnce(`${file}|when`, `⚠️ 定时任务「${nameOf(job)}」的 when 写法有问题：${bad}。这个任务到点不会触发。`);
           continue;
         }
         if (!due) continue;
@@ -472,17 +506,20 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
         if (last && due <= last) continue; // 这一次已经跑过
 
         // 迟到太久：cron 任务与 action 型任务放弃（关机一夜后醒来不该把昨天的任务、过期的模型切换倒着补一遍）；
-        // 一次性 prompt 任务（提醒）补发一次，结果标题注明迟到多久
+        // 一次性 prompt 任务（提醒）补发一次，结果标题注明迟到多久——但迟到超过 ONE_SHOT_MAX_MS 的也放弃
         const lateMs = Date.now() - due.getTime();
         const lateOver = lateMs > MAX_LATE_MS;
-        if (lateOver && !(once && isPromptJob(job))) {
+        const capped = once && isPromptJob(job) && lateMs > ONE_SHOT_MAX_MS;
+        if (lateOver && (!(once && isPromptJob(job)) || capped)) {
           markFired(file, due.toISOString(), { when: job.when, status: 'skipped-late' });
           console.log(
             `[sched] 跳过「${nameOf(job)}」：应于 ${fmtLocal(due)} 触发，已迟到 ${Math.round(lateMs / 60000)} 分钟（超过 ${Math.round(MAX_LATE_MS / 60000)} 分钟窗口）`
           );
-          void noticeOnce(
+          batchOnce(
             `${file}|late`,
-            `⏰ 定时任务「${nameOf(job)}」原定 ${fmtLocal(due)} 触发，迟到了 ${Math.round(lateMs / 60000)} 分钟，超过 ${Math.round(MAX_LATE_MS / 60000)} 分钟的补跑窗口，这次已跳过。`,
+            capped
+              ? `⏰ 定时任务「${nameOf(job)}」原定 ${fmtLocal(due)} 触发，已迟到超过 ${Math.round(ONE_SHOT_MAX_MS / 3_600_000)} 小时，不再补发，这次已跳过。`
+              : `⏰ 定时任务「${nameOf(job)}」原定 ${fmtLocal(due)} 触发，迟到了 ${Math.round(lateMs / 60000)} 分钟，超过 ${Math.round(MAX_LATE_MS / 60000)} 分钟的补跑窗口，这次已跳过。`,
           );
           continue;
         }
@@ -498,7 +535,7 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
             waits.delete(file);
             markFired(file, dueIso, { when: job.when, status: 'skipped-busy' });
             console.log(`[sched] 跳过「${nameOf(job)}」：并发已满，等了超过 ${Math.round(MAX_LATE_MS / 60000)} 分钟仍没排上`);
-            void noticeOnce(
+            batchOnce(
               `${file}|busy`,
               `⏰ 定时任务「${nameOf(job)}」原定 ${fmtLocal(due)} 触发，并发名额一直被占着，等了超过 ${Math.round(MAX_LATE_MS / 60000)} 分钟仍没排上，这次已跳过。`,
             );
@@ -515,10 +552,15 @@ export function startScheduler({ schedulesDir, stateFile, onFire, turnFor, notif
     }
   };
 
-  const safeTick = () => { try { tick(); } catch (e) { console.error('[sched]', e); } };
+  const safeTick = () => {
+    try { tick(); } catch (e) { console.error('[sched]', e); }
+    void flushBatch();
+  };
   const timer = setInterval(safeTick, TICK_MS);
+  // 启动恢复与首拍扫描算同一拍：通知攒到首拍末一起发
   try { recover(); drainResume(); } catch (e) { console.error('[sched]', e); }
-  safeTick();
+  try { tick(); } catch (e) { console.error('[sched]', e); }
+  void flushBatch();
   firstDone = true;
   const first = Promise.allSettled(firstPending).then(() => {});
   console.log(`定时任务调度器已启动（每 ${TICK_MS / 1000}s 检查一次）：${schedulesDir}`);
