@@ -22,6 +22,8 @@ import { tasksCommandReply, listPlain, listWhen } from './sched-approval.js'; //
 import { resolveTurn } from './turn-context.js'; // BRIDGE-PRIV-1：一轮的「身份 × 场合」只在入口算一次
 import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.js';
 import { OWNER_DM_FILE_NAME, loadOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
+import { childRegistryFor, CHILD_REGISTRY_FILE, deferUntilAwake, orphanNoticeText } from './child-registry.js'; // BRIDGE-RUN-2
+import { readEnvFileKeys, registerEnvFileKeys } from './child-env.js'; // BRIDGE-RUN-2
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
@@ -122,6 +124,11 @@ const OWNER_DM_FILE = path.join(DATA_DIR, OWNER_DM_FILE_NAME);
 const ownerDmBoot = loadOwnerDm(OWNER_DM_FILE, OWNER_OPEN_ID || loadOwner(), { log: console.error });
 let ownerDmChatId = ownerDmBoot.chatId;
 console.log(ownerDmBootLine(ownerDmBoot));
+// BRIDGE-RUN-2：以下两件事必须在调度、心跳、长连接和任何 claude 子进程之前做完（都是同步的）：
+// ① 把 .env 文件里写了的键名登记给 childEnv——这些键一律不交给 claude（放行项除外）；② 清掉上一代桥接被强杀后留下的 claude 进程组。
+const envFileExtraKeys = registerEnvFileKeys(readEnvFileKeys(process.env.DOTENV_CONFIG_PATH || path.resolve(process.cwd(), '.env'), { log: console.error }));
+if (envFileExtraKeys.length) console.log(`[config] .env 里另有 ${envFileExtraKeys.length} 个未登记的键，不交给 claude：${envFileExtraKeys.join(', ')}`);
+const orphanReap = childRegistryFor(path.join(DATA_DIR, CHILD_REGISTRY_FILE)).reapPrevious({ log: console.log });
 const voiceChats = new Set(); // 开启语音回复的会话
 
 function isAllowed(openId, chatId, isP2p) {
@@ -995,6 +1002,7 @@ async function scopeSelfCheck() {
   // BRIDGE-ACCT-1：配置了备用账号时自检备用 bin；失败只告警、本次视为未配置。未配置时什么也不打
   verifyFallbackAtStartup({ log: console.log, warn: console.error });
   setAccountNotifier((text) => sendToOwner(text), { isQuiet: () => inQuietHours(new Date(), heartbeatSettings.quietHours) }); // 切到备用时私信 owner（一次备用期一条；免打扰时段延后；失败不影响对话）
+  if (orphanReap.killed > 0) deferUntilAwake({ send: () => sendToOwner(orphanNoticeText(orphanReap.killed)), isQuiet: () => inQuietHours(new Date(), heartbeatSettings.quietHours), log: console.error }); // BRIDGE-RUN-2：上次异常退出清掉了进行中的任务时私信 owner 一条（免打扰时段延后）
   if (shadowed.length) {
     console.error(`[config] ⚠️ 以下变量被 shell 环境覆盖，.env 里的值未生效：${shadowed.join(', ')}`);
   }

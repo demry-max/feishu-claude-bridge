@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { makeSandbox, childProcessEnv, runDriver } from './fixtures/run-helpers.mjs';
 
 const CLEANUP_DRIVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'cleanup-driver.mjs');
+const CLEANUP_PATHS_DRIVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'cleanup-driver-paths.mjs');
 
 const argVal = (args, flag) => {
   const i = args.indexOf(flag);
@@ -95,6 +96,34 @@ describe('MCP 凭据不进 argv', () => {
         assert.equal(r.result[name].left, 0, `${name}：promise 落定时临时 MCP 目录还在`);
         assert.equal(r.result[name].leftLater, 0, `${name}：临时 MCP 目录没清掉`);
         // rm 在迟到事件都跑完之后才数：启动失败时旧写法 error / close 各清一次（共 2 次）
+        assert.equal(r.result[name].rm, 1, `${name}：应恰好清理一次，实际 ${r.result[name].rm} 次`);
+      }
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  // BRIDGE-RUN-2（M1，RUN-1 复审点名补的测试）：上一条只覆盖正常 / 错误 result / 启动失败。
+  // 空闲超时、结果宽限到期、取消是「我们主动杀进程」的三条收尾，同样都走 settle()：
+  // 临时 MCP 配置目录（含 App Secret 的 0600 文件）要在 promise 落定时就没了，且只清一次。
+  test('runClaude 另三种收尾（空闲超时 / 结果宽限到期 / 取消）也清掉临时 MCP 配置目录，且各清一次（行为断言）', { timeout: 60_000 }, async () => {
+    const sb = makeSandbox('mcp-cleanup-paths');
+    try {
+      const env = childProcessEnv(sb, { FEISHU_APP_ID: 'cli_test', FEISHU_APP_SECRET: SECRET, FEISHU_TOOLS: undefined, CLAUDE_MAX_RETRIES: '0' });
+      const r = await runDriver(CLEANUP_PATHS_DRIVER, env, 40_000);
+      assert.ok(r.result, `驱动没有给出结果（退出码 ${r.code}）：${r.err.slice(-300)}`);
+      // 三条路径各自的收尾方式：先确认真的走到了想测的那条，再数目录与清理次数
+      assert.deepEqual(
+        Object.fromEntries(Object.entries(r.result).map(([k, v]) => [k, [v.outcome, v.how]])),
+        { idle: ['rejected', 'timeout'], grace: ['resolved', 'result'], cancel: ['rejected', 'cancelled'] },
+      );
+      assert.equal(r.result.grace.value, '好', '结果宽限到期时应以已收到的结果收尾');
+      assert.match(r.out, /结果已到但进程 0\.3 秒未退出，已结束/, '宽限到期那条日志');
+      assert.equal(r.result.cancel.cancelReturned, true, '取消应当命中正在跑的那一轮');
+      for (const name of ['idle', 'grace', 'cancel']) {
+        assert.equal(r.result[name].spawns, 1, `${name}：应只起一个子进程（没有重试 / 重放）`);
+        assert.equal(r.result[name].left, 0, `${name}：promise 落定时临时 MCP 目录还在`);
+        assert.equal(r.result[name].leftLater, 0, `${name}：临时 MCP 目录没清掉`);
         assert.equal(r.result[name].rm, 1, `${name}：应恰好清理一次，实际 ${r.result[name].rm} 次`);
       }
     } finally {

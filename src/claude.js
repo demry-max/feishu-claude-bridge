@@ -10,6 +10,7 @@ import { patchEnvFile } from './env-file.js';
 import { routeTurn, DEFAULT_EXEC_TRIGGERS } from './lanes.js';
 import { spawnBinFor, runWithAccount, skipErrorSession, accountStatusLine } from './account-fallback.js'; // BRIDGE-ACCT-1 备用账号（未配置时零变化）
 import { childEnv } from './child-env.js'; // BRIDGE-RUN-1：交给 claude 子进程的环境（去掉桥接自己的配置与飞书凭据）
+import { childRegistryFor, CHILD_REGISTRY_FILE } from './child-registry.js'; // BRIDGE-RUN-2：登记在跑的 claude 进程组，桥接被强杀后下次启动清理
 export { routeTurn, DEFAULT_EXEC_TRIGGERS };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -392,6 +393,8 @@ const liveChildren = (globalThis[Symbol.for('feishu-claude-bridge.claude.live-ch
   });
   return set;
 })());
+// BRIDGE-RUN-2：在跑的 claude 进程组记到 data/claude-children.json（只有 pid / 进程组 / 启动时间），桥接被 SIGKILL 后下次启动时清理
+const childRegistry = childRegistryFor(path.join(DATA_DIR, CHILD_REGISTRY_FILE));
 
 // 运行中的 claude 子进程：chatId → child，供 /cancel 终止
 const running = new Map();
@@ -1356,6 +1359,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
     });
     running.set(chatId, child);
     if (child.pid) liveChildren.add(child); // 桥接退出时据此收掉还在跑的进程组
+    if (child.pid) childRegistry.add(child.pid); // BRIDGE-RUN-2：写进记录文件；桥接被强杀、没机会清理时，下次启动据此收尸
     const startedGeneration = resetGeneration.get(chatId) ?? 0; // /new 撤销检测用
     let stderr = '';
     let pending = ''; // 暂存的 assistant 文本（可能是中间进度，也可能是最终答案）
@@ -1391,6 +1395,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       clearTimeout(drainTimer);
       clearTimeout(hardTimer);
       liveChildren.delete(child);
+      if (child.pid) childRegistry.remove(child.pid); // BRIDGE-RUN-2：只在这里摘记录（'exit' 时不摘：此刻孙进程可能还攥着进程组）
       if (running.get(chatId) === child) running.delete(chatId); // 同一会话键上后来者的登记不能被误删
       cleanup(); // 凭据临时文件：无论成败都删
       try { rl.close(); } catch { /* 已关 */ }
@@ -1617,6 +1622,9 @@ const sleepAbortable = (chatId, ms) =>
     });
   });
 
+// BRIDGE-RUN-2：owner 私聊这一轮因为「原会话已失效」换了新会话时，附在答案后面的一句话（只在成功返回时附）
+export const SESSION_RENEWED_NOTE = '（提示：原来的会话已失效，这一轮是在新会话里回答的，之前聊过的上下文已经不在了；需要的话把要点再说一遍。）';
+
 /**
  * 运行 claude 无头模式，网络类失败自动重试（默认最多 2 次，退避 3s / 15s）。
  * 重试次数可用 CLAUDE_MAX_RETRIES 调整，设 0 关闭。
@@ -1627,11 +1635,17 @@ const sleepAbortable = (chatId, ms) =>
  * 模型一个工具都没调、只收到 API Error: 529 Overloaded 的纯网络类失败，被误判成「执行到一半」而放弃重试。
  */
 export async function runClaude(chatId, prompt, isOwner = false, extraTools = [], onProgress = null, opts = {}) {
+  // BRIDGE-RUN-2：本轮（含网络重试）里只要有过一次「原会话不存在、换了新会话」就记下，不随重试清零
+  let renewed = false;
+  const acct = { key: chatId, onRenewed: () => { renewed = true; } };
   for (let attempt = 0; ; attempt++) {
     try {
       // BRIDGE-ACCT-1：账号层重试包在网络重试之内（不 sleep、不占名额）；未配置备用时直接调用。
-      // BRIDGE-RUN-1（M5）：第三个参数只用来给「原会话不存在」的那行日志署会话键
-      return await runWithAccount((o) => runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, o), opts, { key: chatId });
+      // BRIDGE-RUN-1（M5）：第三个参数署会话键（「原会话不存在」那行日志用）；BRIDGE-RUN-2：另带 onRenewed，换新会话时回调
+      const out = await runWithAccount((o) => runClaudeOnce(chatId, prompt, isOwner, extraTools, onProgress, o), opts, acct);
+      // 只有 owner 私聊、且这一轮确实答出了内容，才在答案后补一句；失败照旧抛错，不带这句话
+      if (renewed && opts?.turn?.kind === 'owner-dm' && typeof out === 'string' && out.trim()) return `${out}\n\n${SESSION_RENEWED_NOTE}`;
+      return out;
     } catch (e) {
       const msg = String(e?.message ?? e);
       if (e?.acted && !e?.cancelled && RETRYABLE.test(msg)) {
