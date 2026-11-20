@@ -27,6 +27,14 @@ const claude = await import(`${CLAUDE_URL}?reap=${process.pid}`);
 // SIGTERM = 正常停：走 process.exit，让 claude.js 的 exit 监听器把还在跑的进程组一起收掉
 process.on('SIGTERM', () => process.exit(0));
 
+// 锚点 = 测试文件进程（FAKE_ANCHOR_PID）：测试被中断 / 被杀后它没了，驱动随之退出（走 exit 监听，带走自己的进程组），不会无限期挂着
+const anchor = Number(process.env.FAKE_ANCHOR_PID);
+if (Number.isInteger(anchor) && anchor > 1) {
+  setInterval(() => {
+    try { process.kill(anchor, 0); } catch (e) { if (e?.code === 'ESRCH') process.exit(0); }
+  }, 500).unref();
+}
+
 claude.runClaude('oc_reap', 'hi', true, [], null).catch(() => {});
 const lastSpawn = () => {
   const lines = fs.readFileSync(process.env.FAKE_LOG, 'utf8').split('\n').filter(Boolean);

@@ -78,6 +78,8 @@ describe('U1 判定表（指纹全对才整组结束）', () => {
     ['形态词只在第 0 个词', { command: '-p --output-format stream-json --verbose' }],
     ['四个形态词中间夹了别的参数（第一个词后插 --model x）', { command: '/x/claude -p --model x --output-format stream-json --verbose' }],
     ['四个形态词中间夹了别的参数（stream-json 与 --verbose 之间）', { command: '/x/claude -p --output-format stream-json --resume abc --verbose' }],
+    ['形态词大小写不同（全大写）', { command: '/x/claude -P --OUTPUT-FORMAT STREAM-JSON --VERBOSE' }],
+    ['形态词大小写不同（只有一个词）', { command: '/x/claude -p --output-format STREAM-JSON --verbose' }],
   ];
   for (const [name, override] of BREAKS) {
     it(`逐项改坏：${name} → 不调用 kill，计入 dropped`, T, () => {

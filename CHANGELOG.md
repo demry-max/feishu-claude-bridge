@@ -141,6 +141,15 @@
   - **升级前先做一次只读的键名核对**：原来写在 `.env` 里、本想让 claude 也用上的变量（代理 `HTTPS_PROXY`、`ANTHROPIC_*`、`CLAUDE_CONFIG_DIR`、`NODE_EXTRA_CA_CERTS`、`LANG` / `LC_*` 等）升级后不再传给 claude，要给 claude 用就设在服务自己的环境里（前台启动时 export，常驻服务写进 plist / unit 的环境变量）；启动日志里 `[config] .env 里另有 N 个未登记的键` 那一行会列出被拦的键名。
 - **R1（复审后收紧三处）**：① 清理前的命令行形态判断由「四个标记词按顺序出现、中间可夹别的参数」收紧为「`-p --output-format stream-json --verbose` 四个词连续出现、起点在第 1 个参数或之后」，夹了别的参数的一律不算（只删记录、不发信号）；② `DOTENV_CONFIG_PATH` 以 `~` 开头时，读键名也按 dotenv 的规则展开成主目录；路径是显式指定而文件读不到时启动日志多一行 `[config] ⚠️ 指定的 .env 读不到，无法按文件剥离键`（不含键值，默认的 `./.env` 不存在仍不打日志）；③ 文档补一句：同一个键只要也写在 `.env` 里，即使值来自 shell 或服务环境也不传给 claude（放行表除外）。
 
+### BRIDGE-TESTFIX-1：全量测试限并发、测试被中断时不留进程、B2 不再按墙钟判断（只改测试与文档）
+
+- **`npm test` 限并发为 4**：脚本改成 `node --test --test-concurrency=4 test/*.test.js`（原来不设上限，18 核机器上 node 22 缺省同时跑 17 个文件）。同一台机器上的全量测量（`npm test`，改前 → 改后）：墙钟 21.2 s → 25.1 s，峰值进程 37 → 16，峰值 node 进程 28 → 11，峰值 RSS 合计约 1972 MB → 632 MB（改后数字以 BRIDGE-TESTFIX-1 交付时的实测为准）。临时改并发：直接 `node --test --test-concurrency=<n> test/*.test.js`——参数必须写在文件列表之前（`npm test -- …` 追加无效），也不能放进 `NODE_OPTIONS`；不提供环境变量覆盖（Windows 的 `npm test` 走 cmd，shell 变量写法用不了）。
+- **测试被中断 / 被杀后不留进程**：夹具进程（假 CLI 领头、`--gc` 孙进程、`reap-driver`）每 500 ms 探一次「测试文件进程」（锚点，环境变量 `FAKE_ANCHOR_PID`，只在测试夹具里用），锚点不存在时自己退出。测试正常运行时锚点一直在，既有断言（孤儿被遗弃后仍活着、整组被杀等）语义不变；没有该变量时夹具行为与改前一致。
+- **B2 不再按墙钟判断**：`child-reaper.test.js` 的 B2 原先断言 `took >= 400`，RUN-2 发布时高负载下出过 1 次假红。根因在夹具：假 CLI 先写孙进程 pid 文件、后写事件行，驱动一见 pid 文件就打 READY、测试随即 SIGKILL 驱动，假 CLI 若恰在两步之间被调度走，事件行写到已关闭的管道上 → EPIPE → 假 CLI 自己退出，整组在补 SIGKILL 前就没了。修法：假 CLI 先写事件行、后写 pid 文件；「忽略 SIGTERM」的假 CLI 吞掉 stdout / stderr 的 EPIPE。B2 改为注入 `kill` / `sleepSync` 判断：信号序列恰为 SIGTERM 后 SIGKILL、两者之间有探活、注入的睡眠合计 ≥ escalateMs。
+- **补 RUN-2 复审 LOW-R1**：`child-registry.test.js` 的 `BREAKS` 表加两条大小写变体命令行（`-P --OUTPUT-FORMAT STREAM-JSON --VERBOSE`、只有 `STREAM-JSON` 大写），「形态比较不分大小写」的变异现在会红。实现本身无缺陷。
+- 新增 `test/testfix-fixtures.test.js`（X1–X5）覆盖锚点、无锚点时行为不变、EPIPE 吞掉、pid 文件顺序。
+- `README.en.md` 补一条：定时任务文件里 `chat_id` 写法不对时的行为（与中文版一致）。零 `src/` 改动，合入后不需要重启线上桥接。
+
 ### owner 私聊目的地落盘（重启后定时任务立即恢复业务查询工具）
 
 - **问题**：owner 私聊的 chat_id 只记在内存里，桥接重启后、owner 没再私聊之前，「结果发 owner 私聊」的定时任务判不出目的地，没有 `mcp__biz__biz_get`（11/20 07:30 的定时任务因此报找不到工具）。

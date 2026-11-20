@@ -51,6 +51,7 @@ export function sandboxEnv(sb, extra = {}) {
   return {
     HOME: sb.home, TMPDIR: sb.tmp, WORKSPACE_DIR: sb.ws, GUEST_WORKSPACE_DIR: sb.guest, DATA_DIR: sb.data,
     CLAUDE_BIN: sb.bin, FAKE_PLAN: sb.planFile, FAKE_LOG: sb.logFile,
+    FAKE_ANCHOR_PID: String(process.pid), // 夹具进程盯着测试文件进程：它没了（被中断 / 被杀）夹具进程就自己退出
     FEISHU_TOOLS: 'false', BMS_TOOL_ENABLED: '', CLAUDE_FALLBACK_BIN: '', OWNER_NAME: '', OWNER_STRICT_DENY_WRITE_DIRS: '',
     DAILY_SESSION: '', OWNER_TOOL_PROFILE: '', ALLOWED_TOOLS: undefined, NON_OWNER_TOOLS: undefined, LARK_CLI: undefined,
     CLAUDE_MAX_RETRIES: '2', CLAUDE_IDLE_TIMEOUT_MS: undefined, CLAUDE_TIMEOUT_MS: undefined, CLAUDE_RESULT_GRACE_MS: undefined,

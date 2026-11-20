@@ -144,6 +144,8 @@ important security property of the project:
 | CLI auto-memory | on | off (that store is keyed by git repo root — shared otherwise) |
 | Sessions | by chat_id | by chat_id + sender, mutually invisible |
 
+- A scheduled job file whose `chat_id` is malformed (not `oc_` followed by 16–64 lowercase letters or digits) is not run. The log names only the file: `[sched] 任务 <file name> 的 chat_id 格式不对，已跳过` (once per file content per process). The owner also gets one DM about it (once per file content; the notice never contains the `chat_id` value).
+
 > **Why `--allowedTools` is not enough**: it is not a sandbox. It is an allow-without-asking list and
 > purely additive — `permissions.allow` from the user-level `~/.claude/settings.json` still applies to
 > guest sessions. In v1.x a guest could therefore execute local CLI tools acting as the owner.
