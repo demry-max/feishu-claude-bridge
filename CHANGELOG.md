@@ -31,6 +31,7 @@
 - **时间写法**：先 `parseTime`，不认再 `new Date`（`2026/11/21` 之类照旧可用）；cron 必须 5 段（或 `@` 宏）——6 段会被 cron-parser 当「带秒」，写错一位就变成每小时触发，现在按写法错误处理。`nextFireAt` 移到 `scheduler.js` 导出，`/tasks` 与调度器同一套判定，状态多显示「等位超时跳过」「被重启打断」。
 - **环境变量**：`SCHED_MAX_CONCURRENT`（1–10，默认 2）、`SCHED_MAX_LATE_MS`（60000–86400000，默认 7200000）在 `startScheduler` 里读取；留空按默认（不记日志），写错或越界按默认并记一行启动日志（值最多回显 20 个字）。没有新增变量名。
 - **已知限制**：发送重试（5 秒 + 30 秒）与模型调用自己的重试都算「进行中」，可能超过优雅退出的等待时间；超时被强杀时任务停在 `running`，下次启动按上面的规则补跑或记 `interrupted`（可能重发一次结果）。
+- **已知限制**：结果发送超时但飞书实际已收到时，重试可能多发一份（后续另开卡给发送加幂等键）。
 - **顺手**：答案静默而回传文件发不出去时，通知写「随附的文件发不出去」；任务落盘结束后日志记一行「结束（done|failed）」。
 - 测试：新增 `test/scheduler-reliability.test.js`（S1–S10、R1-1 通知合并、R1-2 迟到上限、R1-3 顺手项）、`test/scheduler-wiring.test.js`（S11：`index.js` 接线，含自诊断围栏与 `onProgress`）；`test/bridge.test.js` 把「迟到超窗口」拆成一次性 prompt 补发与 action 跳过两条，`test/message-queue.test.js` 补 `scheduler` 桩并更新 `onDrain` 字面。
 
