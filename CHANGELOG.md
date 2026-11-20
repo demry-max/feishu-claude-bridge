@@ -143,7 +143,7 @@
 
 ### BRIDGE-TESTFIX-1：全量测试限并发、测试被中断时不留进程、B2 不再按墙钟判断（只改测试与文档）
 
-- **`npm test` 限并发为 4**：脚本改成 `node --test --test-concurrency=4 test/*.test.js`（原来不设上限，18 核机器上 node 22 缺省同时跑 17 个文件）。同一台机器上的全量测量（`npm test`，改前 → 改后）：墙钟 21.2 s → 25.1 s，峰值进程 37 → 16，峰值 node 进程 28 → 11，峰值 RSS 合计约 1972 MB → 632 MB（改后数字以 BRIDGE-TESTFIX-1 交付时的实测为准）。临时改并发：直接 `node --test --test-concurrency=<n> test/*.test.js`——参数必须写在文件列表之前（`npm test -- …` 追加无效），也不能放进 `NODE_OPTIONS`；不提供环境变量覆盖（Windows 的 `npm test` 走 cmd，shell 变量写法用不了）。
+- **`npm test` 限并发为 4**：脚本改成 `node --test --test-concurrency=4 test/*.test.js`（原来不设上限，18 核机器上 node 22 缺省同时跑 17 个文件）。同一台机器上的全量测量（`npm test`，墙钟 / 峰值进程 / 峰值 node 进程 / 峰值 RSS 合计）：改前（并发 17，负载约 10）21.2 s / 37 / 28 / 约 1972 MB；改后交付实测（并发 4，负载约 8）20.3 s / 15 / 13 / 约 750 MB；改后复审实测（并发 4，机器另有负载 20–25）40.8 s / 19 / 10 / 约 810 MB。临时改并发：直接 `node --test --test-concurrency=<n> test/*.test.js`——参数必须写在文件列表之前（`npm test -- …` 追加无效），也不能放进 `NODE_OPTIONS`；不提供环境变量覆盖（Windows 的 `npm test` 走 cmd，shell 变量写法用不了）。
 - **测试被中断 / 被杀后不留进程**：夹具进程（假 CLI 领头、`--gc` 孙进程、`reap-driver`）每 500 ms 探一次「测试文件进程」（锚点，环境变量 `FAKE_ANCHOR_PID`，只在测试夹具里用），锚点不存在时自己退出。测试正常运行时锚点一直在，既有断言（孤儿被遗弃后仍活着、整组被杀等）语义不变；没有该变量时夹具行为与改前一致。
 - **B2 不再按墙钟判断**：`child-reaper.test.js` 的 B2 原先断言 `took >= 400`，RUN-2 发布时高负载下出过 1 次假红。根因在夹具：假 CLI 先写孙进程 pid 文件、后写事件行，驱动一见 pid 文件就打 READY、测试随即 SIGKILL 驱动，假 CLI 若恰在两步之间被调度走，事件行写到已关闭的管道上 → EPIPE → 假 CLI 自己退出，整组在补 SIGKILL 前就没了。修法：假 CLI 先写事件行、后写 pid 文件；「忽略 SIGTERM」的假 CLI 吞掉 stdout / stderr 的 EPIPE。B2 改为注入 `kill` / `sleepSync` 判断：信号序列恰为 SIGTERM 后 SIGKILL、两者之间有探活、注入的睡眠合计 ≥ escalateMs。
 - **补 RUN-2 复审 LOW-R1**：`child-registry.test.js` 的 `BREAKS` 表加两条大小写变体命令行（`-P --OUTPUT-FORMAT STREAM-JSON --VERBOSE`、只有 `STREAM-JSON` 大写），「形态比较不分大小写」的变异现在会红。实现本身无缺陷。
