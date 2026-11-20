@@ -117,7 +117,8 @@ npm run setup          # 自检：没有 .env 就从 .env.example 生成，并�
 ```bash
 npm run doctor         # 体检：全部通过（或只剩 ⚠️）即可
 npm start              # 日志出现 [ws] ws client ready 即连上；在飞书私聊机器人发「你好」
-npm run install-service   # macOS 开机自启（launchd）；npm run uninstall-service 卸载
+npm run install-service     # macOS 开机自启（launchd）
+npm run uninstall-service   # 卸载（-- --dry-run 只看判定；plist 属于别的目录时拒绝，确认后加 -- --force）
 ```
 
 - macOS：`install-service` 用当前 node、本仓库目录与 `which claude` 的结果生成 plist 并立即启动，不用手改占位符。
