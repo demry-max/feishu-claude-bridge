@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession, routeTurn } from './claude.js';
 import { buildPrompt, cleanIncoming, describeError, stripLocalPaths, lookupBotOpenId, botIdFailureCount } from './messages.js';
-import { createInboundGuard } from './inbound-guard.js'; // BRIDGE-INBOUND-1
+import { createInboundGuard, waitAtMost } from './inbound-guard.js'; // BRIDGE-INBOUND-1
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
 import { startScheduler, fireJob, nextFireAt, parseWhen } from './scheduler.js';
 import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY, inQuietHours } from './heartbeat.js';
@@ -175,9 +175,8 @@ function isDuplicate(messageId) {
   }
   return false;
 }
-// BRIDGE-INBOUND-1：入口兜底（src/inbound-guard.js）——进模型前出错的消息撤掉去重、回一句固定的话、记一行日志；挂在事件注册处
-const forgetMessage = (messageId) => { seen.delete(messageId); };
-const inboundGuard = createInboundGuard({ reply, forget: forgetMessage, log: console.error });
+// BRIDGE-INBOUND-1：入口兜底（src/inbound-guard.js）——进模型前出错的消息回一句固定的话、记一行日志；去重记录不动（飞书超时重推仍按重复丢弃）；挂在事件注册处
+const inboundGuard = createInboundGuard({ reply, log: console.error });
 
 // ---- 每个会话串行处理，避免并发 resume 冲突 ----
 const chatQueues = new Map();
@@ -248,6 +247,10 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   const senderOpenId = data.sender?.sender_id?.open_id;
   if (!message || !senderOpenId) return;
   if (isDuplicate(message.message_id)) return;
+  // BRIDGE-INBOUND-1：命令已经生效之后的那次回复。发不出去只记一行日志、不抛——抛出去兜底会对用户说「请再发一次」，而重发会把命令再执行一遍
+  const replyDone = async (text) => {
+    try { await reply(message.message_id, text); } catch { console.error('[inbound] 命令已执行，回复没发出去'); }
+  };
 
   // 群聊仅在 @机器人 时响应
   if (message.chat_type !== 'p2p') {
@@ -295,8 +298,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       return;
     }
     console.log(`[owner] 已锁定 owner open_id = ${owner}`);
-    await reply(
-      message.message_id,
+    await replyDone(
       `✅ 已将你登记为本机器人 owner（open_id: \`${owner}\`）。\n直接发消息即可对话；发送 **/new** 开启新会话，**/status** 查看会话状态。`
     );
     return;
@@ -365,7 +367,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
         if (isRunning(k)) cancelRun(k);
       }
     }
-    await reply(message.message_id, '🆕 已重置，下一条消息将开启全新 Claude 会话。');
+    await replyDone('🆕 已重置，下一条消息将开启全新 Claude 会话。');
     return;
   }
   if (text === '/tasks' || text.startsWith('/tasks ')) {
@@ -377,7 +379,8 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       await reply(message.message_id, '定时任务只在私聊里查看');
       return;
     }
-    await reply(message.message_id, text === '/tasks' ? describeTasks() : tasksDecision(text));
+    if (text === '/tasks') await reply(message.message_id, describeTasks());
+    else await replyDone(tasksDecision(text)); // approve / reject 已经落了决定
     return;
   }
   // 心跳开关只改运行时状态、从不写 .env。只在私聊生效（BRIDGE-HB-1B）：群聊里（包括 owner 本人发的）
@@ -388,14 +391,15 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       console.log('[heartbeat] 群聊里的 /heartbeat 不处理（只在 owner 私聊生效）');
       return;
     }
-    await reply(message.message_id, out);
+    if (/^\/heartbeat\s+(on|off)$/i.test(text.trim())) await replyDone(out); // 开关已经切了
+    else await reply(message.message_id, out);
     return;
   }
   // 每日新会话：/session 只在 owner 私聊生效；群聊不回复（同 /heartbeat）；off 时返回 undefined，照旧落到下面
   if (text === '/session' || text.startsWith('/session ')) {
     const out = await dailySession.command(sessionKey, text, { isOwner, chatType: message.chat_type, notify: (t) => reply(message.message_id, t) });
     if (out === null) { console.log('[daily-session] 群聊里的 /session 不处理（只在 owner 私聊生效）'); return; }
-    if (out !== undefined) { await reply(message.message_id, out); return; }
+    if (out !== undefined) { await replyDone(out); return; } // rotate 已把交接入队
   }
   // 引用回复心跳消息（BRIDGE-EV-1，HEARTBEAT_REPLY_SHORTCUTS=true 才生效；关时恒为 null，逐字走原流程）：
   // 正文恰好是「知道了」「推迟一天」「不做了」→ 桥接确定性回写并回一句确认，不进模型；
@@ -404,7 +408,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   if (isOwner && message.chat_type === 'p2p' && message.parent_id) {
     const shortcut = await heartbeatReplyShortcut({ message, isOwner, heartbeat });
     if (shortcut?.reply) {
-      await reply(message.message_id, shortcut.reply);
+      await replyDone(shortcut.reply); // 台账已经回写
       return;
     }
     ledgerHint = shortcut?.hint ?? '';
@@ -457,8 +461,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
           }
         }
         const next = setRuntimeConfig({ execModel: args[1], execEffort: args[2] });
-        await reply(
-          message.message_id,
+        await replyDone(
           next.execModel
             ? `✅ 执行模型 \`${next.execModel}\`（思考深度 \`${next.execEffort || next.effort || 'CLI 默认'}\`）。说「执行」或发 \`/do <任务>\` 即走该模型；聊天/规划仍用 \`${next.model || 'CLI 默认'}\`。`
             : `✅ 已关闭模型分工，所有轮次都用 \`${next.model || 'CLI 默认'}\`。`
@@ -483,8 +486,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       const next = EFFORT_LEVELS.includes(first)
         ? setRuntimeConfig({ effort: first })
         : setRuntimeConfig({ model: args[0], effort: args[1] });
-      await reply(
-        message.message_id,
+      await replyDone(
         `✅ 已切换：模型 \`${next.model || 'CLI 默认'}\`，思考深度 \`${next.effort || 'CLI 默认'}\`\n下一条消息即生效（无需重启）。`
       );
     } catch (e) {
@@ -503,7 +505,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
         killed = cancelRun(k) || killed;
       }
     }
-    await reply(message.message_id, withClearedNote(killed ? '🛑 已取消当前任务。' : '当前没有正在运行的任务。', cleared)); // 清掉 0 条时逐字同基线
+    await replyDone(withClearedNote(killed ? '🛑 已取消当前任务。' : '当前没有正在运行的任务。', cleared)); // 清掉 0 条时逐字同基线；取消已经生效
     return;
   }
   if (text === '/voice' || text === '/voice on' || text === '/voice off') {
@@ -513,7 +515,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
       : text === '/voice off' ? false
       : !voiceChats.has(message.chat_id);
     if (on) voiceChats.add(message.chat_id); else voiceChats.delete(message.chat_id);
-    await reply(message.message_id, on ? '🔊 已开启语音回复（回答会附一条语音）。发 /voice off 关闭。' : '🔇 已关闭语音回复。');
+    await replyDone(on ? '🔊 已开启语音回复（回答会附一条语音）。发 /voice off 关闭。' : '🔇 已关闭语音回复。');
     return;
   }
   // BRIDGE-MQ-1：owner 私聊 + 开关开 + 本会话正忙（含 isRunning 为 false 的起步 / 收尾窗口）→ 入队，当前轮结束后接着办
@@ -1014,10 +1016,14 @@ async function scopeSelfCheck() {
 
 // 启动通知放在全部自检之后：此前 announceStartup() 在 config 块之前调用，
 // cliProblem 在发通知那一刻永远是 null，「启动自检发现问题」那段文案从未真正发出过
-const botCheck = lookupBotOpenId(client, { entry: true }).then((id) => { // BRIDGE-INBOUND-1：与 scope 自检并行取一次机器人自身 open_id；取不到就在启动通知里说一句
+// 最多等 5 秒（取机器人信息的请求可能挂住，启动通知不能因此一直不发）：超时就当「暂时取不到」照常发，后台那次查询继续按原有重试跑
+const BOT_ID_STARTUP_WAIT_MS = 5000;
+const botCheck = waitAtMost(lookupBotOpenId(client, { entry: true }).then((id) => { // BRIDGE-INBOUND-1：与 scope 自检并行取一次机器人自身 open_id；取不到就在启动通知里说一句
   botIdStartupMissing = !id;
   if (!id) console.error(`[bot] 启动时取不到机器人自身 open_id（连续第 ${botIdFailureCount(client)} 次）`);
-}).catch(() => { botIdStartupMissing = true; });
+}).catch(() => { botIdStartupMissing = true; }), BOT_ID_STARTUP_WAIT_MS).then((r) => {
+  if (r === 'timeout') { botIdStartupMissing = true; console.error('[bot] 启动时取机器人自身 open_id 超过 5 秒还没结果，启动通知先发，后台继续取'); }
+});
 scopeSelfCheck().finally(() => botCheck.finally(() => announceStartup()));
 
 // BRIDGE-PERM-1：audit/strict 档每天 TOOL_AUDIT_SUMMARY_AT（默认 21:30）私信 owner 一份工具审计日报——

@@ -1,12 +1,20 @@
-// BRIDGE-INBOUND-1：入口兜底。消息在「进模型之前」出错（命令分支的回复失败、拼这一轮时抛错），
-// 过去用户看到的是没反应，去重表里还留着这条消息 id，飞书重推也被当成重复丢掉。
-// 兜底层挂在事件注册处：处理函数抛错或被拒时 ①撤掉去重 ②回一句固定的话 ③记一行日志 ④不再往外抛
-// （抛给 SDK 会回 500，是否触发重推未核实；吞掉异常再让用户自己重发，不会叠成两次处理）。
+// BRIDGE-INBOUND-1（V04）：入口兜底。消息在「进模型之前」出错（命令分支的回复失败、拼这一轮时抛错），
+// 过去用户看到的是没反应。兜底层挂在事件注册处：处理函数抛错或被拒时 ①回一句固定的话 ②记一行日志 ③不再往外抛
+// （抛给 SDK 会回 500，是否触发重推未核实；吞掉异常，由用户按提示自己重发）。
 //
-// 不变式（调用方 src/index.js 要保持）：「处理函数以抛错结束」⇔「这条消息还没入队、没进模型」。
+// 不撤去重：这条消息的 id 留在去重表里。理由——SDK 文档（node_modules/@larksuiteoapi/node-sdk/README.zh.md 的长连接一节）
+// 写明 3 秒内没处理完会触发超时重推；命令分支是「先执行、后回复」，回复慢失败时命令已经生效，
+// 撤去重会让晚到的同 id 重推把命令再执行一遍；普通消息则会变成「用户按提示重发 + 原 id 重推」处理两次。
+// 所以同一条消息的重推仍按重复丢弃，只有用户重发（新 id）才会重新处理。
+//
+// 不变式（调用方 src/index.js 要保持）：「处理函数以抛错结束」⇔「这条消息还没入队、没进模型、命令还没生效」。
 //   - 处理函数里交给队列、起这一轮之后，不得再加可能抛错的语句；
-//   - 起一轮的函数里，把任务交进串行链必须是最后一句。
+//   - 起一轮的函数里，把任务交进串行链必须是最后一句；
+//   - 命令分支里「执行已生效、之后才回复」的那次回复发不出去时，只记日志、不抛（index.js 的 replyDone）。
 // 已入队 / 已在跑的回合出错走各自原来的报错出口，不经过这里。
+// 已知例外：`/session rotate`（DAILY_SESSION=on）在 dailySession.command 里先把交接入队、再返回进度文案，
+// 入队之后才回复——这次回复若抛错，兜底那句「请再发一次」不准确（交接还在跑，重发会得到「有任务正在跑」）。
+// 所以 index.js 对它也走 replyDone（回复失败只记日志、不抛），例外随之不再发生；其余「先执行、后回复」的命令分支同理。
 //
 // 本文件不 import 本仓库任何模块。
 
@@ -30,7 +38,14 @@ export function errorStage(e) {
   return /\brunTurn\b/.test(stack) ? 'turn' : 'message';
 }
 
-export function createInboundGuard({ reply, forget, log = console.error } = {}) {
+/** 最多等 p 这么久：p 先落定（成交或失败）就照 p 的结果，超时则返回 'timeout'。p 本身不被取消，后台照常跑完；p 被拒时返回 'rejected' */
+export function waitAtMost(p, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), ms); });
+  return Promise.race([Promise.resolve(p).then(() => 'done', () => 'rejected'), timeout]).finally(() => clearTimeout(timer));
+}
+
+export function createInboundGuard({ reply, log = console.error } = {}) {
   const safeLog = (line) => { try { log(line); } catch { /* 日志出错不影响兜底 */ } };
   return async function guard(data, handle) {
     try {
@@ -40,7 +55,6 @@ export function createInboundGuard({ reply, forget, log = console.error } = {}) 
       const messageId = message?.message_id;
       let replied = 'no';
       if (messageId) {
-        try { forget?.(messageId); } catch { /* 撤去重出错也吞掉 */ }
         try {
           await reply(messageId, INBOUND_FAILED_REPLY);
           replied = 'yes';

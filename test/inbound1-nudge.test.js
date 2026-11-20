@@ -99,6 +99,37 @@ describe('第 3 项 固化提醒按轮绑定', () => {
     assert.equal(m.shouldRecycleSession('oc_n11b'), false);
   });
 
+  test('N13 带标记的那一轮起跑后中途 /new（resetSession），那一轮之后成功：不记已固化，不回收', async () => {
+    const m = await load();
+    await primed(m, 'oc_n13');
+    assert.equal(m.consumeMemoryNudge('oc_n13'), true);
+    SB.plan(okPlan(5000, { delayMs: 400 })); // 用量高于阈值：若误记已固化，shouldRecycleSession 会回 true
+    const r = m.runClaude('oc_n13', 'R2 带提醒', true, [], null, MARK);
+    await sleep(100);
+    m.resetSession('oc_n13'); // /new：全清提醒状态
+    await within(r, 15_000);
+    assert.equal(m.shouldRecycleSession('oc_n13'), false, '重置过的会话不能被记成已固化（src/claude.js 成功出口核对状态仍为在途）');
+  });
+
+  test('N14 带标记的那一轮在途时，同一会话一次不带标记的调用失败：不打「下一轮再提醒」、不重排；带标记那轮随后成功 → 回收', async () => {
+    const m = await load();
+    const cap = captureConsole();
+    try {
+      await primed(m, 'oc_n14');
+      assert.equal(m.consumeMemoryNudge('oc_n14'), true);
+      SB.plan(okPlan(5000, { delayMs: 500 }));
+      const tagged = m.runClaude('oc_n14', 'R2 带提醒', true, [], null, MARK);
+      await sleep(150); // 带标记的那次已起跑（假 CLI 已领走上面的计划）
+      SB.plan({ events: [init(), errResult('boom')], exit: 1 });
+      const plain = await settle(within(m.runClaude('oc_n14', '同会话普通轮', true, [], null), 15_000)); // 两次调用同一会话键并发：假 CLI 不拦，runClaude 本身不串行
+      assert.equal(plain.ok, false, '不带标记的那次失败');
+      assert.equal(cap.lines.filter((l) => l.includes(NOTICE)).length, 0, '不带标记的失败不重排提醒（src/claude.js 失败出口只对 carriesNudge）');
+      await within(tagged, 15_000);
+      assert.equal(cap.lines.filter((l) => l.includes(NOTICE)).length, 0);
+      assert.equal(m.shouldRecycleSession('oc_n14'), true, '带标记的那一轮成功才记已固化');
+    } finally { cap.restore(); }
+  });
+
   test('N12 接线：取到提醒的轮把 runClaude 包一层加 memoryNudge: true（lane、turn 原样）；不取提醒的轮不带这个键', async () => {
     const SRC = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
     const start = 'if (isOwner && consumeMemoryNudge(sessionKey)) {';
