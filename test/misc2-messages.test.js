@@ -105,8 +105,10 @@ describe('S02 错误说明去掉本机路径', () => {
       assert.equal(describeError(new Error(keep)).text, keep);
     }
     assert.equal(describeError(Object.assign(new Error('x'), { code: 'EHOSTUNREACH' })).text, '网络暂时不可达（EHOSTUNREACH）');
-    // 其他两个分支也过去路径
-    assert.ok(!describeError(Object.assign(new Error('x'), { code: 'ECONNRESET' })).text.includes('/'));
+    // network 分支：code 为空、message 带路径的网络类错误（走 `code || msg`，msg 里有路径）
+    const net = describeError(new Error("network error while reading '/Users/张 三/a b.png'"));
+    assert.equal(net.kind, 'network');
+    assert.equal(net.text, `网络暂时不可达（network error while reading '${PLACE}'）`);
     const perm = describeError(Object.assign(new Error('x'), { response: { status: 400, data: { code: 99991672, msg: "no scope for '/Users/a/b'" } } }));
     assert.equal(perm.kind, 'permission');
     assert.ok(perm.text.includes('99991672') && perm.text.includes(PLACE) && !perm.text.includes('/Users'));
@@ -127,5 +129,25 @@ describe('S02 错误说明去掉本机路径', () => {
     assert.ok(err, 'file 消息落盘失败会抛');
     const d = describeError(err);
     assert.ok(!d.text.includes(ws) && !d.text.includes(os.tmpdir()), d.text);
+  });
+});
+
+describe('S02 语音转写失败的回复（R1）', () => {
+  const audio = () => ({ message_id: 'om_a', message_type: 'audio', content: JSON.stringify({ file_key: 'fk_a', duration: 3000 }) });
+  test('V1 转写 / 下载抛带本机绝对路径的错误 → 回复没有绝对路径，仍有「语音转写失败」、错误码、非路径说明与权限提示', async () => {
+    const abs = path.join(ws, 'incoming', 'fk_a.opus');
+    const client = { im: { v1: { messageResource: { get: async () => ({ writeFile: async () => {
+      const er = new Error(`EACCES: permission denied, open '${abs}' (see /Users/张 三/logs/x.log)`);
+      er.code = 'EACCES';
+      throw er;
+    } }) } } } };
+    const r = await buildPrompt(client, audio(), ws);
+    assert.equal(r.prompt, null);
+    assert.match(r.unsupported, /^语音转写失败：/);
+    assert.ok(r.unsupported.includes('EACCES: permission denied'), r.unsupported);
+    assert.ok(r.unsupported.includes('<本机路径>'), r.unsupported);
+    assert.ok(!r.unsupported.includes(ws) && !r.unsupported.includes(os.tmpdir()), r.unsupported);
+    assert.doesNotMatch(r.unsupported, /\/(Users|tmp|var|private)\//);
+    assert.ok(r.unsupported.includes('（若是权限问题，请在开发者后台开通 speech_to_text:speech 并发布版本）'));
   });
 });

@@ -99,7 +99,7 @@ describe('S11 任务文件里下划线开头的键', () => {
 
 describe('S12 并发已满只在开始等位时记一行', () => {
   const FULL = /并发已满（1）/;
-  test('C5 占位期间推进 5 拍：只 1 行；占位结束后正常派发；同一文件新的一次等位再记 1 行；等位超时跳过的日志与通知不变', async (t) => {
+  test('C5 占位期间推进 5 拍：只 1 行；占位结束后正常派发；同一个调度器实例里同一文件到期时间变了算新的一次等位再记 1 行；等位超时跳过的日志与通知不变', async (t) => {
     const env = mkEnv(t);
     const g = gate();
     const notes = [];
@@ -108,31 +108,23 @@ describe('S12 并发已满只在开始等位时记一行', () => {
     env.write('b-wait.json', job({ name: 'wait' }));
     const h = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, maxConcurrent: 1,
       notifyOwner: async (x) => { notes.push(x); },
-      onFire: async (j) => { started.push(j.name); if (j.name === 'hog' || j.name === 'hog2') await g.p; } });
+      onFire: async (j) => { started.push(j.name); if (j.name === 'hog') await g.p; } });
     try {
       await settle();
       for (let i = 0; i < 5; i++) { t.mock.timers.tick(30_000); await settle(); }
       assert.equal(env.logs.filter((l) => FULL.test(l)).length, 1, `日志：${env.logs.filter((l) => FULL.test(l)).join('|')}`);
       assert.deepEqual(started, ['hog']);
+      // 同一个调度器实例、同一个文件还在等位：应触发时间变了（改了 when）→ 算新的一次等位，再记 1 行（w.dueIso !== dueIso 分支）
+      env.write('b-wait.json', job({ name: 'wait', when: localWhen(-120_000) }));
+      t.mock.timers.tick(30_000); await settle();
+      assert.equal(env.logs.filter((l) => FULL.test(l)).length, 2, '到期时间变了：新的一次等位再记 1 行');
+      for (let i = 0; i < 3; i++) { t.mock.timers.tick(30_000); await settle(); }
+      assert.equal(env.logs.filter((l) => FULL.test(l)).length, 2, '新的一次等位里再推进也不重复记');
+      assert.deepEqual(started, ['hog']);
       g.release(); await h.idle();
       t.mock.timers.tick(30_000); await settle(); await h.idle();
       assert.ok(started.includes('wait'), '慢任务结束后它照常派发');
-      assert.equal(env.logs.filter((l) => FULL.test(l)).length, 1);
-
-      // 新的一次等位：换一个应触发时间（新的 due），再被另一个占位任务挡住 → 再记 1 行
-      const g2 = gate();
-      const before = env.logs.filter((l) => FULL.test(l)).length;
-      h.stop();
-      const h2 = startScheduler({ schedulesDir: env.jobs, stateFile: env.state, maxConcurrent: 1,
-        notifyOwner: async () => {},
-        onFire: async (j) => { started.push(j.name); if (j.name === 'hog2') await g2.p; } });
-      env.write('a-hog.json', job({ name: 'hog2', when: localWhen(-30_000) }));
-      env.write('b-wait.json', job({ name: 'wait2', when: localWhen(-90_000) }));
-      try {
-        for (let i = 0; i < 4; i++) { t.mock.timers.tick(30_000); await settle(); }
-        assert.ok(started.includes('hog2'));
-        assert.equal(env.logs.filter((l) => FULL.test(l)).length, before + 1, '新的一次等位再记 1 行');
-      } finally { g2.release(); h2.stop(); }
+      assert.equal(env.logs.filter((l) => FULL.test(l)).length, 2);
     } finally { g.release(); h.stop(); env.cleanup(); }
   });
 

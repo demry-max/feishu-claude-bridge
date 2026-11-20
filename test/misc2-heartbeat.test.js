@@ -220,7 +220,7 @@ test('N4 send 前两次抛错：只记日志，第 3 拍发出，之后不再发
   assert.equal(h.logs.filter((l) => /已私聊 owner：台账目录读不了/.test(l)).length, 1);
 });
 
-test('N5 只有静默读失败（快照 / afterModel / digestNow / statusText）：0 条，下一拍目录正常也 0 条', async (t) => {
+test('N5 只有静默读失败（快照 / afterModel / digestNow / statusText）：0 条；下一拍状态文件读不出（提前返回）时静默读也没有登记故障；之后目录正常也 0 条', async (t) => {
   if (isRoot()) { t.skip(SKIP); return; }
   const env = mkEnv();
   writeTask(env, 'quote', base());
@@ -232,21 +232,28 @@ test('N5 只有静默读失败（快照 / afterModel / digestNow / statusText）
   try { await h.hb.beat(); } finally { fs.chmodSync(env.tasksDir, 0o755); }
   await dirDenied(env, async () => { h.hb.statusText(); await h.hb.digestNow(); });
   assert.equal(count(h, LEDGER), 0);
+  // 静默读若登记了故障，主读取没机会清掉它：状态文件读不出的那拍提前返回，beat() 末尾的通知照样会发
+  await fileDenied(env.stateFile, async () => { next(h); await h.hb.beat(); });
+  assert.equal(count(h, LEDGER), 0, '静默读没有登记台账目录故障');
   next(h); await h.hb.beat();
   assert.equal(count(h, LEDGER), 0);
 });
 
-test('N6 状态文件读不出来的那拍不改变台账目录故障状态：不重复通知', async (t) => {
+test('N6 状态文件读不出来的那拍不改变台账目录故障状态：目录坏并已通知 → 状态文件也坏（目录仍坏）→ 状态恢复、目录仍坏 → 仍只通知过 1 条', async (t) => {
   if (isRoot()) { t.skip(SKIP); return; }
   const env = mkEnv();
   writeTask(env, 'later', FAR());
   const h = harness(env, { config: CFG({}) });
   await h.hb.beat();
-  await dirDenied(env, async () => { next(h); await h.hb.beat(); });
+  await dirDenied(env, async () => {
+    next(h); await h.hb.beat();
+    assert.equal(count(h, LEDGER), 1, '目录坏并已通知');
+    await fileDenied(env.stateFile, async () => { next(h); await h.hb.beat(); }); // 提前返回，没读台账；目录仍坏
+    assert.equal(count(h, LEDGER), 1);
+    next(h); await h.hb.beat(); // 状态恢复、目录仍坏：故障状态没被清过，不重复通知
+    assert.equal(count(h, LEDGER), 1, '仍只通知过 1 条');
+    assert.equal(count(h, READ), 1);
+  });
+  next(h); await h.hb.beat(); // 目录也恢复
   assert.equal(count(h, LEDGER), 1);
-  await fileDenied(env.stateFile, async () => { next(h); await h.hb.beat(); }); // 提前返回，没读台账
-  next(h); await h.hb.beat(); // 都恢复
-  next(h); await h.hb.beat();
-  assert.equal(count(h, LEDGER), 1);
-  assert.equal(count(h, READ), 1);
 });

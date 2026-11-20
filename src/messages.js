@@ -442,7 +442,7 @@ export async function buildPrompt(client, message, workspaceDir, senderOpenId = 
         return {
           prompt: null,
           attachments: [],
-          unsupported: `语音转写失败：${e?.message ?? e}\n（若是权限问题，请在开发者后台开通 speech_to_text:speech 并发布版本）`,
+          unsupported: `语音转写失败：${stripLocalPaths(e?.message ?? e)}\n（若是权限问题，请在开发者后台开通 speech_to_text:speech 并发布版本）`,
         };
       }
     }
