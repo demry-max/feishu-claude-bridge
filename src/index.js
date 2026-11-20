@@ -5,7 +5,7 @@ import path from 'node:path';
 import { runClaude, checkCliEnvironment, resetSession, abortRetries, sessionKeysWithPrefix, runningKeysWithPrefix, sessionInfo, WORKSPACE_DIR, GUEST_WORKSPACE_DIR, workspaceFor, outboxDirFor, cancelRun, isRunning, getRuntimeConfig, setRuntimeConfig, MODEL_ALIASES, EFFORT_LEVELS, consumeMemoryNudge, shouldRecycleSession, routeTurn } from './claude.js';
 import { buildPrompt, cleanIncoming, describeError } from './messages.js';
 import { loadOwner, saveOwner, DATA_DIR } from './store.js';
-import { startScheduler } from './scheduler.js';
+import { startScheduler, fireJob, nextFireAt } from './scheduler.js';
 import { startHeartbeat, heartbeatConfig, privateHeartbeatCommand, HEARTBEAT_KEY, inQuietHours } from './heartbeat.js';
 import { VERIFY_KEY } from './verifier.js';
 import { createShutdown, shutdownGraceSec, replyIfDraining } from './shutdown.js';
@@ -702,23 +702,7 @@ async function sendMarkdown(receiveIdType, receiveId, text, opts = {}) {
 const SCHEDULES_DIR = path.join(WORKSPACE_DIR, 'schedules');
 const SCHED_STATE_FILE = path.join(DATA_DIR, 'schedule-state.json');
 
-// 下次触发时间：/help 承诺了「上次/下次」，此前只实现了上次
-function nextFireAt(job) {
-  if (job.enabled === false) return null;
-  const when = String(job.when ?? '').trim();
-  if (!when) return null;
-  try {
-    if (!when.startsWith('@') && !when.includes(' ')) {
-      // 纯日期（2026-09-01）会被按 UTC 解析，补上时间部分强制走本地时区
-      const norm = /^\d{4}-\d{2}-\d{2}$/.test(when) ? `${when}T00:00` : when;
-      const t = new Date(norm); // 一次性任务，本地时区
-      return !isNaN(t) && t > new Date() ? t : null;
-    }
-    return CronExpressionParser.parse(when, { currentDate: new Date() }).next().toDate();
-  } catch {
-    return null;
-  }
-}
+// 下次触发时间（nextFireAt）与调度器同一个 when 写法判定，从 scheduler.js 导入
 
 // /tasks：直读任务定义与触发状态，让 owner 随时能确认「它到底还在不在替我干活」
 function describeTasks() {
@@ -741,7 +725,7 @@ function describeTasks() {
       const rec = state[f];
       const at = typeof rec === 'string' ? rec : rec?.at;
       const st = typeof rec === 'string' ? '' : rec?.status;
-      const stLabel = { baseline: '已登记', running: '执行中', done: '已完成', failed: '失败', 'skipped-late': '迟到跳过' }[st] ?? '';
+      const stLabel = { baseline: '已登记', running: '执行中', done: '已完成', failed: '失败', 'skipped-late': '迟到跳过', 'skipped-busy': '等位超时跳过', interrupted: '被重启打断' }[st] ?? '';
       const last = at ? `${new Date(at).toLocaleString('zh-CN')}${stLabel ? `（${stLabel}）` : ''}` : '（尚未触发）';
       const status = job.enabled === false ? '⏸ 已停用' : '▶️ 启用';
       lines.push(`- ${status} **${job.name ?? f}** — \`${job.when}\``);
@@ -801,10 +785,12 @@ function schedTurnFor(source, job) {
   });
 }
 
-startScheduler({
+const scheduler = startScheduler({
   schedulesDir: SCHEDULES_DIR,
   stateFile: SCHED_STATE_FILE,
-  onFire: async (job) => {
+  turnFor: schedTurnFor, // 按引用传：启动补跑只补「目的地是 owner 私聊」的任务，判定与上面同一处
+  notifyOwner: (text) => sendToOwner(text), // 迟到跳过 / 被重启打断 / when 写错等私聊 owner（与启动通知同一条路）
+  onFire: async (job, ctx) => {
     const chatId = job.chat_id;
     // 动作型任务：切换模型/思考档，不走 Claude 调用
     if (job.action === 'set-model') {
@@ -824,64 +810,54 @@ startScheduler({
       }
       return;
     }
-    if (!chatId) {
-      console.error(`[sched] 任务「${job.name ?? job._file}」缺 chat_id，跳过`);
-      return;
-    }
     // 定时任务用独立会话上下文，避免污染用户正在进行的对话
     const schedChatId = `sched:${job._file}`;
     // 任务可自带档位，未指定则用全局配置；工具档固定为定时（BRIDGE-PERM-1）
     const schedOpts = { model: job.model, effort: job.effort, toolProfile: 'sched' };
     const schedTurn = schedTurnFor('sched', job); // 私密档只给「发往 owner 私聊」的任务；其余走访客边界
-    if (schedTurn.private === false && !ownerDmChatId) console.log(`[sched] 「${job.name ?? job._file}」owner 私聊目的地未知，按非私密档运行`);
-    try {
-      const answer = await runClaude(
+    if (chatId && schedTurn.private === false && !ownerDmChatId) console.log(`[sched] 「${job.name ?? job._file}」owner 私聊目的地未知，按非私密档运行`);
+    const sendCreate = (data) => client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } });
+    // 编排（缺 chat_id、调模型、发送重试与通知）在 scheduler.js 的 fireJob；这里只接线
+    await fireJob({
+      job,
+      // 中间旁白不发到目的会话（onProgress 传 null，与心跳、自诊断相同），只发最终结果
+      run: () => runClaude(
         schedChatId,
         job.prompt,
         schedTurn.private,
         [],
-        (p) => sendToChat(chatId, `⏳ ${p}`),
+        null,
         { ...schedOpts, turn: schedTurn }
-      );
-      const late = job._late ? `（迟到补跑 ${Math.round(job._late / 60000)} 分钟）` : '';
-      // 无事不报：答案整条就是 HEARTBEAT_OK（或为空）时静默跳过，
-      // 让「每天检查一遍，有问题才叫我」这类心跳型任务成为可能（判定见 isQuietAnswer）
-      const body = (answer ?? '').trim();
-      const quiet = isQuietAnswer(body);
-      if (quiet) {
-        console.log(`[sched] 「${job.name ?? job._file}」无需汇报，静默跳过`);
-      } else {
-        await sendToChat(chatId, `⏰ **${job.name ?? '定时任务'}**${late}\n\n${body}`);
-      }
+      ),
+      send: (text) => sendToChat(chatId, text),
       // 定时任务写的文件此前从不发送，会滞留到下一条任意消息被顺手发走
-      await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), (data) =>
-        client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } })
-      );
-    } catch (e) {
-      // 失败自诊断：让 Claude 判断是什么原因、能否自行修复。
-      // 登录类故障例外：诊断本身也要调 claude，只会同样失败（9/20–9/21 两天里每次都是
-      // 「诊断也失败了」），所以直接发确定性修复步骤。
-      const err = String(e?.message ?? e).slice(0, 800);
-      const diagTurn = schedTurnFor('sched-diag', job); // 与上面同一个目的地判定：发往非 owner 私聊的任务，自诊断也不带私密工具
-      await handleScheduledFailure({
-        err,
-        jobName: job.name ?? job._file,
-        send: (text) => sendToChat(chatId, text),
-        runDiagnosis: () => runClaude(
-          `sched-diag:${job._file}`,
-          // 自诊断是模板化的短任务，没必要用旗舰模型；提示词按工具档拼（audit/strict 或非私密档把任务指令/报错围栏起来）
-          schedDiagPrompt(job, err, { fence: diagTurn.private === false }),
-          diagTurn.private,
-          [],
-          null,
-          { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low', turn: diagTurn }
-        ),
-      });
-      // 失败时也要清空本任务的回传目录，否则残留文件会搭下一次报告一起发出
-      await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), (data) =>
-        client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...data } })
-      ).catch(() => {});
-    }
+      flush: () => flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate),
+      notifyOwner: (text, reason) => (ctx?.notifyOnce ? ctx.notifyOnce(reason, text) : sendToOwner(text)),
+      isQuiet: isQuietAnswer,
+      onRunFailure: async (e) => {
+        // 失败自诊断：让 Claude 判断是什么原因、能否自行修复。
+        // 登录类故障例外：诊断本身也要调 claude，只会同样失败（9/20–9/21 两天里每次都是
+        // 「诊断也失败了」），所以直接发确定性修复步骤。
+        const err = String(e?.message ?? e).slice(0, 800);
+        const diagTurn = schedTurnFor('sched-diag', job); // 与上面同一个目的地判定：发往非 owner 私聊的任务，自诊断也不带私密工具
+        await handleScheduledFailure({
+          err,
+          jobName: job.name ?? job._file,
+          send: (text) => sendToChat(chatId, text),
+          runDiagnosis: () => runClaude(
+            `sched-diag:${job._file}`,
+            // 自诊断是模板化的短任务，没必要用旗舰模型；提示词按工具档拼（audit/strict 或非私密档把任务指令/报错围栏起来）
+            schedDiagPrompt(job, err, { fence: diagTurn.private === false }),
+            diagTurn.private,
+            [],
+            null,
+            { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low', turn: diagTurn }
+          ),
+        });
+        // 失败时也要清空本任务的回传目录，否则残留文件会搭下一次报告一起发出
+        await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate).catch(() => {});
+      },
+    });
   },
 });
 
@@ -936,11 +912,11 @@ ownerDm = createOwnerDmRecorder({ file: OWNER_DM_FILE, boot: ownerDmBoot, log: c
 const shutdown = createShutdown({
   graceSec: shutdownGraceSec(process.env, console.error),
   inflight: () => turnsInFlight
-    + runningKeysWithPrefix('sched:').filter((k) => k !== HEARTBEAT_KEY && k !== VERIFY_KEY).length
+    + scheduler.inflightCount() // BRIDGE-SCHED-1：定时任务从派发到状态落盘（含发送、自诊断、重试等待）
     + (heartbeat.isInflight() ? 1 : 0)
     + ownerQueue.inflight(), // BRIDGE-MQ-1：「请稍后重发」等通知还没发完的、刚出队还没接上的（开关关时恒 0）
   // BRIDGE-MQ-1：停心跳后，owner 私聊队列里没处理的逐条回「助理正在重启，这条没处理，请稍后重发」（停心跳抛错也照发）
-  onDrain: () => { try { heartbeat.stop(); } finally { ownerQueue.flushForShutdown(); } },
+  onDrain: () => { try { scheduler.stop(); } catch (e) { console.error('[shutdown] 停定时任务调度出错:', e?.message ?? e); } try { heartbeat.stop(); } finally { ownerQueue.flushForShutdown(); } },
   log: console.log,
 });
 shutdown.install(process);

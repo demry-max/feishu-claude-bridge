@@ -307,18 +307,24 @@ describe('调度器（真跑 tick 的行为断言）', () => {
     fs.rmSync(env.dir, { recursive: true, force: true });
   });
 
-  test('迟到超过窗口则跳过，不补跑', async () => {
+  test('迟到超过窗口：一次性 prompt 任务补发一次（带迟到时长），action 型任务照旧跳过', async () => {
     const env = mkEnv();
     const fired = [];
     process.env.SCHED_MAX_LATE_MS = '60000';
-    const longAgo = localWhen(-3 * 3600_000);
-    write(env, 'stale.json', { name: 'stale', when: longAgo, prompt: 'x', enabled: true });
-    await run(env, (j) => fired.push(j.name));
-    assert.deepEqual(fired, [], '关机一夜后醒来不该把昨天的任务倒着补一遍');
-    const st = JSON.parse(fs.readFileSync(env.state, 'utf8'));
-    assert.equal(st['stale.json'].status, 'skipped-late', '状态要能分辨「跳过」与「执行」');
-    delete process.env.SCHED_MAX_LATE_MS;
-    fs.rmSync(env.dir, { recursive: true, force: true });
+    try {
+      const longAgo = localWhen(-3 * 3600_000);
+      write(env, 'stale.json', { name: 'stale', when: longAgo, prompt: 'x', enabled: true });
+      write(env, 'stale-act.json', { name: 'stale-act', when: longAgo, action: 'set-model', model: 'fable', enabled: true });
+      await run(env, (j) => fired.push(j));
+      assert.deepEqual(fired.map((j) => j.name), ['stale'], '一次性提醒迟到也补发；过期的模型切换不补做');
+      assert.ok(fired[0]._late >= 3 * 3600_000, '带上迟到时长，结果标题据此注明');
+      const st = JSON.parse(fs.readFileSync(env.state, 'utf8'));
+      assert.equal(st['stale.json'].status, 'done');
+      assert.equal(st['stale-act.json'].status, 'skipped-late', '状态要能分辨「跳过」与「执行」');
+    } finally {
+      delete process.env.SCHED_MAX_LATE_MS;
+      fs.rmSync(env.dir, { recursive: true, force: true });
+    }
   });
 
   test('未知 action 被拒绝执行（防注入的任务定义）', async () => {
