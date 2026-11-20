@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import { routeTurn } from '../src/lanes.js';
 import { detectConfirm, CONFIRM_DEFAULT_PROMPT } from '../src/tool-policy.js';
 import { createToolTurn } from '../src/tool-audit.js';
+import { resolveTurn } from '../src/turn-context.js';
 import { fenceUntrusted } from '../src/messages.js';
 import { createShutdown, replyIfDraining, DRAINING_REPLY } from '../src/shutdown.js';
 import * as mq from '../src/message-queue.js';
@@ -99,6 +100,8 @@ function bridge(opts = {}) {
     withClearedNote: mq.withClearedNote,
     // 车道、确认、回执（真实）
     routeTurn, detectConfirm, createToolTurn, OWNER_TOOL_PROFILE: profile,
+    // BRIDGE-PRIV-1：每轮的身份 × 场合上下文（真实）；BMS 在这里恒关
+    resolveTurn, BIZ_ON: false,
     // 优雅退出（真实 createShutdown，注入时钟 / 定时器 / 退出函数）
     createShutdown: (opts) => createShutdown({ ...opts, pollMs: 1000, exit: (c) => r.exits.push(c), now: () => r.clock, timers }),
     shutdownGraceSec: () => graceSec,
@@ -936,7 +939,7 @@ describe('BRIDGE-MQ-1 接线（执行 src/index.js 真实代码，依赖全桩�
     for (const m of [g, gp, gg]) assert.deepEqual(b.emojis(m.id), [], '忙时被回「还在跑」的不加排队表情');
     const gs = b.send('/status', { type: 'group' });
     await settle();
-    assert.deepEqual(b.to(gs.id), ['**会话状态**\n- 会话: oc_group']);
+    assert.deepEqual(b.to(gs.id), [`**会话状态**\n- 会话: guest:oc_group:${OWNER}`]);
     b.open().forEach((c) => c.resolve('ok'));
     await settle();
     assert.equal(b.calls.length, 3, '这些会话结束后不补跑任何东西');
@@ -1167,7 +1170,7 @@ describe('BRIDGE-MQ-1 源码断言（index.js 接线写法——只证明写法�
   test('引用回复快捷仍在原位置、只出现一次，排在排队判定之前；合并轮 / 排队单条的确认与车道在 runTurn 里覆写', () => {
     assert.equal(SRC.split('heartbeatReplyShortcut(').length - 1, 1);
     assert.ok(SRC.indexOf('heartbeatReplyShortcut(') < SRC.indexOf('ownerQueue.shouldQueue('));
-    assert.ok(SRC.includes('const { message, senderOpenId, isOwner, sessionKey, text, built, ledgerHint, merged, queued } = spec;'));
+    assert.ok(SRC.includes('const { message, senderOpenId, isOwner: speakerIsOwner, turn, sessionKey, text, built, ledgerHint, merged, queued } = spec;'));
     assert.ok(SRC.includes('const confirm = (merged || queued) ? MERGED_NO_CONFIRM : detectConfirm(prompt, message.chat_type, isOwner);'));
     assert.ok(SRC.includes('const toolTurn = createToolTurn({ profile: OWNER_TOOL_PROFILE, isOwner, chatType: message.chat_type, prompt, confirm, runClaude, redact });'));
     assert.ok(!SRC.includes('confirm: merged ? MERGED_NO_CONFIRM'), '旧写法（只看 merged）已换掉');
@@ -1196,7 +1199,7 @@ describe('BRIDGE-MQ-1 源码断言（index.js 接线写法——只证明写法�
     assert.ok(SRC.includes('async function handleMessage(data, seq = ++arrivalSeq) {'));
     assert.ok(!SRC.includes('const seq = ++arrivalSeq; // BRIDGE-MQ-1：在第一个 await 之前取号'), '旧的函数体内取号已删');
     assert.equal(SRC.split('++arrivalSeq').length - 1, 2, '取号只有 trackedHandleMessage 与 handleMessage 默认参数两处');
-    const iKey = SRC.indexOf(': `guest:${message.chat_id}:${senderOpenId}`;');
+    const iKey = SRC.indexOf('const sessionKey = turn.sessionKey;'); // BRIDGE-PRIV-1：会话键公式搬进 turn-context.js
     const iArr = SRC.indexOf('if (ownerQueue.applies(isOwner, message.chat_type)) ownerQueue.arrivalStarted(sessionKey, seq);');
     assert.ok(iKey > 0 && iArr > iKey && iArr - iKey < 200, '会话键算出后紧接着登记');
     assert.ok(iArr < SRC.indexOf('built = await buildPrompt(client, message, myWorkspace, senderOpenId);'), '登记在下载附件之前');
@@ -1211,6 +1214,6 @@ describe('BRIDGE-MQ-1 源码断言（index.js 接线写法——只证明写法�
   test('合并 prompt 照旧作为 runClaude 的 prompt 参数走 stdin，不拼进命令行', () => {
     const claudeSrc = fs.readFileSync(new URL('../src/claude.js', import.meta.url), 'utf8');
     assert.ok(claudeSrc.includes('child.stdin.write(prompt)'));
-    assert.ok(SRC.includes('const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });'));
+    assert.ok(SRC.includes('const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane, turn });'));
   });
 });

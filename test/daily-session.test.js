@@ -916,7 +916,7 @@ describe('22 index.js 源码接线（只证明写法）', () => {
     const lines = SRC.split('\n');
     const li = lines.findIndex((l) => l.includes(ALIAS));
     assert.ok(lines[li - 1].includes('prompt = dailySession.beforeTurn({'), '紧挨在别名行之前');
-    assert.equal(lines[li + 1].trim(), 'const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });');
+    assert.equal(lines[li + 1].trim(), 'const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane, turn });');
     const iHb = SRC.indexOf("if (text === '/heartbeat'");
     const iSess = SRC.indexOf("if (text === '/session' || text.startsWith('/session '))");
     const iLedger = SRC.indexOf('let ledgerHint');

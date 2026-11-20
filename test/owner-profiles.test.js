@@ -28,6 +28,7 @@ process.on('exit', () => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const FIXTURE = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'owner-args-perm-legacy.json'), 'utf8'));
 const { larkRules, LARK_POLICY } = await import('../src/tool-policy.js');
+const { stripSnap, hasSecretsDeny, secretsDenyOf, disallowedOf } = await import('./helpers/strip-secrets-deny.js');
 
 // 与夹具生成脚本完全相同的基准环境与用例
 const BASE = {
@@ -128,6 +129,8 @@ const ACCOUNT = ['Artifact', 'CronCreate', 'CronDelete', 'CronList', 'RemoteTrig
 const IAS = `Edit(//${home.replace(/^\/+/, '')}/code/ias-ops/**)`;
 const COMMON_DENY = [...ACCOUNT, 'WebFetch', 'Bash(lark-cli api:*)', 'Bash(lark-cli auth logout:*)', 'Bash(codex:*)',
   'Bash(nohup:*)', 'Bash(npx:*)', IAS, 'Edit(./CLAUDE.md)', 'Edit(./.claude/**)'];
+// BRIDGE-PRIV-1：对所有带工具的档常开的 4 条（.env 拒读 + security 拒绝），追加在各档拒绝清单末尾
+const SEC4 = [`Read(/${REPO}/.env)`, `Read(/${REPO}/.env.*)`, 'Bash(security:*)', 'Bash(/usr/bin/security:*)'];
 const SCHED_DENY = ['Edit(./schedules/**)', 'Edit(./tasks/**)', 'Edit(./skills/**)'];
 const MCP_SCHED = ['doc_read', 'sheet_read', 'bitable_tables', 'bitable_fields', 'bitable_records', 'mail_attachment_download']
   .map((t) => `mcp__feishu__${t}`);
@@ -161,7 +164,10 @@ test('测1 legacy：未设/legacy/非法值时 owner 对话、执行、定时等
     assert.equal(errs.filter((l) => l.includes('OWNER_TOOL_PROFILE')).length, profile === 'bogus' ? 1 : 0, '非法值只记一行日志');
     for (const [name, c] of Object.entries(CASES)) {
       const mm = await load({ ...c.env, OWNER_TOOL_PROFILE: profile });
-      const got = snap(mm.buildClaudeArgs(...structuredClone(c.call)));
+      const raw = snap(mm.buildClaudeArgs(...structuredClone(c.call)));
+      // BRIDGE-PRIV-1：4 条 .env / security 拒绝规则对带工具的 argv 常开：先断言有，再从实际 argv 拿掉后逐字比对夹具（夹具不改）
+      assert.ok(hasSecretsDeny(raw.args), `${profile}/${name} 应带 4 条拒绝规则`);
+      const got = stripSnap(raw);
       assert.deepEqual(got, fixtureOf(name), `${profile}/${name}`);
       // 心跳的基线 argv 本就带 --settings/--setting-sources ''（上面已与夹具逐字比对），这里只查走 owner 档分派的用例
       if (c.call[1] === true && c.call[3]?.toolProfile !== 'heartbeat') {
@@ -186,7 +192,10 @@ test('测2 audit：隔离用户设置、lark-cli 全放行（不看 LARK_CLI）�
       const allowed = list(r.args, '--allowedTools');
       for (const t of ['Bash(lark-cli:*)', 'Bash(lark-cli)', 'mcp__feishu', 'Read', 'Edit(./memory/**)']) assert.ok(allowed.includes(t), `${lark}:${t}`);
       assert.ok(!r.args.includes('--tools'));
-      assert.ok(!r.args.includes('--disallowedTools'));
+      // BRIDGE-PRIV-1：audit 不再「完全没有」--disallowedTools，但只有那 4 条 .env / security 拒绝规则
+      assert.ok(hasSecretsDeny(r.args));
+      assert.deepEqual(disallowedOf(r.args), secretsDenyOf(r.args));
+      assert.equal(disallowedOf(r.args).length, 4);
       assertHook(r.args);
       assert.equal(r.mcp.env.FEISHU_MCP_FENCE, '1');
       assert.equal(r.mode, 0o600);
@@ -228,7 +237,8 @@ test('测3 strict 对话：9 个内置工具、lark 按子命令放行（无确�
   assert.ok(allowed.includes('Bash(lark-cli --as user im +messages-send:*)'));
   for (const rule of rulesOfClass('confirm', 'deny')) assert.ok(!allowed.includes(rule), rule);
   const deny = list(r.args, '--disallowedTools');
-  assert.deepEqual(sorted(deny), sorted(COMMON_DENY));
+  assert.deepEqual(sorted(deny), sorted([...COMMON_DENY, ...SEC4]));
+  assert.deepEqual(secretsDenyOf(r.args), SEC4);
   for (const t of ['WebFetch', 'Bash(codex:*)', 'Bash(nohup:*)', IAS]) assert.ok(deny.includes(t), t);
   assert.ok(IAS.startsWith('Edit(//') && IAS.includes(path.join(home, 'code', 'ias-ops').slice(1)));
   for (const t of SCHED_DENY) assert.ok(!deny.includes(t), `对话不该禁 ${t}`);
@@ -342,7 +352,9 @@ test('测5 确认通道：strict 私聊「确认 发吧」本轮加确认级规�
   for (const rule of confirmRules) assert.ok(!s.includes(rule), rule);
   const hb = snap(m.buildClaudeArgs('sched:heartbeat', true, [], { toolProfile: 'heartbeat', model: 'claude-test-hb', effort: 'low', confirm: true }));
   const hbm = await load({ ...CASES.heartbeat.env, OWNER_TOOL_PROFILE: 'strict' });
-  assert.deepEqual(snap(hbm.buildClaudeArgs('sched:heartbeat', true, [], { toolProfile: 'heartbeat', model: 'claude-test-hb', effort: 'low', confirm: true })), fixtureOf('heartbeat'));
+  const hbRaw = snap(hbm.buildClaudeArgs('sched:heartbeat', true, [], { toolProfile: 'heartbeat', model: 'claude-test-hb', effort: 'low', confirm: true }));
+  assert.ok(hasSecretsDeny(hbRaw.args), '心跳带 4 条拒绝规则（且只一份）');
+  assert.deepEqual(stripSnap(hbRaw), fixtureOf('heartbeat'));
   assert.ok(!hb.args.some((a) => confirmRules.includes(a)));
   // legacy / audit：确认不改 argv，也不改提示词
   for (const profile of ['legacy', 'audit']) {
@@ -350,7 +362,7 @@ test('测5 确认通道：strict 私聊「确认 发吧」本轮加确认级规�
     const plain = snap(mm.buildClaudeArgs('oc_x', true, [], { lane: 'chat', resumeId: 'sess-1' }));
     const conf = snap(mm.buildClaudeArgs('oc_x', true, [], { lane: 'chat', resumeId: 'sess-1', confirm: true }));
     assert.deepEqual(conf, plain, profile);
-    if (profile === 'legacy') assert.deepEqual(plain, fixtureOf('ownerChat'));
+    if (profile === 'legacy') { assert.ok(hasSecretsDeny(plain.args)); assert.deepEqual(stripSnap(plain), fixtureOf('ownerChat')); }
     const calls = [];
     const runClaude = async (...a) => { calls.push(a); return 'ok'; };
     const t = mm.createToolTurn({ profile: mm.OWNER_TOOL_PROFILE, isOwner: true, chatType: 'p2p', prompt: '确认 发吧', confirm: mm.detectConfirm('确认 发吧', 'p2p', true), runClaude, redact: (x) => x });
@@ -373,13 +385,17 @@ test('测14 心跳与访客 argv 三档都不变；sched-diag legacy 等于基�
     for (const name of ['heartbeat', 'guest', 'guestFile']) {
       const c = CASES[name];
       const m = await load({ ...c.env, OWNER_TOOL_PROFILE: profile });
-      assert.deepEqual(snap(m.buildClaudeArgs(...structuredClone(c.call))), fixtureOf(name), `${profile}/${name}`);
+      const raw = snap(m.buildClaudeArgs(...structuredClone(c.call)));
+      assert.ok(hasSecretsDeny(raw.args), `${profile}/${name} 应带 4 条拒绝规则（心跳只一份）`);
+      assert.deepEqual(stripSnap(raw), fixtureOf(name), `${profile}/${name}`);
     }
   }
   // sched-diag：legacy 逐字等于基线；audit/strict 改走「无任何工具」的自诊断档（BRIDGE-PERM-2 Q2）
   const d = CASES.schedDiag;
   const legacy = await load({ ...d.env, OWNER_TOOL_PROFILE: 'legacy' });
-  assert.deepEqual(snap(legacy.buildClaudeArgs(...structuredClone(d.call))), fixtureOf('schedDiag'), 'legacy/schedDiag');
+  const dRaw = snap(legacy.buildClaudeArgs(...structuredClone(d.call)));
+  assert.ok(hasSecretsDeny(dRaw.args), 'legacy 自诊断有工具，带 4 条拒绝规则');
+  assert.deepEqual(stripSnap(dRaw), fixtureOf('schedDiag'), 'legacy/schedDiag');
   for (const profile of ['audit', 'strict']) {
     const m = await load({ ...d.env, OWNER_TOOL_PROFILE: profile });
     const r = m.buildClaudeArgs(...structuredClone(d.call));
@@ -391,6 +407,7 @@ test('测14 心跳与访客 argv 三档都不变；sched-diag legacy 等于基�
     assert.ok(args.includes('--strict-mcp-config'), `${profile}/schedDiag --strict-mcp-config`);
     assert.ok(!args.includes('--mcp-config'), `${profile}/schedDiag 不挂 MCP`);
     assert.ok(!args.includes('--allowedTools'), `${profile}/schedDiag 不预批工具`);
+    assert.equal(secretsDenyOf(args).length, 0, `${profile}/schedDiag 零工具档不加 4 条拒绝规则（argv 与基线一致）`);
     assert.equal(val(args, '--model'), 'claude-test-diag', `${profile}/schedDiag 透传模型`);
     assert.match(val(args, '--append-system-prompt'), /没有任何工具/, `${profile}/schedDiag 系统提示标明无工具`);
   }
@@ -552,7 +569,7 @@ test('接线：index.js 确认判定在 routeTurn 之后、调用保持守卫字
   assert.ok(iAlias > 0 && src.indexOf(ALIAS, iAlias + 1) === -1, '别名行恰好出现一次');
   const lines = src.split('\n');
   const li = lines.findIndex((l) => l.includes(ALIAS));
-  assert.equal(lines[li + 1].trim(), 'const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane });', '别名行的下一行就是调用行');
+  assert.equal(lines[li + 1].trim(), 'const answer = await runClaude(sessionKey, prompt, isOwner, extraTools, progress.update, { lane: route.lane, turn });', '别名行的下一行就是调用行');
   assert.ok(iAlias > iConfirm, '别名在确认判定之后');
   assert.match(src, /await reply\(message\.message_id, toolTurn\.withReceipt\(answer \|\| '（Claude 返回了空回复）'\)\);/);
   const iSelf = src.lastIndexOf('scopeSelfCheck().finally(');

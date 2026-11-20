@@ -15,6 +15,8 @@ import { CASES, PROFILES, makeHarness, runMatrix, snapCase } from './fixtures/bi
 import { BIZ_TOOL, BIZ_SERVER, BIZ_SKILL } from '../src/biz-targets.js';
 import { BIZ_HEARTBEAT_LINE, SECURITY_DENY, BIZ_ENV_STRIP, ENV_BIN, SCHED_DEST_OWNER_P2P, schedDestOf } from '../src/biz-wiring.js';
 import { safeToolName } from '../src/tool-policy.js';
+import { resolveTurn } from '../src/turn-context.js';
+import { stripSnap, hasSecretsDeny } from './helpers/strip-secrets-deny.js';
 
 const REPO = fs.realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 const FIXTURE_FILE = path.join(REPO, 'test', 'fixtures', 'owner-args-biz-off-419d56f.json');
@@ -86,6 +88,42 @@ function expectOn(pname, name, off) {
   return s;
 }
 
+// ---- BRIDGE-PRIV-1：.env 拒读 + security 拒绝（4 条）对所有「有工具」的档常开；owner 在群里按访客边界跑 ----
+// 基线夹具（只读、不重新生成）比的是「别的东西」：比对前把实际 argv 里的这 4 条拿掉（stripSecretsDeny，只包实际 argv），
+// 4 条本身另行断言「有工具的档一定有」；ownerGroup 的期望改成访客形状（夹具里的 guest），多出的只有群聊说明与 --resume。
+const zeroTool = (pname, name) => name === 'verifier' || (pname !== 'legacy' && name === 'schedDiag'); // 零工具档：不加这 4 条
+const GROUP_NOTE = '\n- 本轮发言的是机器人的主人，但这里是群聊';
+function groupAsGuest(snap, tag) {
+  const s = stripSnap(snap);
+  const a = [...s.args];
+  const ri = a.indexOf('--resume');
+  if (ri >= 0) a.splice(ri, 2);
+  const pi = a.indexOf('--append-system-prompt');
+  const cut = a[pi + 1].indexOf(GROUP_NOTE);
+  assert.ok(cut > 0, `${tag}：owner 在群里的提示词要带「按访客权限运行」的说明`);
+  a[pi + 1] = a[pi + 1].slice(0, cut);
+  return { ...s, args: a };
+}
+const viewOf = (pname, name, snap) => (name === 'ownerGroup' ? groupAsGuest(snap, `${pname}/${name}`) : stripSnap(snap));
+const wantOff = (pname, name) => (name === 'ownerGroup' ? FIXTURE[pname].guest : FIXTURE[pname][name]);
+function assertOffMatrix(m, tag) {
+  for (const pname of Object.keys(PROFILES)) {
+    for (const name of Object.keys(CASES)) {
+      assert.deepEqual(viewOf(pname, name, m[pname][name]), wantOff(pname, name), `${tag} ${pname}/${name}`);
+      assert.equal(hasSecretsDeny(m[pname][name].args), !zeroTool(pname, name), `${tag} ${pname}/${name}：有工具的档才有那 4 条拒绝规则`);
+    }
+  }
+}
+/** 发往群 / 别的会话 / 目的地不明的定时：访客形状（访客工作区、只有 WebSearch、没有 mcp-config、4 条拒绝常开、没有 biz）。 */
+function assertSchedOtherShape(snap, tag) {
+  assert.equal(snap.cwd, '<guest-workspace>', tag);
+  assert.equal(flag(snap.args, '--tools'), 'WebSearch', tag);
+  assert.equal(flag(snap.args, '--allowedTools'), 'WebSearch', tag);
+  assert.equal(count(snap.args, '--mcp-config'), 0, tag);
+  assert.ok(hasSecretsDeny(snap.args), `${tag}：4 条拒绝规则常开`);
+  assert.doesNotMatch(JSON.stringify(stripSnap(snap)), /mcp__biz|mcp-biz|feishu-mcp|lark-cli/, tag);
+}
+
 let onCache = null;
 async function onMatrix() {
   if (!onCache) {
@@ -110,7 +148,7 @@ test('11 夹具：来自基线 419d56f，内容钉死（测试从不重新生成
 
 test('11 开关关（未设置 / 0）：三档各 17 个用例与基线夹具逐字一致', async () => {
   for (const v of [undefined, '0']) {
-    assert.deepEqual(await runMatrix(h, { BMS_TOOL_ENABLED: v }), FIXTURE, `BMS_TOOL_ENABLED=${v}`);
+    assertOffMatrix(await runMatrix(h, { BMS_TOOL_ENABLED: v }), `BMS_TOOL_ENABLED=${v}`);
   }
 });
 
@@ -122,8 +160,9 @@ test('11 只有恰好 "1" 才算开：空串 / true / yes / 前后空格 / 01 / 
     for (const [pname, profile] of Object.entries(PROFILES)) {
       const m = await h.load({ LARK_CLI: 'true', OWNER_TOOL_PROFILE: profile, BMS_TOOL_ENABLED: v });
       for (const name of names) {
-        assert.deepEqual(snapCase(m.buildClaudeArgs(...structuredClone(CASES[name].call)), h.norm), FIXTURE[pname][name],
-          `${pname}/${name} BMS_TOOL_ENABLED=${JSON.stringify(v)}`);
+        const snap = snapCase(m.buildClaudeArgs(...structuredClone(CASES[name].call)), h.norm);
+        assert.deepEqual(viewOf(pname, name, snap), wantOff(pname, name), `${pname}/${name} BMS_TOOL_ENABLED=${JSON.stringify(v)}`);
+        assert.ok(hasSecretsDeny(snap.args), `${pname}/${name}：4 条拒绝规则常开`);
       }
     }
   }
@@ -133,7 +172,10 @@ test('11 开关开：私聊 / 心跳只做加法；群聊（含 owner）、目�
   const on = await onMatrix();
   for (const pname of Object.keys(PROFILES)) {
     for (const name of ELIGIBLE) assert.deepEqual(on[pname][name], expectOn(pname, name, FIXTURE[pname][name]), `${pname}/${name}`);
-    for (const name of NEVER) assert.deepEqual(on[pname][name], FIXTURE[pname][name], `${pname}/${name} 不该有任何变化`);
+    for (const name of NEVER) {
+      assert.deepEqual(viewOf(pname, name, on[pname][name]), wantOff(pname, name), `${pname}/${name} 除那 4 条拒绝规则（与 owner 群聊的访客形状）外不该有任何变化`);
+      assert.equal(hasSecretsDeny(on[pname][name].args), !zeroTool(pname, name), `${pname}/${name}`);
+    }
   }
   assert.doesNotMatch(JSON.stringify(on), /ZZTESTMARK|bms_sk_/);
 });
@@ -203,10 +245,11 @@ test('11 定时任务按目的地：发往 owner 私聊才有 biz_get（只做�
       const m = await h.load({ ...CASES[name].env, OWNER_TOOL_PROFILE: profile, BMS_TOOL_ENABLED: '1' });
       const snap = (dest) => snapCase(m.buildClaudeArgs(...callOf(name, dest)), h.norm);
       assert.deepEqual(snap(SCHED_DEST_OWNER_P2P), expectOn(pname, name, FIXTURE[pname][name]), `${pname}/${name} 发往 owner 私聊`);
-      assert.deepEqual(snap(schedDestOf('oc_group', 'oc_owner')), FIXTURE[pname][name], `${pname}/${name} 发往群`);
-      assert.deepEqual(snapCase(m.buildClaudeArgs(...structuredClone(CASES[name].call)), h.norm), FIXTURE[pname][name], `${pname}/${name} 目的地缺失`);
+      // BRIDGE-PRIV-1：发往群 / 别的会话、目的地写法不对的定时，整个按访客边界跑（不只是不挂 biz）
+      assertSchedOtherShape(snap(schedDestOf('oc_group', 'oc_owner')), `${pname}/${name} 发往群`);
+      assert.deepEqual(stripSnap(snapCase(m.buildClaudeArgs(...structuredClone(CASES[name].call)), h.norm)), FIXTURE[pname][name], `${pname}/${name} 目的地缺失（调用里没有 schedDest：与关时一样）`);
       for (const bad of ['p2p', 'owner', 'OWNER-P2P', true, 1]) {
-        assert.deepEqual(snap(bad), FIXTURE[pname][name], `${pname}/${name} schedDest=${JSON.stringify(bad)}`);
+        assertSchedOtherShape(snap(bad), `${pname}/${name} schedDest=${JSON.stringify(bad)}`);
       }
     }
   }
@@ -214,8 +257,12 @@ test('11 定时任务按目的地：发往 owner 私聊才有 biz_get（只做�
   const src = fs.readFileSync(path.join(REPO, 'src', 'index.js'), 'utf8');
   assert.match(src, /\n {2}if \(isOwner && message\.chat_type === 'p2p'\) ownerDmChatId = message\.chat_id;\n/);
   assert.equal(src.match(/ownerDmChatId =/g).length, 2, '只有声明与上面那一处赋值');
-  assert.match(src, /\{ \.\.\.schedOpts, schedDest: schedDestOf\(chatId, ownerDmChatId\) \}/);
-  assert.equal(src.match(/schedDest:/g).length, 1, 'schedDest 只在定时那一处传');
+  // 目的地判定只有一处：schedTurnFor 里的 schedDestOf(chatId, ownerDmChatId)；定时与自诊断都经它（再各调一次）
+  assert.match(src, /schedDest: schedDestOf\(chatId, ownerDmChatId\), ownerDmKnown: Boolean\(ownerDmChatId\)/);
+  assert.equal(src.match(/schedDestOf\(/g).length, 1, '目的地判定（schedDestOf）只有这一处，别处不许再各判一遍');
+  assert.equal(src.match(/schedDest:/g).length, 1, 'schedDest 只在 schedTurnFor 里传给 resolveTurn');
+  assert.equal(src.match(/schedTurnFor\(/g).length, 3, '声明 + 定时 + 自诊断');
+  assert.match(src, /\{ \.\.\.schedOpts, turn: schedTurn \}/);
 });
 
 test('12 任何档、开或关：免询问白名单里没有 Bash(security / Bash(env / Bash(printenv / Bash(ps，也没有裸 Bash', async () => {
@@ -287,34 +334,35 @@ test('11 交接（handoff）、未知 toolProfile、带 chatType 的验收档：
     for (const [name, call] of Object.entries(calls)) {
       const got = snapCase(on.buildClaudeArgs(...structuredClone(call)), h.norm);
       assert.deepEqual(got, snapCase(off.buildClaudeArgs(...structuredClone(call)), h.norm), `${pname}/${name}`);
-      assert.doesNotMatch(JSON.stringify(got), /mcp__biz|mcp-biz|\.env\)/, `${pname}/${name}`);
+      assert.doesNotMatch(JSON.stringify(stripSnap(got)), /mcp__biz|mcp-biz|\.env\)/, `${pname}/${name}`);
+      assert.equal(hasSecretsDeny(got.args), name !== 'verifierP2p', `${pname}/${name}：有工具的档常开 4 条拒绝，验收档（零工具）没有`);
     }
   }
 });
 
-test('11 createToolTurn：开关开、owner 时把 chatType 带进 runClaude；关或非 owner 时就是基线的那一个', async () => {
+test('11 createToolTurn：biz 不再靠这层包装（BRIDGE-PRIV-1：turn 由 index.js 经 opts.turn 带下去）；非 owner 原样；串起来私聊有 biz_get、群聊没有', async () => {
   const seen = [];
   const spy = async (...a) => { seen.push(a); return 'ok'; };
   const optsOf = async (t) => {
     seen.length = 0;
-    await t.runClaude('oc_x', 'hi', true, [], null, { lane: 'chat' }); // index.js 的调用只带 lane
+    await t.runClaude('oc_x', 'hi', true, [], null, { lane: 'chat' }); // index.js 的调用带 lane 与 turn
     assert.equal(seen.length, 1);
     return seen[0][5];
   };
   const turn = (m, o) => m.createToolTurn({ profile: m.OWNER_TOOL_PROFILE, isOwner: true, prompt: 'hi', runClaude: spy, ...o });
 
-  // 开、legacy：基线返回原函数，这里多包一层，只加 chatType
+  // 开、legacy：就是原函数（chatType 不再往下带）；非 owner 原样
   let m = await h.load({ BMS_TOOL_ENABLED: '1' });
   let t = turn(m, { chatType: 'p2p' });
-  assert.deepEqual(await optsOf(t), { lane: 'chat', chatType: 'p2p' });
+  assert.equal(t.runClaude, spy);
   assert.equal(t.prompt, 'hi');
   assert.equal(t.withReceipt('ans'), 'ans');
   assert.equal(turn(m, { isOwner: false, chatType: 'p2p' }).runClaude, spy, '非 owner 原样');
 
-  // 开、audit、群聊：基线的工具事件与 confirm 照旧，另带 chatType=group
+  // 开、audit、群聊：基线的工具事件与 confirm 照旧，不带 chatType
   m = await h.load({ BMS_TOOL_ENABLED: '1', OWNER_TOOL_PROFILE: 'audit' });
   const o = await optsOf(turn(m, { chatType: 'group' }));
-  assert.equal(o.chatType, 'group');
+  assert.equal('chatType' in o, false);
   assert.equal(typeof o.onToolEvent, 'function');
   assert.equal(o.confirm, false);
 
@@ -326,18 +374,20 @@ test('11 createToolTurn：开关开、owner 时把 chatType 带进 runClaude；�
   assert.equal('chatType' in off, false);
   assert.equal(typeof off.onToolEvent, 'function');
 
-  // 串起来：同 index.js 的调用形状，私聊有 biz_get、群聊没有
+  // 串起来：同 index.js 的调用形状（isOwner = turn.private，opts 带 turn）：私聊有 biz_get、群聊（含 owner 本人）没有；4 条拒绝两边都有
   for (const [pname, profile] of Object.entries(PROFILES)) {
     m = await h.load({ BMS_TOOL_ENABLED: '1', OWNER_TOOL_PROFILE: profile });
     for (const [chatType, want] of [['p2p', true], ['group', false]]) {
+      const tn = resolveTurn({ source: 'chat', isOwner: true, chatType, chatId: 'oc_x', senderOpenId: 'ou_o', profile, bizOn: true });
       const tt = m.createToolTurn({
-        profile: m.OWNER_TOOL_PROFILE, isOwner: true, chatType, prompt: 'hi',
+        profile: m.OWNER_TOOL_PROFILE, isOwner: tn.private, chatType, prompt: 'hi',
         runClaude: async (chatId, p, owner, extra, onProgress, opts) => m.buildClaudeArgs(chatId, owner, extra, opts),
       });
-      const r = await tt.runClaude('oc_x', 'hi', true, [], null, { lane: 'chat' });
+      const r = await tt.runClaude(tn.sessionKey, 'hi', tn.private, [], null, { lane: 'chat', turn: tn });
       try {
         assert.equal(flag(r.args, '--allowedTools').split(',').includes(BIZ_TOOL), want, `${pname}/${chatType}`);
-        assert.equal(r.args.join('\n').includes('.env)'), want, `${pname}/${chatType}：.env 拒读跟着工具走`);
+        assert.equal(count(r.args, '--mcp-config'), want ? 1 : 0, `${pname}/${chatType}`);
+        assert.ok(hasSecretsDeny(r.args), `${pname}/${chatType}：4 条拒绝规则常开（不再跟着 biz 工具走）`);
       } finally {
         r.cleanup();
       }
