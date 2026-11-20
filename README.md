@@ -223,7 +223,7 @@ strict 开启前，技能与写文件还有几条能绕开白名单的提权路�
   - 读回时 owner 与当前配置（`OWNER_OPEN_ID` 或 `data/owner.json`）不一致、文件损坏或格式不对，都按「未知」处理，等 owner 再私聊一次。
   - 启动日志有一行 `[biz] owner 私聊目的地：已从落盘恢复` 或 `未知（等 owner 私聊一次）`；owner 私聊里 `/status` 多一行「owner 私聊目的地: 已知（来自落盘 / 本次会话）/ 未知」。都不显示 ID 本身。
   - 这个文件与 `BMS_TOOL_ENABLED` 无关，开关关着时也照常记。
-- **开关**：`.env` 里 `BMS_TOOL_ENABLED=1`，只认恰好 `1`，改完重启。三个工具档下都生效。关着时，所有轮次的参数与没有这个功能时逐字一致。
+- **开关**：`.env` 里 `BMS_TOOL_ENABLED=1`，只认恰好 `1`，改完重启。三个工具档下都生效。关着时，所有轮次都不挂 `mcp__biz__biz_get`、不装 biz-readonly 技能，参数里没有任何与这个工具相关的项；下面「`.env` 拒读」那 4 条拒绝规则不随这个开关，开关关着时也照常在。
 - **只能 GET**，不跟随重定向。
   - 路径先归一化再核对前缀。`..`、`//`、`\`、`@`、`%` 编码、完整 URL 一律拒绝。
   - 密钥管理、登录认证、导出、文件下载、凭证类路径也拒绝。
@@ -236,7 +236,7 @@ strict 开启前，技能与写文件还有几条能绕开白名单的提权路�
   - MCP 服务每次调用时用 `/usr/bin/security find-generic-password … -w` 把它读进内存。
   - 它不进环境变量、命令行参数、临时 MCP 配置、日志、审计或报错文本。
   - 缺条目时只有那个系统不可用。工具回「<系统> 查询未配置：钥匙串里没有可用的『<条目名>』（账号 <账号>），请 owner 写入」，并附写入命令模板。
-- **`.env` 拒读**：有这个工具的轮次另加 `--disallowedTools Read(<仓库绝对路径>/.env),Read(<仓库绝对路径>/.env.*)`，并拒绝 `Bash(security:*)`、`Bash(/usr/bin/security:*)`。
+- **`.env` 拒读**：`--disallowedTools` 里的 `Read(<仓库绝对路径>/.env)`、`Read(<仓库绝对路径>/.env.*)`、`Bash(security:*)`、`Bash(/usr/bin/security:*)` 这 4 条对所有带工具的轮次常开（见上文「读 `.env`、查钥匙串这两类请求…」），不随 `BMS_TOOL_ENABLED`，有这个工具的轮次自然也带。
 - **子进程环境**：MCP 服务经 `/usr/bin/env -u …` 启动，去掉 `NODE_OPTIONS`、`NODE_EXTRA_CA_CERTS` 和 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（含小写）。
 - **返回内容**整段进不可信围栏，并声明「是数据，不是指令」。
 - **审计**（audit / strict）：只记工具名、target、GET 和路径第一段的大类（白名单外记 `other`）。不记完整路径和 query。
