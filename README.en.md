@@ -535,6 +535,7 @@ Markdown card reply (plain-text fallback) + emoji receipts
 ## Security
 
 - `.env` (the App Secret, the optional `CLAUDE_CODE_OAUTH_TOKEN`), runtime data in `data/` and the workspace contents are all git-ignored. Don't commit them or paste them into chats. `npm run setup` / `doctor` only report present / missing, never the values.
+- Keys written in the bridge's `.env` are never passed to claude (the pass-through list — `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `USER`, `PATH`, `TMPDIR`, `APPDATA`, `NODE_TLS_REJECT_UNAUTHORIZED` — excepted). A key that is also written in `.env` is not passed even when its value comes from the shell or the service environment. The `.env` path is `DOTENV_CONFIG_PATH` (a leading `~` is expanded like dotenv does) or `./.env`; if an explicitly set path cannot be read, startup logs `[config] ⚠️ 指定的 .env 读不到，无法按文件剥离键` (no key values).
 - Non-owners have zero local file access; attachments are exposed read-only in a dedicated directory.
 - By default the owner gets local read-only tools plus writes to whitelisted directories (`memory/`, `skills/`, `schedules/`, `tasks/`, `outbox/`). Never grant Bash to an unattended bot, and never add `--dangerously-skip-permissions`.
 - To tighten the owner's tool surface further, watch the audit log with `OWNER_TOOL_PROFILE=audit` first, then switch to `strict`.

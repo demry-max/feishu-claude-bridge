@@ -412,6 +412,52 @@ describe('BRIDGE-RUN-2 .env 里写了的键不交给 claude', () => {
       assert.deepEqual(logs, []);
     });
 
+    test('E3 路径以 ~ 开头：按 dotenv 的规则展开成主目录，键名读得到并被 childEnv 剥掉', () => {
+      const home = path.join(SB.root, 'e3-home');
+      fs.mkdirSync(path.join(home, 'x'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'x', '.env'), `TILDE_SECRET=${VALUE}\nexport TILDE_OTHER=1\n`);
+      const logs = [];
+      const keys = readEnvFileKeys('~/x/.env', { home, log: (m) => logs.push(m) });
+      assert.deepEqual([...keys].sort(), ['TILDE_OTHER', 'TILDE_SECRET']);
+      assert.deepEqual(logs, []);
+      assert.deepEqual(registerEnvFileKeys(keys), ['TILDE_OTHER', 'TILDE_SECRET']);
+      assert.deepEqual(childEnv({ TILDE_SECRET: 'a', TILDE_OTHER: 'b', PATH: '/bin' }), { PATH: '/bin' });
+      registerEnvFileKeys([]);
+    });
+
+    test('E3 路径以 ~ 开头：不给 home 时用 os.homedir()（HOME）', () => {
+      const home = path.join(SB.root, 'e3-home2');
+      fs.mkdirSync(home, { recursive: true });
+      fs.writeFileSync(path.join(home, '.env'), 'HOME_KEY=1\n');
+      const saved = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        assert.deepEqual(readEnvFileKeys('~/.env', { log: () => {} }), ['HOME_KEY']);
+      } finally {
+        if (saved === undefined) delete process.env.HOME; else process.env.HOME = saved;
+      }
+    });
+
+    test('E3 显式指定的路径读不到：恰好一行日志、不抛、日志里没有路径和键值；默认路径不存在仍不打日志', () => {
+      const missing = path.join(SB.root, 'e3', 'explicit-missing.env');
+      const saved = process.env.DOTENV_CONFIG_PATH;
+      process.env.DOTENV_CONFIG_PATH = missing;
+      try {
+        const logs = [];
+        assert.deepEqual(readEnvFileKeys(missing, { log: (m) => logs.push(m) }), []);
+        assert.deepEqual(logs, ['[config] ⚠️ 指定的 .env 读不到，无法按文件剥离键']);
+        const tilde = [];
+        assert.deepEqual(readEnvFileKeys('~/no/such/.env', { explicit: true, home: SB.root, log: (m) => tilde.push(m) }), []);
+        assert.equal(tilde.length, 1);
+        const other = [];
+        assert.deepEqual(readEnvFileKeys(path.join(SB.root, 'e3', 'default-missing.env'), { log: (m) => other.push(m) }), []);
+        assert.deepEqual(other, [], '不是显式指定的路径不打日志');
+        assert.deepEqual(readEnvFileKeys(missing, { log: () => { throw new Error('日志坏了'); } }), [], '日志函数抛错也不抛');
+      } finally {
+        if (saved === undefined) delete process.env.DOTENV_CONFIG_PATH; else process.env.DOTENV_CONFIG_PATH = saved;
+      }
+    });
+
     test('E3 读不了（路径是目录）→ []，恰好一行带错误码的日志', () => {
       const dir = path.join(SB.root, 'e3', 'a-directory.env');
       fs.mkdirSync(dir, { recursive: true });

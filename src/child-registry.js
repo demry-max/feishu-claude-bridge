@@ -77,15 +77,14 @@ export function probeProcess(pid, { exec = execFileSync, psBin } = {}) {
   }
 }
 
-/** 命令按空白切词后，在下标 ≥1 处依次出现 -p / --output-format / stream-json / --verbose。 */
+/** 命令按空白切词后，-p / --output-format / stream-json / --verbose 四个词连续出现，且起点在下标 ≥1（宁严勿宽：夹了别的参数不算）。 */
 function hasClaudeShape(command) {
   if (typeof command !== 'string') return false;
   const words = command.split(/\s+/).filter(Boolean);
-  let at = 0;
-  for (let i = 1; i < words.length && at < SHAPE_WORDS.length; i += 1) {
-    if (words[i] === SHAPE_WORDS[at]) at += 1;
+  for (let i = 1; i + SHAPE_WORDS.length <= words.length; i += 1) {
+    if (SHAPE_WORDS.every((w, k) => words[i + k] === w)) return true;
   }
-  return at === SHAPE_WORDS.length;
+  return false;
 }
 
 /** 指纹是否全部对上（第 3d 条）：进程组、启动时间、调用形态、父进程是 1。 */

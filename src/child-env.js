@@ -20,8 +20,10 @@
 // 出现这里没归类的名字就红，并列出名字（只列名字，不含值）。新增配置项时，桥接自己用的加进
 // BRIDGE_OWN_KEYS；必须传给子进程的加进 PASSTHROUGH，并写明原因。
 //
-// 本文件不读任何环境变量，也不打印任何值；唯一读的是 .env 文件，且只留键名。
+// 本文件不打印任何值；读的只有 .env 文件（且只留键名）和 DOTENV_CONFIG_PATH（只用来判断路径是不是显式指定的）。
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { parse as parseDotenv } from 'dotenv';
 
 /** 必须传给子进程的键（桥接或脚本也读它们），每项写原因。与 BRIDGE_OWN_KEYS 互不相交。 */
@@ -72,17 +74,30 @@ let fileKeys = new Set();
 
 /**
  * 读 .env 文件里的键名（只要名字：值读出来就丢，不进日志、不进返回值）。
- * 文件不存在 → []，不打日志（没有 .env、全靠服务自己的环境变量是正常配法）；
+ * 路径开头的 `~` 按 dotenv 的规则展开成用户主目录（dotenv 的 _resolveHome：只看第 1 个字符是不是 `~`）。
+ * 文件不存在 → []：路径是显式指定的（等于 DOTENV_CONFIG_PATH，或传了 explicit）时打一行不带任何键值的警告，
+ *   没指定（默认的 cwd/.env，没有 .env、全靠服务自己的环境变量是正常配法）不打日志；
  * 读不了（权限、是目录……）→ 打一行带错误码的警告、返回 []，这次只按清单过滤。永不抛。
  * @param {string} file
- * @param {{log?: (msg: string) => void, read?: (file: string, enc: string) => string}} [o]
+ * @param {{log?: (msg: string) => void, read?: (file: string, enc: string) => string, explicit?: boolean, home?: string}} [o]
  */
-export function readEnvFileKeys(file, { log = console.error, read = fs.readFileSync } = {}) {
+export function readEnvFileKeys(file, { log = console.error, read = fs.readFileSync, explicit, home } = {}) {
+  const say = (msg) => { try { log(msg); } catch { /* 日志出错不影响启动 */ } };
   try {
-    return Object.keys(parseDotenv(read(file, 'utf8')));
-  } catch (e) {
-    if (e?.code === 'ENOENT') return [];
-    try { log(`[config] ⚠️ 读不了 .env 的键名（${e?.code ?? 'ERR'}），这次只按清单过滤`); } catch { /* 日志出错不影响启动 */ }
+    const envPath = process.env.DOTENV_CONFIG_PATH;
+    const isExplicit = explicit ?? (typeof envPath === 'string' && envPath !== '' && envPath === file);
+    const target = typeof file === 'string' && file[0] === '~' ? path.join(home ?? os.homedir(), file.slice(1)) : file;
+    try {
+      return Object.keys(parseDotenv(read(target, 'utf8')));
+    } catch (e) {
+      if (e?.code === 'ENOENT') {
+        if (isExplicit) say('[config] ⚠️ 指定的 .env 读不到，无法按文件剥离键');
+        return [];
+      }
+      say(`[config] ⚠️ 读不了 .env 的键名（${e?.code ?? 'ERR'}），这次只按清单过滤`);
+      return [];
+    }
+  } catch {
     return [];
   }
 }

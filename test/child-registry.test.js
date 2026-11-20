@@ -76,6 +76,8 @@ describe('U1 判定表（指纹全对才整组结束）', () => {
     ['ppid 是 本进程自己（本代刚起的）', { ppid: 99_999 }],
     ['形态词顺序不对', { command: '/x/claude --verbose stream-json --output-format -p' }],
     ['形态词只在第 0 个词', { command: '-p --output-format stream-json --verbose' }],
+    ['四个形态词中间夹了别的参数（第一个词后插 --model x）', { command: '/x/claude -p --model x --output-format stream-json --verbose' }],
+    ['四个形态词中间夹了别的参数（stream-json 与 --verbose 之间）', { command: '/x/claude -p --output-format stream-json --resume abc --verbose' }],
   ];
   for (const [name, override] of BREAKS) {
     it(`逐项改坏：${name} → 不调用 kill，计入 dropped`, T, () => {
