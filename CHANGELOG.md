@@ -43,6 +43,8 @@
   - 抑制通知：模型可以预写通知去重文件让确认通知不发出来；任务仍然待确认、不执行（失败时关闭），`/tasks` 里看得到。
   - 同一拍里超过 10 项通知时，SCHED-1 的合并只列前 10 项，其余显示「另有 N 项」，确认码要用 `/tasks` 查。
   - 通知里没有群名，只有会话 id 末 4 位。
+  - 备份与迁机：确认记录 `data/sched-approvals.json` 在 `data/` 下，会随工作区一起备份；签名密钥 `.env.sched-approval-key` 在仓库根、不在备份范围内。所以从备份恢复到新机器后，所有确认都会因验签不通过而作废，桥接会私聊 owner 重新确认一次——这是预期行为，不是故障。
+  - 「同一次作废只问一次」的前提是作废后能把记录重写回磁盘：重写失败时（如 `data/` 只读），每次重启都会再问一次，而不是只问一次（复审 LOW-5）。
 - 测试：新增 `test/sched-approval.test.js`（K：哈希 / 签名 / 密钥重建 / 篡改 / 不读盘 / 写失败与 500 条上限 / 通知文案 / K7 作废后重写记录；C1–C8：`tasksCommandReply`）、`test/sched-approval-scheduler.test.js`（G1–G8、I1、I2：真实 `startScheduler`，G8 为作废后重新问 owner）、`test/sched-approval-wiring.test.js`（W1–W5：`index.js` 接线、忙判定、卡片回调、`/tasks` 标记）、`test/priv2-prompts.test.js`（L1 `turnOf` 守卫、L2 目的地提示词）；`test/turn-argv.test.js` 的 T2-3 按 `destUnknown` 选正则（唯一改动的既有断言）。
 
 ### BRIDGE-SCHED-1 定时任务调度可靠性：不互相挡、重启不丢、写盘失败不重跑、出问题告诉 owner
