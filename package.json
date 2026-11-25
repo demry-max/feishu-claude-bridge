@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test --test-concurrency=4 test/*.test.js",
+    "test": "node --test --test-concurrency=4 test/*.test.js && node --test --test-concurrency=1 grok-bridge/test/*.test.js",
+    "test:grok": "node --test --test-concurrency=1 grok-bridge/test/*.test.js",
     "start": "node src/index.js",
     "register": "node scripts/register.js",
     "install-service": "node scripts/install-service.js",

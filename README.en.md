@@ -13,6 +13,8 @@
 
 Sister projects: [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-claude-bridge) (DingTalk) · [wecom-claude-bridge](https://github.com/demry-max/wecom-claude-bridge) (WeCom)
 
+The deployed Grok webhook bridge (stdin from lark-cli, wake by POST, no Claude process) lives in [`grok-bridge/`](grok-bridge/README.md). It is not this Claude websocket bridge. Delivery, restart recovery, and rollback: [`grok-bridge/DEPLOY.md`](grok-bridge/DEPLOY.md).
+
 ## Features
 
 ### Always on

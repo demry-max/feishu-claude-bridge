@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### feishu-grok-bridge 1.2.0：已接受事件的 webhook 投递改为可恢复队列
+
+当前线上桥接（`feishu-grok-bridge`）和本仓库的 Claude 长连接桥是两套程序。线上那套以 stdin 接收 lark-cli 事件，把唤醒 POST 到 Grok routine。1.1 只有一次 15 秒 fetch，去重在内存里，进程退出后既不会补投，也会把同一次 `message_id` 再投一遍。
+
+`grok-bridge/` 是这份线上程序的 1.2.0，不替换 Claude 桥。webhook JSON 字段与 1.1 相同。HTTP 2xx 才算送达。429 和多数 5xx、连接被拒绝会按有上限的退避重试，然后进入死信。客户端超时、连接中断、408/504/409，以及请求已经发出但进程在写回结果前退出，记为 `ambiguous`，**不**标成已送达，默认也**不**自动重发。下游若不按 `message_id` 去重，就不能承诺恰好一次。操作、回滚和与上游接收端的配合见 `grok-bridge/DEPLOY.md`。
+
 ### BRIDGE-PRIV-1：非私密场合不再带 owner 的私密记忆（权限卡）
 
 - **问题**：owner 在群里发消息、定时任务把结果发往群，都被当成「owner 私聊」跑——owner 工作区与画像、记忆召回、lark-cli / 飞书工具全带上，回答又发给整个群。
