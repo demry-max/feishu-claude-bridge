@@ -13,6 +13,8 @@
 
 姊妹项目：[lark-claude-bridge](https://github.com/demry-max/lark-claude-bridge)（Lark 国际版，英文文档）· [dingtalk-claude-bridge](https://github.com/demry-max/dingtalk-claude-bridge)（钉钉版，免公网）· [wecom-claude-bridge](https://github.com/demry-max/wecom-claude-bridge)（企业微信版）
 
+当前线上的 Grok webhook 桥（stdin ← lark-cli，POST 唤醒，不跑 Claude）在 [`grok-bridge/`](grok-bridge/README.md)。它和上面的 Claude 长连接桥不是同一个进程。投递、重启恢复和回滚见 [`grok-bridge/DEPLOY.md`](grok-bridge/DEPLOY.md)。
+
 ## 特性 Features
 
 ### 默认就有
