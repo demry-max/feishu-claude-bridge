@@ -32,6 +32,7 @@ function make(kind, f) {
     workspace: f.workspace,
     toolSet: f.toolSet,
     biz: f.biz === true,
+    brain: f.brain === true,
     confirm: f.confirm === true,
     receipt: f.receipt === true,
     recall: f.recall === true,
@@ -55,12 +56,14 @@ const NONE = { confirm: false, receipt: false, recall: false, memoryNudge: false
  *   ownerDmKnown  定时用：仓主私聊 chat id 是否已知（false 时目的地按「未知」记 destUnknown）
  *   profile       legacy | audit | strict（只影响 receipt 与自诊断工具档）
  *   bizOn         BMS_TOOL_ENABLED 是否开（只影响 biz 字段）
+ *   brainOn       BRAIN_TOOL_ENABLED 是否开（仅 audit / strict 的明确私聊目的地）
  */
 export function resolveTurn(input = {}) {
   const { source, chatType, chatId, senderOpenId, schedDest, ownerDmKnown } = input;
   const isOwner = input.isOwner === true;
   const profile = PROFILES.includes(input.profile) ? input.profile : 'legacy';
   const bizOn = input.bizOn === true;
+  const brainOn = input.brainOn === true && profile !== 'legacy';
   const ctx = { isOwner, profile };
 
   // 非仓主：不管来源，一律访客（心跳 / 交接 / 验收只对仓主生效，非仓主带这些档时当没带）
@@ -91,6 +94,7 @@ export function resolveTurn(input = {}) {
       if (toDm) {
         return make('sched-owner-dm', {
           ...ctx, ...NONE, private: true, workspace: 'owner', toolSet: 'owner', biz: bizOn, sessionKey: chatId ?? null, speakerIsOwner: true,
+          brain: brainOn && ownerDmKnown !== false,
         });
       }
       return make('sched-other', {
@@ -116,6 +120,7 @@ export function resolveTurn(input = {}) {
       if (chatType === 'p2p') {
         return make('owner-dm', {
           ...ctx, private: true, workspace: 'owner', toolSet: 'owner', biz: bizOn,
+          brain: brainOn && source === 'chat',
           confirm: true, receipt: profile !== 'legacy', recall: true, memoryNudge: true,
           sessionKey: chatId ?? null, speakerIsOwner: true,
         });
@@ -135,7 +140,7 @@ export function resolveTurn(input = {}) {
  *   显式 chatType 且不是 p2p 的 owner 调用 → owner-group；
  *   sched: / sched-diag: 且显式带了 schedDest 而不等于 owner-p2p → *-other。
  * 字段缺省（不带 chatType / schedDest）按现状处理：owner 私聊式、biz 不挂。
- * env：{ profile, bizOn }，由 claude.js 传入（本模块不读环境变量）。
+ * env：{ profile, bizOn, brainOn }，由 claude.js 传入（本模块不读环境变量）。
  */
 export function turnFromLegacyCall(chatId, isOwner, opts = {}, env = {}) {
   const id = String(chatId);
@@ -156,6 +161,7 @@ export function turnFromLegacyCall(chatId, isOwner, opts = {}, env = {}) {
     return resolveTurn({
       ...common, source: 'sched', schedDest: destGiven ? opts.schedDest : SCHED_DEST_OWNER_P2P, ownerDmKnown: true,
       bizOn: destGiven && env.bizOn === true,
+      brainOn: destGiven && env.brainOn === true,
     });
   }
   // 对话：显式 chatType 且不是 p2p → 群回合；没带 chatType 按私聊式处理（biz 只在显式 p2p、且没有别的档标记时挂）
@@ -163,5 +169,6 @@ export function turnFromLegacyCall(chatId, isOwner, opts = {}, env = {}) {
   return resolveTurn({
     ...common, source: 'chat', chatType: explicitGroup ? chatType : 'p2p',
     bizOn: env.bizOn === true && chatType === 'p2p' && tp == null,
+    brainOn: env.brainOn === true && chatType === 'p2p' && tp == null,
   });
 }

@@ -10,6 +10,7 @@ import path from 'node:path';
 import { classifyCommand, classifySegments, auditName, safeToolName, STRICT_TOOLS, FEISHU_MCP_READ, checkOutputTargets, usesEqAsPrefix } from './tool-policy.js';
 import { fenceUntrusted } from './messages.js';
 import { BIZ_TOOL, bizAuditFields } from './biz-targets.js';
+import { BRAIN_ALLOWED_TOOLS } from './brain-targets.js';
 
 const MAX_AUDIT_BYTES = 5 * 1024 * 1024;
 const nameOrNull = (v) => (v == null ? null : auditName(v));
@@ -39,12 +40,15 @@ function guardOptions(workspace) {
  * 按 strict 档的规则预判一次调用（audit 档用它预演 strict；strict 档用它和真实的 permission_denials 对账）。
  * 只返回安全名，不返回任何参数。workspace 非空时再过一道输出路径闸：写到 outbox/临时目录之外（或保护区）判拒。
  */
-function judge(use, kind, profile, confirm, workspace = null) {
+function judge(use, kind, profile, confirm, workspace, brain) {
   const name = use?.name;
   // BRIDGE-BMS-1：biz_get 只读 GET，对话与定时都放行；只记 target、路径类别、方法，不记 path / query 的值
   if (name === BIZ_TOOL) {
     const f = bizAuditFields(use?.input);
     return { tool: BIZ_TOOL, domain: nameOrNull(f.domain), cmd: nameOrNull(f.cmd), method: nameOrNull(f.method), decision: 'allow' };
+  }
+  if (BRAIN_ALLOWED_TOOLS.includes(name)) {
+    return { tool: name, domain: null, cmd: null, method: null, decision: brain ? 'allow' : 'deny' };
   }
   if (name === 'Bash') {
     const command = typeof use?.input?.command === 'string' ? use.input.command : '';
@@ -71,7 +75,7 @@ function judge(use, kind, profile, confirm, workspace = null) {
  * result 事件（带 permission_denials）到了才落盘；进程中途退出没有 result 时由 flush() 补写。flush 幂等。
  * onToolEvent 收到 {phase:'use'|'result'|'denied', …}（含原始输入，只在进程内给回执用）。
  */
-export function createToolRecorder({ kind = 'chat', profile = 'audit', confirm = false, workspace = null, file, onToolEvent = null, now = () => new Date(), log = console } = {}) {
+export function createToolRecorder({ kind = 'chat', profile = 'audit', confirm = false, workspace = null, brain = false, file, onToolEvent = null, now = () => new Date(), log = console } = {}) {
   const uses = [];
   const seen = new Set();
   const denied = new Set();
@@ -90,7 +94,7 @@ export function createToolRecorder({ kind = 'chat', profile = 'audit', confirm =
     const records = uses.map((u) => ({
       ts: u.ts,
       kind,
-      ...judge(u, kind, profile, confirm, workspace),
+      ...judge(u, kind, profile, confirm, workspace, brain),
       denied: u.fromDenial === true || (typeof u.id === 'string' && denied.has(u.id)),
     }));
     if (records.length) appendToolAudit(file, records, { log });
