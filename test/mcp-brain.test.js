@@ -12,7 +12,7 @@ import { childEnv } from '../src/child-env.js';
 
 const NAMES = ['brain_search', 'brain_read', 'brain_list', 'brain_whoami'];
 const HEADER_NAMES = ['Accept', 'Authorization', 'CF-Access-Client-Id', 'CF-Access-Client-Secret',
-  'Content-Type', 'X-Brain-Asker', 'X-Brain-Channel'];
+  'Content-Type', 'User-Agent', 'X-Brain-Asker', 'X-Brain-Channel'];
 const VALUES = Object.fromEntries(['key', 'cfId', 'cfSecret', 'unionId'].map((key) => [key, `${key}_${randomUUID()}`]));
 const MARKER = 'upstream-error-marker';
 const WHOAMI = { agent_id: 'private-assistant-owner', read_max_tier: 'L1', raw_allowed: true,
@@ -70,6 +70,7 @@ test('request headers are exact and keychain values stay out of local surfaces',
     assert.equal(req.headers['CF-Access-Client-Secret'], VALUES.cfSecret);
     assert.equal(req.headers.Accept, 'application/json, text/event-stream');
     assert.equal(req.headers['Content-Type'], 'application/json');
+    assert.equal(req.headers['User-Agent'], 'feishu-claude-bridge/2.3.0');
     const { id, ...body } = JSON.parse(req.body);
     assert.ok(id != null);
     assert.deepEqual(body, { jsonrpc: '2.0', method: 'tools/call', params: { name: 'search', arguments: input } });
@@ -110,6 +111,7 @@ test('stdio lists four read-only tools and blocks unlisted tools without forward
   await client.connect(clientTransport);
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map(({ name }) => name), NAMES);
+  assert.equal(tools[0].inputSchema.properties.query.maxLength, 200);
   for (const [i, fields] of [
     ['domain', 'include_history', 'include_raw', 'k', 'query'], ['id', 'version'],
     ['cursor', 'domain', 'limit', 'updated_since'], [],
@@ -158,13 +160,31 @@ test('proxy strictly validates inputs and forwards the four supported names', as
   assert.equal(h.requests.length, 0);
   assert.equal(h.reads.length, 0);
   for (const [name, args] of [
-    ['brain_search', { query: '大'.repeat(500), k: 10 }], ['brain_read', { id: 'entry', version: 1 }],
+    ['brain_search', { query: '大'.repeat(200), k: 10 }], ['brain_read', { id: 'entry', version: 1 }],
     ['brain_list', { domain: 'ops', updated_since: '2026-11-26T01:01:00+08:00', cursor: 'x'.repeat(512), limit: 50 }],
     ['brain_whoami', undefined],
   ]) {
     assert.equal((await h.call(name, args)).result.isError, undefined, name);
     assert.deepEqual(JSON.parse(h.requests.at(-1).req.body).params, { name: name.slice(6), arguments: args ?? {} });
   }
+});
+
+test('search counts Unicode code points before reading credentials or using quota', async () => {
+  const h = harness();
+  for (const query of ['大'.repeat(199) + '😀中', '😀'.repeat(201)]) {
+    const { result } = await h.call('brain_search', { query });
+    assert.deepEqual(result, { ...textResult('大脑工具参数不合法'), isError: true });
+  }
+  assert.equal(h.reads.length, 0);
+  assert.equal(h.requests.length, 0);
+
+  const query = '😀'.repeat(200);
+  const { result } = await h.call('brain_search', { query });
+  assert.equal(result.isError, undefined);
+  assert.equal(h.requests.length, 1);
+  const { id, params } = JSON.parse(h.requests[0].req.body);
+  assert.equal(id, 1);
+  assert.deepEqual(params, { name: 'search', arguments: { query } });
 });
 
 test('missing keychain fields and insecure TLS return fixed errors', async () => {

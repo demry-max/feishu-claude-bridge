@@ -630,7 +630,8 @@ async function runTurn(spec) {
       , { mode: e?.cancelled ? 'discard' : 'hold', idempotencyKey: replyKey }).catch(() => null);
       if (e?.cancelled) return; // /cancel 主动终止，不报错
       if (turn.brain && e?.code === BRAIN_INIT_MISMATCH) {
-        await reply(message.message_id, BRAIN_INIT_STOP);
+        await reply(message.message_id, BRAIN_INIT_STOP).catch(() => {});
+        if (held?.note) await reply(message.message_id, held.note).catch(() => {});
         return;
       }
       console.error('[claude]', e);
@@ -878,8 +879,8 @@ const scheduler = startScheduler({
         }
         // 失败时不发回传文件：挪到保留目录，另发一行列出文件名（BRIDGE-SEND-2）；取消的只清不发
         const held = await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate, { mode: e?.cancelled ? 'discard' : 'hold' }).catch(() => null);
-        if (brainInitMismatch) await sendToChat(chatId, BRAIN_INIT_STOP, sendOpts);
-        else if (held?.note) await sendToChat(chatId, held.note).catch(() => {});
+        if (brainInitMismatch) await sendToChat(chatId, BRAIN_INIT_STOP, sendOpts).catch(() => {});
+        if (held?.note) await sendToChat(chatId, held.note).catch(() => {});
       },
     });
   },

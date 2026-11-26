@@ -6,12 +6,16 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { BRAIN_ENDPOINT, BRAIN_KEYCHAIN, BRAIN_LIMITS, BRAIN_TOOL_NAMES } from './brain-targets.js';
+import { BRAIN_ENDPOINT, BRAIN_KEYCHAIN, BRAIN_LIMITS, BRAIN_TOOL_NAMES, BRAIN_USER_AGENT } from './brain-targets.js';
 import { fencedMcpResult } from './tool-audit.js';
 
 const INPUTS = {
   brain_search: z.strictObject({
-    query: z.string().min(1).max(500),
+    // JSON Schema 的 maxLength 按码点计，Zod 的字符串长度按 UTF-16 单元计。
+    query: z.string().min(1)
+      .refine((query) => query.length <= BRAIN_LIMITS.queryCodePoints * 2
+        && [...query].length <= BRAIN_LIMITS.queryCodePoints)
+      .meta({ maxLength: BRAIN_LIMITS.queryCodePoints }),
     k: z.number().int().min(1).max(10).optional(),
     domain: z.string().min(1).optional(),
     include_raw: z.boolean().optional(),
@@ -163,6 +167,7 @@ async function request({ name, input, id, secrets, fetch, timeoutMs, log }) {
         'X-Brain-Asker': JSON.stringify({ kind: 'feishu_union_id', value: unionId }),
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
+        'User-Agent': BRAIN_USER_AGENT,
       },
       body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: name.slice(6), arguments: input } }),
     }), deadline]);

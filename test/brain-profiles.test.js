@@ -231,7 +231,10 @@ test('scheduled init mismatch holds the outbox and sends the fixed reply without
       return 'group response';
     },
     handleScheduledFailure: async () => assert.fail('init mismatch must not start a diagnosis'),
-    sendToChat: async (...args) => sent.push(args),
+    sendToChat: async (...args) => {
+      sent.push(args);
+      if (args[0] === dm) throw new Error('stubbed send failure');
+    },
     outboxDirFor: (key, privateTurn) => `${key}:${privateTurn}`,
     flushOutbox: async (_client, dir, _send, opts) => { flushed.push([dir, opts]); return { note: 'held-file-marker' }; },
     isQuietAnswer: () => false,
@@ -241,11 +244,11 @@ test('scheduled init mismatch holds the outbox and sends the fixed reply without
   const sendKey = { idempotencyKey: 'sched-fixture' };
   assert.equal(scheduler.turnFor('sched-diag', job).brain, false);
   await scheduler.onFire(job, { sendKey: sendKey.idempotencyKey });
-  assert.deepEqual(sent, [[dm, STOP_TEXT, sendKey]]);
+  assert.deepEqual(sent, [[dm, STOP_TEXT, sendKey], [dm, 'held-file-marker']]);
   assert.deepEqual(flushed, [['sched:sample.json:true', { mode: 'hold' }]]);
   await scheduler.onFire({ ...job, chat_id: group });
-  assert.equal(sent[1][0], group);
-  assert.match(sent[1][1], /group response$/);
+  assert.equal(sent[2][0], group);
+  assert.match(sent[2][1], /group response$/);
   assert.deepEqual(calls.map(({ kind, brain }) => [kind, brain]), [['sched-owner-dm', true], ['sched-other', false]]);
 });
 

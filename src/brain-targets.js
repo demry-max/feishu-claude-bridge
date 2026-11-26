@@ -1,5 +1,6 @@
 export const BRAIN_SERVER = 'brain';
 export const BRAIN_ENDPOINT = 'https://brain.gdsgroup.tech/mcp';
+export const BRAIN_USER_AGENT = 'feishu-claude-bridge/2.3.0';
 export const BRAIN_TOOL_NAMES = Object.freeze(['brain_search', 'brain_read', 'brain_list', 'brain_whoami']);
 export const BRAIN_ALLOWED_TOOLS = Object.freeze(BRAIN_TOOL_NAMES.map((name) => `mcp__${BRAIN_SERVER}__${name}`));
 
@@ -11,6 +12,7 @@ export const BRAIN_KEYCHAIN = Object.freeze({
 });
 
 export const BRAIN_LIMITS = Object.freeze({
+  queryCodePoints: 200,
   callsPerProcess: 30,
   callsPerMinute: 20,
   minuteMs: 60_000,

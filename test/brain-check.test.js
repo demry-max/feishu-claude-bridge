@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { runBrainCheck } from '../scripts/brain-check.js';
 
@@ -11,6 +12,11 @@ async function check(response) {
   assert.deepEqual(calls, [['brain_whoami']]);
   return { outputs, status };
 }
+
+test('package.json exposes the brain-check script', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(manifest.scripts['brain-check'], 'node scripts/brain-check.js');
+});
 
 test('brain-check reports only agent, tier, raw permission and quota', async () => {
   const summary = { agent_id: 'private-assistant-owner', read_max_tier: 'L1', raw_allowed: true,
