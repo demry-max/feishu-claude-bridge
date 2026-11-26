@@ -18,4 +18,24 @@ export const HOME_SECRET_PATHS = Object.freeze([
   '.aws',                    // AWS 访问凭据与配置
   '.netrc',                  // 网络客户端的账号和密码
   '.npmrc',                  // npm registry 配置与令牌
+  '.config/gh',              // GitHub CLI 主机配置与登录令牌
+  '.git-credentials',        // Git credential-store 的明文凭据
+  '.docker',                 // Docker registry 登录和客户端配置
+  '.kube',                   // Kubernetes 集群配置和认证材料
+  '.gnupg',                  // GnuPG 密钥和信任库
+  '.config/feishu-*',        // 飞书桥接与工具的本机配置
+  '.lark-cli',               // lark-cli 本机配置和用户状态
+  '.config/lark-cli',        // lark-cli 的 HOME 内 XDG 配置位置
+  'Library/Application Support/lark-cli', // macOS 上 lark-cli 的本机支持目录
+]);
+
+// 只保护主备账号的会话记录，保留项目自动记忆的访问。
+export const HOME_SESSION_PATHS = Object.freeze([
+  '.claude/projects/**/*.jsonl',
+  '.claude-b/projects/**/*.jsonl',
+]);
+
+export const HOME_ENV_PATHS = Object.freeze([
+  '**/.env',                 // HOME 内任意深度的项目环境文件
+  '**/.env.*',               // 同一项目的环境文件变体
 ]);

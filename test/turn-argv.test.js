@@ -32,6 +32,23 @@ const withoutPrompt = (args) => {
   return { args: i < 0 ? a : [...a.slice(0, i), ...a.slice(i + 2)], prompt: i < 0 ? null : a[i + 1] };
 };
 
+// BRIDGE-SEC-2 停卡授权：分别检查工具放行与配置目录拒读。
+function assertNoLarkCliGrant(args, label) {
+  for (const [i, arg] of args.entries()) {
+    const option = args[i - 1];
+    if (option === '--tools' || option === '--allowedTools') {
+      assert.ok(!arg.includes('lark-cli'), `${label}：${option} 不得放行 lark-cli`);
+    }
+    if (option === '--disallowedTools') {
+      for (const rule of arg.split(',').filter((r) => r.includes('lark-cli'))) {
+        assert.match(rule, /^Read\([^)]+\)$/, `${label}：lark-cli 相关拒绝项必须使用 Read(…)`);
+      }
+    } else {
+      assert.ok(!arg.includes('Bash(lark-cli'), `${label}：拒绝表之外不得出现 Bash(lark-cli`);
+    }
+  }
+}
+
 const GUEST_ENV = { LARK_CLI: 'true' };
 const SWITCH = [['关', undefined], ['开', '1']];
 
@@ -86,7 +103,8 @@ for (const [label, bms] of SWITCH) {
       assert.ok(!viaOpts.args.includes('--mcp-config') && viaOpts.mcp === null, '不挂任何 MCP');
       assert.ok(viaOpts.args.includes('--strict-mcp-config'));
       assert.equal(flag(viaOpts.args, '--setting-sources'), '');
-      assert.ok(!viaOpts.args.join(' ').includes('lark-cli') && !viaOpts.args.join(' ').includes('mcp__'), '无 lark-cli / 飞书 / biz 工具');
+      assertNoLarkCliGrant(viaOpts.args, '群聊'); // BRIDGE-SEC-2 停卡授权
+      assert.ok(!viaOpts.args.join(' ').includes('mcp__'), '无飞书 / biz 工具');
       assert.ok(hasSecretsDeny(viaOpts.args), '密钥拒绝规则齐全');
       assert.ok(o.prompt.startsWith(g.prompt));
       assert.match(o.prompt.slice(g.prompt.length), /^\n- 本轮发言的是机器人的主人，但这里是群聊：按访客权限运行/);
@@ -113,7 +131,8 @@ for (const [label, bms] of SWITCH) {
         assert.equal(flag(s.args, '--tools'), 'WebSearch', tag);
         assert.ok(s.mcp === null && !s.args.includes('--mcp-config'), tag);
         assert.ok(hasSecretsDeny(s.args), tag);
-        assert.ok(!s.args.join(' ').includes('lark-cli') && !s.args.join(' ').includes('mcp__'), tag);
+        assertNoLarkCliGrant(s.args, tag); // BRIDGE-SEC-2 停卡授权
+        assert.ok(!s.args.join(' ').includes('mcp__'), tag);
         assert.ok(o.prompt.startsWith(g.prompt), tag);
         assert.match(
           o.prompt.slice(g.prompt.length),

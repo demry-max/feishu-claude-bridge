@@ -11,6 +11,7 @@ import { routeTurn, DEFAULT_EXEC_TRIGGERS } from './lanes.js';
 import { spawnBinFor, runWithAccount, skipErrorSession, accountStatusLine } from './account-fallback.js'; // BRIDGE-ACCT-1 备用账号（未配置时零变化）
 import { childEnv } from './child-env.js'; // BRIDGE-RUN-1：交给 claude 子进程的环境（去掉桥接自己的配置与飞书凭据）
 import { childRegistryFor, CHILD_REGISTRY_FILE } from './child-registry.js'; // BRIDGE-RUN-2：登记在跑的 claude 进程组，桥接被强杀后下次启动清理
+import { prepareLarkCliGuard } from './lark-cli-guard.js';
 export { routeTurn, DEFAULT_EXEC_TRIGGERS };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -401,11 +402,14 @@ function killChild(child) {
 // 单例：测试与热加载会带 ?query 重复 import 本模块，监听器只能挂一次，各份模块实例共用同一个集合
 // （靠 globalThis 上的 Symbol.for 键共享）。桥接自己被 SIGKILL 时 exit 事件不会触发，这里管不到。
 const liveChildren = (globalThis[Symbol.for('feishu-claude-bridge.claude.live-children')] ??= (() => {
-  const set = new Set();
+  const children = new Map();
   process.on('exit', function bridgeClaudeGroupCleanup() {
-    for (const c of set) signalChild(c, 'SIGTERM');
+    for (const [child, cleanupGuard] of children) {
+      signalChild(child, 'SIGTERM');
+      cleanupGuard?.();
+    }
   });
-  return set;
+  return children;
 })());
 // BRIDGE-RUN-2：在跑的 claude 进程组记到 data/claude-children.json（只有 pid / 进程组 / 启动时间），桥接被 SIGKILL 后下次启动时清理
 const childRegistry = childRegistryFor(path.join(DATA_DIR, CHILD_REGISTRY_FILE));
@@ -927,7 +931,7 @@ export const OWNER_TOOL_PROFILE = (() => {
   return 'legacy';
 })();
 
-const BROAD_BASH_PROGRAM = /^(?:\*|(?:cat|head|tail|less|cp|base64|node)\*?|python.*)$/;
+const BROAD_BASH_PROGRAM = /^(?:cat|head|tail|less|cp|base64|node|python.*|sh|bash|zsh|env|awk|sed|perl|ruby|xargs|find|rg|grep)$/;
 
 /** 启动时只记录事件码。strict 使用自己的放行表。 */
 export function warnOwnerBroadBash(warn = console.error) {
@@ -938,7 +942,7 @@ export function warnOwnerBroadBash(warn = console.error) {
     if (!tool.startsWith('Bash(')) return false;
     const command = tool.slice('Bash('.length, -1).trim();
     const [program] = command.split(/[\s:]/, 1);
-    return BROAD_BASH_PROGRAM.test(path.posix.basename(program));
+    return program.endsWith('*') || BROAD_BASH_PROGRAM.test(path.posix.basename(program));
   });
   if (broadBash) warn('owner_tools_broad_bash');
 }
@@ -1384,14 +1388,25 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
     console.error('[outbox-dir]', e?.message ?? e);
   }
 
-  return new Promise((resolve, reject) => {
-    const child = spawn(spawnBinFor(CLAUDE_BIN, opts), args, { // BRIDGE-ACCT-1：选 bin 只在这一处
+  const env = childEnv(); // BRIDGE-RUN-1：飞书 MCP 需要的凭据另由临时 mcp.json 传
+  let larkGuard;
+  let child;
+  try {
+    if (isOwner && turnOf(chatId, isOwner, opts).toolSet === 'owner') larkGuard = prepareLarkCliGuard(env);
+    child = spawn(spawnBinFor(CLAUDE_BIN, opts), args, { // BRIDGE-ACCT-1：选 bin 只在这一处
       cwd,
-      env: childEnv(), // BRIDGE-RUN-1（H3）：去掉桥接自己的配置与飞书凭据；MCP 要用的飞书凭据另由临时 mcp.json 传
+      env: larkGuard?.env ?? env,
       detached: !IS_WINDOWS, // BRIDGE-RUN-1（M2）：非 Windows 上自成进程组，超时 / 取消 / 退出时整组一起收；Windows 见上方说明
     });
+  } catch (error) {
+    larkGuard?.cleanup();
+    cleanup();
+    throw error;
+  }
+
+  return new Promise((resolve, reject) => {
     running.set(chatId, child);
-    if (child.pid) liveChildren.add(child); // 桥接退出时据此收掉还在跑的进程组
+    if (child.pid) liveChildren.set(child, larkGuard?.cleanup); // 桥接退出时收掉进程组和包装目录
     if (child.pid) childRegistry.add(child.pid); // BRIDGE-RUN-2：写进记录文件；桥接被强杀、没机会清理时，下次启动据此收尸
     const startedGeneration = resetGeneration.get(chatId) ?? 0; // /new 撤销检测用
     let stderr = '';
@@ -1430,6 +1445,7 @@ function runClaudeOnce(chatId, prompt, isOwner = false, extraTools = [], onProgr
       liveChildren.delete(child);
       if (child.pid) childRegistry.remove(child.pid); // BRIDGE-RUN-2：只在这里摘记录（'exit' 时不摘：此刻孙进程可能还攥着进程组）
       if (running.get(chatId) === child) running.delete(chatId); // 同一会话键上后来者的登记不能被误删
+      larkGuard?.cleanup();
       cleanup(); // 凭据临时文件：无论成败都删
       try { rl.close(); } catch { /* 已关 */ }
       try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* 已销毁 */ }

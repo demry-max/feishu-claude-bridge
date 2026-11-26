@@ -14,12 +14,22 @@ export const SECRETS_DENY_RE = [
 
 // 独立的契约期望。直接从生产清单生成会漏掉删路径的回归。
 export function homeSecretsDeny(prefix = `//${os.homedir().split(path.sep).join('/').replace(/^\/+|\/+$/g, '')}`) {
-  return [
+  const direct = [
     '.brain-secrets', '.brain-client', '.ssh', '.config/claude-api', '.config/openai-api',
     '.config/claude-b', '.config/deepseek', '.config/bms-ai', '.config/starlight-r2',
     '.cloudflare*', '.codex', '.codex-s', '.codex-api-*', '.claude/.credentials*',
     '.claude-b/.credentials*', '.aws', '.netrc', '.npmrc',
+    '.config/gh', '.git-credentials', '.docker', '.kube', '.gnupg',
+    '.config/feishu-*', '.lark-cli', '.config/lark-cli',
+    'Library/Application Support/lark-cli',
   ].flatMap((p) => [`Read(${prefix}/${p})`, `Read(${prefix}/${p}/**)`]);
+  return [
+    ...direct,
+    `Read(${prefix}/.claude/projects/**/*.jsonl)`,
+    `Read(${prefix}/.claude-b/projects/**/*.jsonl)`,
+    `Read(${prefix}/**/.env)`,
+    `Read(${prefix}/**/.env.*)`,
+  ];
 }
 
 const normalizedHomeDeny = [homeSecretsDeny('/<home>'), homeSecretsDeny('/<tmp>/home')];
@@ -49,8 +59,8 @@ export function secretsDenyOf(args) {
 export function hasSecretsDeny(args) {
   const rules = secretsDenyOf(args);
   return rules.length === SECRETS_DENY_COUNT
-    && SECRETS_DENY_RE.every((re) => rules.filter((r) => re.test(r)).length === 1)
-    && homeDenySets().some((expected) => expected.every((rule) => rules.includes(rule)));
+    && homeDenySets().some((expected) => expected.every((rule) => rules.includes(rule))
+      && SECRETS_DENY_RE.every((re) => rules.filter((r) => !expected.includes(r) && re.test(r)).length === 1));
 }
 
 /** 返回去掉这组规则的新 argv；不改入参。 */

@@ -81,7 +81,20 @@ describe('LARK_CLI 开关（飞书官方 lark-cli，用户身份）', () => {
   test('访客永远拿不到 lark-cli（它以 owner 的飞书身份读写 IM/邮件/审批）', () =>
     withEnv({ LARK_CLI: 'true' }, (m) => {
       const g = m.buildClaudeArgs('guest:oc:ou', false, []);
-      assert.ok(!g.args.join(' ').includes('lark-cli'));
+      // BRIDGE-SEC-2 停卡授权：分别检查工具放行与配置目录拒读。
+      for (const [i, arg] of g.args.entries()) {
+        const option = g.args[i - 1];
+        if (option === '--tools' || option === '--allowedTools') {
+          assert.ok(!arg.includes('lark-cli'), `${option} 不得放行 lark-cli`);
+        }
+        if (option === '--disallowedTools') {
+          for (const rule of arg.split(',').filter((r) => r.includes('lark-cli'))) {
+            assert.match(rule, /^Read\([^)]+\)$/, 'lark-cli 相关拒绝项必须使用 Read(…)');
+          }
+        } else {
+          assert.ok(!arg.includes('Bash(lark-cli'), '拒绝表之外不得出现 Bash(lark-cli');
+        }
+      }
       assert.ok((argVal(g.args, '--disallowedTools') ?? '').split(',').includes('Bash'));
     }));
 });
