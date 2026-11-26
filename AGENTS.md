@@ -413,7 +413,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
   launchctl kickstart -k gui/$(id -u)/<label>   # Linux: systemctl --user restart feishu-claude-bridge
   ```
 
-  - 先看 [CHANGELOG.md](CHANGELOG.md) 有没有新增的 `.env` 项。新项都在 `.env.example` 里，默认关闭。
+  - 先看 [CHANGELOG.md](CHANGELOG.md) 有没有新增的 `.env` 项。新项都在 `.env.example` 里，默认关闭。例外：标准 MUST 项（补拉 `BRIDGE_BACKFILL`、补漏 `BRIDGE_SWEEP_MIN`、过期判定 `BRIDGE_STALE_MS`）缺省开启，不用往 `.env` 加行。
   - `.env`、`data/`、`workspace/` 下的记忆不受升级影响。
 - **回滚**：
 
