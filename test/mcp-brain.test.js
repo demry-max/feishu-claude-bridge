@@ -16,8 +16,7 @@ const HEADER_NAMES = ['Accept', 'Authorization', 'CF-Access-Client-Id', 'CF-Acce
   'Content-Type', 'User-Agent', 'X-Brain-Asker', 'X-Brain-Channel'];
 const VALUES = Object.fromEntries(['key', 'cfId', 'cfSecret', 'unionId'].map((key) => [key, `${key}_${randomUUID()}`]));
 const MARKER = 'upstream-error-marker';
-const WHOAMI = { agent_id: 'private-assistant-owner', read_max_tier: 'L1', raw_allowed: true,
-  remaining: { search: { minute: 8, day: 180 }, whoami: { minute: 29 } } };
+const WHOAMI = JSON.parse(fs.readFileSync(new URL('./fixtures/brain-whoami.json', import.meta.url), 'utf8'));
 
 function textResult(text) {
   return { content: [{ type: 'text', text }] };
@@ -27,7 +26,11 @@ function rpc(req, result) {
   return { jsonrpc: '2.0', id: JSON.parse(req.body).id, result };
 }
 
-function reply(req, result = textResult('资料')) {
+function reply(req, result) {
+  if (result === undefined) {
+    result = textResult('资料');
+    if (JSON.parse(req.body).params.name === 'whoami') result.structuredContent = WHOAMI;
+  }
   return Response.json(rpc(req, result));
 }
 
@@ -307,10 +310,18 @@ test('SSE and JSON results use one data fence and cap the displayed body', async
 
 test('whoami exposes only a safe metadata summary for the check command', async () => {
   const h = harness({ respond: (req) => reply(req, {
-    structuredContent: { ...WHOAMI, key: VALUES.key, remaining: { ...WHOAMI.remaining, [VALUES.unionId]: { day: 2 } } },
+    structuredContent: { ...WHOAMI, key: VALUES.key, rate: { ...WHOAMI.rate, [VALUES.unionId]: 2 } },
     ...textResult(MARKER),
   }) });
-  assert.deepEqual((await h.call('brain_whoami')).summary, WHOAMI);
+  assert.deepEqual((await h.call('brain_whoami')).summary, {
+    agent_id: WHOAMI.agent_id,
+    channel: WHOAMI.channel,
+    read_tiers: WHOAMI.read_tiers,
+    raw_allowed: WHOAMI.raw_allowed,
+    rate: {
+      search_minute_left: 8, search_day_left: 180, read_minute_left: 119, list_minute_left: 60, whoami_minute_left: 29,
+    },
+  });
   const h2 = harness({ respond: (req) => reply(req, { structuredContent: { ...WHOAMI, agent_id: VALUES.key } }) });
   assert.equal((await h2.call('brain_whoami')).summary, undefined);
 });

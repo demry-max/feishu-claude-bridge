@@ -1,0 +1,26 @@
+{
+  "agent_id": "private-assistant-owner",
+  "read_tiers": [
+    "L1"
+  ],
+  "raw_allowed": true,
+  "propose_tier": null,
+  "note_tier": null,
+  "read_domains": [
+    "ops"
+  ],
+  "propose_domains": [],
+  "channel": "dm",
+  "rate": {
+    "search_minute_left": 8,
+    "search_day_left": 180,
+    "read_minute_left": 119,
+    "list_minute_left": 60,
+    "propose_hour_left": 10,
+    "feedback_hour_left": 30,
+    "whoami_minute_left": 29
+  },
+  "propose_day_left": 0,
+  "note_day_left": 0,
+  "note_day_bytes_left": 0
+}

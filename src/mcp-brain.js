@@ -32,6 +32,21 @@ const INPUTS = {
   brain_whoami: z.strictObject({}),
 };
 
+const QUOTA_COUNT = z.number().int().nonnegative();
+const WHOAMI_SUMMARY = z.object({
+  agent_id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  channel: z.enum(['dm', 'group', 'server']),
+  read_tiers: z.array(z.enum(['L1', 'L2', 'L3'])),
+  raw_allowed: z.boolean(),
+  rate: z.object({
+    search_minute_left: QUOTA_COUNT,
+    search_day_left: QUOTA_COUNT,
+    read_minute_left: QUOTA_COUNT,
+    list_minute_left: QUOTA_COUNT,
+    whoami_minute_left: QUOTA_COUNT,
+  }),
+});
+
 const DESCRIPTIONS = {
   brain_search: '检索公司大脑，返回条目 ID、标题和摘要。可按领域过滤。',
   brain_read: '按条目 ID 读取公司大脑资料，可指定版本。',
@@ -107,25 +122,15 @@ function rpcReply(text, type, id) {
 }
 
 function whoamiSummary(data, secrets) {
-  const { agent_id, read_max_tier, raw_allowed, remaining } = data ?? {};
-  if (typeof agent_id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(agent_id)
-    || !['L1', 'L2', 'L3'].includes(read_max_tier) || typeof raw_allowed !== 'boolean'
-    || !remaining || typeof remaining !== 'object' || Array.isArray(remaining)) return undefined;
-  const summary = { agent_id, read_max_tier, raw_allowed, remaining: {} };
-  for (const tool of BRAIN_TOOL_NAMES) {
-    const name = tool.slice(6);
-    const quota = remaining[name];
-    if (!quota || typeof quota !== 'object' || Array.isArray(quota)) continue;
-    const windows = {};
-    for (const window of ['minute', 'hour', 'day']) {
-      const count = quota[window];
-      if (Number.isSafeInteger(count) && count >= 0) windows[window] = count;
-    }
-    if (Object.keys(windows).length) summary.remaining[name] = windows;
+  const parsed = WHOAMI_SUMMARY.safeParse(data);
+  if (!parsed.success) {
+    const field = parsed.error.issues[0].path.join('.') || 'structuredContent';
+    return { errorCode: `brain_whoami_invalid:${field}` };
   }
+  const summary = parsed.data;
   const printed = JSON.stringify(summary);
-  if (Object.keys(summary.remaining).length && !secrets.some((value) => printed.includes(value))) return summary;
-  return undefined;
+  if (secrets.some((value) => printed.includes(value))) return { errorCode: 'brain_whoami_unsafe_metadata' };
+  return { summary };
 }
 
 function toolResult(payload, name, secrets, status) {
@@ -135,6 +140,8 @@ function toolResult(payload, name, secrets, status) {
     /^\[brain\] (?:rate_limited|not_available|schema:|error\b)/.test(part)))) {
     return failure(parts.includes('[brain] rate_limited') ? QUOTA : UNAVAILABLE, status);
   }
+  const { summary, errorCode } = name === 'brain_whoami' ? whoamiSummary(payload.structuredContent, secrets) : {};
+  if (errorCode) return { ...failure(`${UNAVAILABLE}（${errorCode}）`, status), errorCode };
   if (payload.structuredContent != null) parts.unshift(JSON.stringify(payload.structuredContent));
   if (!parts.length) return failure(UNAVAILABLE, status);
   let text = parts.join('\n');
@@ -144,7 +151,6 @@ function toolResult(payload, name, secrets, status) {
   }
   // 上游的标记也只是资料。保留外层唯一的、由桥生成的围栏。
   text = text.replace(/<<<\s*(?:END_)?BRAIN_DATA[\w-]*|-*BRAIN_DATA_END[\w-]*/gi, '[已移除的伪造标记]');
-  const summary = name === 'brain_whoami' ? whoamiSummary(payload.structuredContent, secrets) : undefined;
   return { status, result: fenced(text.slice(0, BRAIN_LIMITS.resultChars)), summary };
 }
 
