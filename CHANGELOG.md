@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### BRIDGE-STD-1：重启和断线后不重答、漏收的尽量补回（部分完成）
+
+- **问题**：去重只在内存里，重启后飞书重推会再答一遍；长连接断开期间的消息没人补；长连接没连上时进程照样活着；日志里有完整的会话 / 用户 id。
+- **去重落盘**（`src/inbound-dedupe.js`）：处理过的消息 id 记在 `data/inbound-seen.json`（0600、原子写；7 天内的和最近 2000 条都留，最多 20000 条）。
+- **过期只记不答**：`BRIDGE_STALE_MS`（默认 10 分钟）。事件和补拉走同一个入口（`src/backfill.js` 的 `createIngest`）。
+- **补拉与补漏**（`src/backfill.js`）：长连接就绪、重连后补拉已知会话的历史消息；`BRIDGE_SWEEP_MIN`（默认 10 分钟）定时补漏；`BRIDGE_BACKFILL=off` 关掉这两样；会话游标记在 `data/inbound-cursor.json`。需要读历史消息的权限（scope 名未核实）；缺权限只记错误码。
+- **启动自证**（`src/ws-watchdog.js`）：App ID 缺失或形状不对、启动 60 秒内未就绪、断线超过 10 分钟未恢复，按原有的退出阶梯退出。
+- **日志**（`src/log-safe.js`）：console 层兜底，把 `oc_` / `ou_` / `on_` id 只留末 6 位（owner 未登记时的两种拒绝行除外，`setup` / `doctor` 要从中认 owner）；启动时把 stdout / stderr 指向的日志文件收紧到 0600。
+- **缺省开**：三个 `BRIDGE_*` 开关缺省开启（可靠性修复，不是可选功能）。新增 [`docs/release-sheet.md`](docs/release-sheet.md)。
+- **升级注意**：第一次启动时去重表是空的，重启前约 10 分钟内已经答过的消息可能被首轮补拉再答一遍。挑安静时段重启，或首次先设 `BRIDGE_BACKFILL=off`（做法见 `docs/release-sheet.md` 开头）。
+- **本次未做**（另行处理）：owner 候选改记到 `data/owner-candidates.json`、逐处截短 id、`[msg]` 行不带正文（目前仍带）、`install-service` 预建 0600 日志文件、plist 调整、回复带飞书幂等键。
+- 测试：新增 `test/std1-*.test.js` 四个文件；`test/inbound1-guard.test.js` 按卡片授权改 realGuard。
+
 ### BRIDGE-PRIV-1：非私密场合不再带 owner 的私密记忆（权限卡）
 
 - **问题**：owner 在群里发消息、定时任务把结果发往群，都被当成「owner 私聊」跑——owner 工作区与画像、记忆召回、lark-cli / 飞书工具全带上，回答又发给整个群。
