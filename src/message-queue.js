@@ -210,7 +210,7 @@ export function createOwnerMessageQueue({
     let p;
     try { p = Promise.resolve(reply(messageId, text)); } catch (e) { p = Promise.reject(e); }
     return p
-      .catch((e) => oops(`[queue] 回复失败（${String(text).slice(0, 24)}）：${e?.message ?? e}`))
+      .catch((e) => oops(`[queue] 回复失败（长度 ${String(text).length}）：${e?.message ?? e}`)) // BRIDGE-STD-1：日志不带正文
       .finally(() => { pending -= 1; });
   }
 

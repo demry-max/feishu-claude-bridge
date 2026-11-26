@@ -2,6 +2,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { routeTurn } from '../src/lanes.js';
 import { detectConfirm } from '../src/tool-policy.js';
 import { createToolTurn } from '../src/tool-audit.js';
@@ -9,6 +11,7 @@ import { resolveTurn } from '../src/turn-context.js';
 import * as mq from '../src/message-queue.js';
 import { createShutdown, replyIfDraining } from '../src/shutdown.js';
 import { createInboundGuard, INBOUND_FAILED_REPLY, errorKind, errorStage, waitAtMost } from '../src/inbound-guard.js';
+import { createDedupeStore } from '../src/inbound-dedupe.js';
 
 const FULL_ID = 'om_x100b5a1c2d3e4f5g6h7i8j9k0l';
 const data = (extra = {}) => ({ message: { message_id: FULL_ID, chat_type: 'group', message_type: 'text', content: '{"text":"正文 ABC"}', ...extra }, sender: {} });
@@ -101,14 +104,18 @@ describe('G 入口兜底', () => {
   });
 
   // index.js 里真实的 seen / isDuplicate / 兜底实例（切段法）
+  // BRIDGE-STD-1：isDuplicate 改成调落盘去重表——段头换成 isDuplicate，去重表指向一次性临时目录
   function realGuard() {
     const SRC = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
-    const a = SRC.indexOf('const seen = new Set();');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inbound1-seen-'));
+    process.once('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
+    const a = SRC.indexOf('function isDuplicate(messageId) {');
     const b = SRC.indexOf('// ---- 每个会话串行处理', a);
     assert.ok(a >= 0 && b > a);
     const replies = []; const errors = []; let replyFails = false;
     // eslint-disable-next-line no-new-func
     const api = new Function('scope', `with (scope) {\n${SRC.slice(a, b)}\nreturn { isDuplicate, inboundGuard };\n}`)({
+      dedupe: createDedupeStore({ file: path.join(dir, 'inbound-seen.json') }),
       createInboundGuard,
       reply: async (id, text) => { if (replyFails) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); replies.push([id, text]); },
       console: { error: (s) => errors.push(s), log() {} },
@@ -127,8 +134,9 @@ describe('G 入口兜底', () => {
     assert.equal(api.isDuplicate('om_2'), false);
     await api.inboundGuard({ message: { message_id: 'om_2' } }, async () => 'done');
     assert.equal(api.isDuplicate('om_2'), true, '正常处理完的仍算重复');
-    // 注册处：trackedHandleMessage 交给兜底（只这一条是源码断言）
-    assert.match(SRC, /'im\.message\.receive_v1': \(data\) => inboundGuard\(data, trackedHandleMessage\)/);
+    // 注册处：事件走统一入口（BRIDGE-STD-1：过期判定在前），入口仍把 trackedHandleMessage 交给兜底（只这两条是源码断言）
+    assert.match(SRC, /'im\.message\.receive_v1': \(data\) => ingest\(data, 'event'\)/);
+    assert.match(SRC, /handle: \(data\) => inboundGuard\(data, trackedHandleMessage\),/);
     assert.ok(!/createInboundGuard\(\{[^}]*forget/.test(SRC), '兜底实例不再传 forget');
   });
 

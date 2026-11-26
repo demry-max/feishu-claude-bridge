@@ -299,7 +299,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
      > 请在飞书里私聊机器人发「你好」，告诉我有没有收到回复。
      >
      > Please DM the bot "hello" in Feishu and tell me whether it replied.
-5. **验证**：`grep -n "\[msg\]" bridge.log | tail -3`，应有一行 `[msg] … @ p2p [text]: …`。
+5. **验证**：`grep -n "\[msg\]" bridge.log | tail -3`，应有一行 `[msg] … @ p2p [text] len=… id=…`（日志不记正文）。
    - 人说收到回复 → 成功。
    - **日志里没有 `[msg]`**：飞书没把消息推过来。
      - 「使用长连接接收事件」没开，或没加 `im.message.receive_v1`。
@@ -368,6 +368,11 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 备用账号（主用额度用完 / 登录失效时自动切换） | 关 | `CLAUDE_FALLBACK_BIN=<备用 claude 路径>`；冷却 `CLAUDE_FALLBACK_COOLDOWN_MIN`（默认 30，1–720） | 备用 claude 能跑 `--version`（doctor 项 `claude_fallback_cli`）；两个 claude 最好共用同一个 CLI 配置目录，否则换账号时两边都会自动开新会话；备用账号的登录是 `[需要人]` |
 | 语音兜底转写 | 自动 | — | `ffmpeg` 在 PATH 里（常驻服务的 PATH 也要有） |
 | 优雅退出等待 | `120` 秒（macOS launchd 下最多 50） | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |
+| 启动与重连后补拉历史消息（可靠性修复） | **开** | `BRIDGE_BACKFILL=on` / `off` | 要开通读历史消息的权限（scope 名未核实，见 `docs/release-sheet.md`）；没开通只记 `[backfill] 拉取失败` |
+| 定时补漏（可靠性修复） | **开**，每 `10` 分钟 | `BRIDGE_SWEEP_MIN`：`0`（关）或 5–60 | 补拉已开 |
+| 过期消息只记不答（可靠性修复） | **开**，`600000` 毫秒 | `BRIDGE_STALE_MS`（60000–86400000） | 无 |
+
+最后三项是可靠性修复，不算可选功能，所以缺省开启（原因见 README「重启与断线」）。
 
 细节见 [README.md](README.md)。`docs/*-prompt-proposal.md` 是这些功能可选的提示词补充，人想用时再并入 `workspace/CLAUDE.md`。
 
@@ -390,7 +395,8 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 有 `[msg]`，没回复 | claude 未登录或登录过期（§2.3）；缺 `im:message`；看日志里的报错 |
 | 文档 / 表格工具说没权限 | 缺 scope 或改完没发布：`npm run doctor` 的 `feishu_scopes` |
 | 需要代理才能上网 | 桥接没有专门的代理配置项：机器要能访问 `open.feishu.cn` / `open.larksuite.com`（含长连接地址）和 Claude 的服务。必须走代理时，可试在启动环境里设 `HTTPS_PROXY`（Node ≥ 22.21 / 24.5 再加 `NODE_USE_ENV_PROXY=1`，让内置 fetch 走代理），**未经验证**，长连接是否走代理取决于飞书 SDK。常驻服务要把这些变量写进 plist / unit 的环境里 |
-| 长连接静默断开 | 桥接在 SDK 放弃重连或巡检到 `failed` 时，约 15 秒后主动退出，交给 launchd / systemd 拉起，连环失败会退避到 15 分钟。Windows 启动项不会自动拉起（§7） |
+| 长连接静默断开 | 桥接在 SDK 放弃重连、巡检到 `failed`、启动 60 秒内没就绪或断线超过 10 分钟没恢复时，至少 15 秒后主动退出，交给 launchd / systemd 拉起，连环失败时等待逐步拉长。Windows 启动项不会自动拉起（§7） |
+| 补拉缺权限：日志 `[backfill] 拉取失败（…）code=…`（缺权限常见 `99991672`） | 应用没开通读历史消息的权限（scope 名未核实，按 `docs/release-sheet.md` 第 4 节在后台核对）。`[需要人]` 开通后发布版本。实时收消息不受影响；不要补拉就设 `BRIDGE_BACKFILL=off` |
 | `.env` 改了不生效 | shell 里 export 过同名变量（dotenv 不覆盖已有变量）：doctor 的 `env_shadowed` 会列出来。前台启动前 `unset`；常驻服务不受影响 |
 | 飞书里多出一个应用 | `npm run register` 和 `lark-cli config init --new` 各扫了一次码（每次扫码都建新应用）：保留 `.env` 里那个，`npm run setup -- --link-lark-cli --force` 让 lark-cli 改用它；多余的应用由人在后台停用 |
 | 回复了两遍 | 前台进程和常驻服务同时在跑：停掉一个 |

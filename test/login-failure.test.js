@@ -203,19 +203,19 @@ describe('(a) 定时任务失败', () => {
 });
 
 describe('(c) 入站 [msg] 日志行', () => {
-  const line = (text, over = {}) => formatInboundLog({ who: 'owner', chatType: 'p2p', messageType: 'post', text, ...over });
+  const line = (text, over = {}) => formatInboundLog({ who: 'owner', chatType: 'p2p', messageType: 'post', text, messageId: 'm1', ...over });
 
   test('真实泄漏形态：密钥单独占一行 → 不留密钥，整条仍是一行', () => {
     const out = line(`密钥仅显示一次\n${FAKE_BMS_KEY}\nhttps://crm.example.com`);
     assert.ok(!out.includes(FAKE_BODY));
-    assert.ok(out.includes('bms_sk_***'));
+    assert.ok(!out.includes('密钥仅显示一次') && !out.includes('crm.example.com'), out);
     assert.ok(!out.includes('\n'));
   });
 
-  test('先脱敏再截断：密钥跨过第 80 个字符也不留尾巴', () => {
-    // 先截断的话，第 80 个字符正好切在 bms_sk_ 后 3 位：不足 8 位不匹配，这 3 位就留在日志里
+  test('不带正文：长正文里夹着密钥也一个字不进日志，只记长度和消息尾号', () => {
     const out = line(`${'密'.repeat(70)}${FAKE_BMS_KEY}`);
-    assert.ok(!/bms_sk_[0-9a-f]/.test(out), out);
+    assert.ok(!/bms_sk_|密密/.test(out), out);
+    assert.match(out, / len=\d+ id=…m1$/);
   });
 
   test('紧贴中文、Bearer、等号后面都能抹掉', () => {
@@ -231,8 +231,8 @@ describe('(c) 入站 [msg] 日志行', () => {
   });
 
   test('前缀与格式不变', () => {
-    assert.equal(line('你好'), '[msg] owner @ p2p [post]: 你好');
-    assert.equal(line('去做', { who: 'ou_x', chatType: 'group', messageType: 'text', exec: true }), '[msg] ou_x @ group [text] [exec]: 去做');
+    assert.equal(line('你好'), '[msg] owner @ p2p [post] len=2 id=…m1');
+    assert.equal(line('去做', { who: 'ou_x', chatType: 'group', messageType: 'text', exec: true }), '[msg] ou_x @ group [text] [exec] len=2 id=…m1');
   });
 });
 

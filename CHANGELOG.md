@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### BRIDGE-STD-1：重启和断线后不重答、漏收的尽量补回（部分完成）
+
+- **问题**：去重只在内存里，重启后飞书重推会再答一遍；长连接断开期间的消息没人补；长连接没连上时进程照样活着；日志里有完整的会话 / 用户 id。
+- **去重落盘**（`src/inbound-dedupe.js`）：处理过的消息 id 记在 `data/inbound-seen.json`（0600、原子写；7 天内的和最近 2000 条都留，最多 20000 条）。
+- **过期只记不答**：`BRIDGE_STALE_MS`（默认 10 分钟）。事件和补拉走同一个入口（`src/backfill.js` 的 `createIngest`）。
+- **补拉与补漏**（`src/backfill.js`）：长连接就绪、重连后补拉已知会话的历史消息；单个请求 30 秒没返回就放弃这一轮，下一轮照常；`BRIDGE_SWEEP_MIN`（默认 10 分钟）定时补漏；`BRIDGE_BACKFILL=off` 关掉这两样；会话游标记在 `data/inbound-cursor.json`。需要读历史消息的权限（scope 名未核实）；缺权限只记错误码。
+- **启动自证**（`src/ws-watchdog.js`）：App ID 缺失或形状不对、启动 60 秒内未就绪、断线超过 10 分钟未恢复，按原有的退出阶梯退出。
+- **日志**（`src/log-safe.js`）：console 层兜底，把 `oc_` / `ou_` / `on_` id 只留末 6 位（owner 未登记时的两种拒绝行除外，`setup` / `doctor` 要从中认 owner）；启动时把 stdout / stderr 指向的日志文件收紧到 0600。
+- **日志不落正文**：`[msg]` 行改为 `[msg] <身份> @ <会话类型> [<消息类型>] len=<字数> id=…<尾号>`；排队通知发送失败只记长度；语音回复失败只记错误码；飞书 SDK 打的请求错误里，请求体和回显的字段值记成 `[正文未记]`。旧日志里的内容不动。
+- **回复带请求级 uuid**：对消息的文字回复、本轮回传的附件、语音回复都带由消息 id 派生的 uuid（不超过 50 字符），同一条回复的重复请求由飞书去重。
+- **缺省开**：三个 `BRIDGE_*` 开关缺省开启（可靠性修复，不是可选功能）。新增 [`docs/release-sheet.md`](docs/release-sheet.md)。
+- **升级注意**：第一次启动（或去重文件丢失、损坏）时，以启动时刻为水位线记进 `data/inbound-seen.json`：发出时间早于它的消息只登记、不处理。这样旧版本答过的消息不会重做；代价是升级停机期间发来的消息这一次也不会回答，需要重发。水位线用本机时钟和飞书的发送时间比较，请保持本机时间同步。
+- **本次未做**（另行处理）：owner 候选改记到 `data/owner-candidates.json`、逐处截短 id、`install-service` 预建 0600 日志文件、plist 调整。
+- 测试：新增 `test/std1-*.test.js` 五个文件；`test/inbound1-guard.test.js` 按卡片授权改 realGuard，注册处的源码断言改成钉「事件走 `ingest`，入口里仍交给兜底」；`login-failure` / `send2-*` 里钉旧日志格式和旧请求体的期望随之更新。
+
 ### BRIDGE-PRIV-1：非私密场合不再带 owner 的私密记忆（权限卡）
 
 - **问题**：owner 在群里发消息、定时任务把结果发往群，都被当成「owner 私聊」跑——owner 工作区与画像、记忆召回、lark-cli / 飞书工具全带上，回答又发给整个群。
