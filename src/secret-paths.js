@@ -23,12 +23,16 @@ export const HOME_SECRET_PATHS = Object.freeze([
   '.docker',                 // Docker registry 登录和客户端配置
   '.kube',                   // Kubernetes 集群配置和认证材料
   '.gnupg',                  // GnuPG 密钥和信任库
-  '.claude/projects',        // Claude Code 主账号的会话记录
-  '.claude-b/projects',      // Claude Code 备用账号的会话记录
   '.config/feishu-*',        // 飞书桥接与工具的本机配置
   '.lark-cli',               // lark-cli 本机配置和用户状态
   '.config/lark-cli',        // lark-cli 的 HOME 内 XDG 配置位置
   'Library/Application Support/lark-cli', // macOS 上 lark-cli 的本机支持目录
+]);
+
+// 只保护主备账号的会话记录，保留项目自动记忆的访问。
+export const HOME_SESSION_PATHS = Object.freeze([
+  '.claude/projects/**/*.jsonl',
+  '.claude-b/projects/**/*.jsonl',
 ]);
 
 export const HOME_ENV_PATHS = Object.freeze([

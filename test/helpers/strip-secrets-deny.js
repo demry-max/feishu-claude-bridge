@@ -19,11 +19,17 @@ export function homeSecretsDeny(prefix = `//${os.homedir().split(path.sep).join(
     '.config/claude-b', '.config/deepseek', '.config/bms-ai', '.config/starlight-r2',
     '.cloudflare*', '.codex', '.codex-s', '.codex-api-*', '.claude/.credentials*',
     '.claude-b/.credentials*', '.aws', '.netrc', '.npmrc',
-    '.config/gh', '.git-credentials', '.docker', '.kube', '.gnupg', '.claude/projects',
-    '.claude-b/projects', '.config/feishu-*', '.lark-cli', '.config/lark-cli',
+    '.config/gh', '.git-credentials', '.docker', '.kube', '.gnupg',
+    '.config/feishu-*', '.lark-cli', '.config/lark-cli',
     'Library/Application Support/lark-cli',
   ].flatMap((p) => [`Read(${prefix}/${p})`, `Read(${prefix}/${p}/**)`]);
-  return [...direct, `Read(${prefix}/**/.env)`, `Read(${prefix}/**/.env.*)`];
+  return [
+    ...direct,
+    `Read(${prefix}/.claude/projects/**/*.jsonl)`,
+    `Read(${prefix}/.claude-b/projects/**/*.jsonl)`,
+    `Read(${prefix}/**/.env)`,
+    `Read(${prefix}/**/.env.*)`,
+  ];
 }
 
 const normalizedHomeDeny = [homeSecretsDeny('/<home>'), homeSecretsDeny('/<tmp>/home')];

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const CLAUDE_URL = new URL('../src/claude.js', import.meta.url).href;
 const DENIED = '本地路径受保护，已拒绝\n';
@@ -158,4 +159,80 @@ test('访客、owner 群聊、发往群的定时都保持原 PATH', POSIX, (t) =
     assert.equal(PATH, f.originalPath);
     assert.equal(bridgeLog, '');
   }
+});
+
+test('文件字段与多层等号后缀中的保护路径逐次拒绝', POSIX, (t) => {
+  const f = setup(t);
+  const protectedFile = path.join(f.home, '.ssh', 'sample');
+  const ordinaryFile = path.join(f.cwd, 'sample=1.txt');
+  fs.writeFileSync(ordinaryFile, 'fixture');
+  const allowed = ['fixture', '--file', `f=${ordinaryFile}`];
+  const { results: [accepted, ...rejected], bridgeLog } = f.run([
+    allowed,
+    ['fixture', '--file', `f=${protectedFile}`],
+    ['fixture', `--file=f=${protectedFile}`],
+    ['fixture', '--file', 'f=~/.ssh/sample'],
+    ['fixture', `f=@${protectedFile}`],
+    ['fixture', `--file=f=meta=@${protectedFile}`],
+  ]);
+  assert.equal(accepted.status, 37);
+  assert.deepEqual(JSON.parse(accepted.stdout).args, allowed);
+  assertBlocked(rejected);
+  assert.equal(bridgeLog, BLOCKED.repeat(rejected.length));
+});
+
+test('短参连写中的保护路径逐次拒绝', POSIX, (t) => {
+  const f = setup(t);
+  const protectedFile = path.join(f.home, '.ssh', 'sample');
+  const ordinaryFile = path.join(f.cwd, 'sample.txt');
+  fs.writeFileSync(ordinaryFile, 'fixture');
+  const allowed = ['fixture', `-o${ordinaryFile}`];
+  const { results: [accepted, ...rejected], bridgeLog } = f.run([
+    allowed,
+    ['fixture', `-o${protectedFile}`],
+    ['fixture', '-o~/.ssh/sample'],
+    ['fixture', `-q@${protectedFile}`],
+  ]);
+  assert.equal(accepted.status, 37);
+  assert.deepEqual(JSON.parse(accepted.stdout).args, allowed);
+  assertBlocked(rejected);
+  assert.equal(bridgeLog, BLOCKED.repeat(rejected.length));
+});
+
+test('主备账号 projects 只保护各层会话记录，自动记忆路径透传', POSIX, (t) => {
+  const f = setup(t);
+  const projects = ['~/.claude/projects', '~/.claude-b/projects'];
+  const allowed = projects.flatMap((dir) => [
+    ['fixture', `${dir}/project/memory/MEMORY.md`],
+    ['fixture', `${dir}/project/session.jsonl.bak`],
+  ]);
+  const denied = projects.flatMap((dir) => [
+    ['fixture', `${dir}/session.jsonl`],
+    ['fixture', `${dir}/project/subagents/session.jsonl`],
+  ]);
+  const { results, bridgeLog } = f.run([...allowed, ...denied]);
+  for (const [index, args] of allowed.entries()) {
+    assert.equal(results[index].status, 37);
+    assert.deepEqual(JSON.parse(results[index].stdout).args, args);
+  }
+  assertBlocked(results.slice(allowed.length));
+  assert.equal(bridgeLog, BLOCKED.repeat(denied.length));
+});
+
+test('macOS 与 Windows 的保护路径大小写不敏感', {
+  skip: !['darwin', 'win32'].includes(process.platform),
+}, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-sec2-case-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const wrapper = path.join(root, 'wrapper');
+  const events = path.join(root, 'blocked');
+  fs.writeFileSync(wrapper, '');
+  fs.writeFileSync(events, '');
+  const guard = fileURLToPath(new URL('../src/lark-cli-guard.js', import.meta.url));
+  const result = spawnSync(process.execPath, [guard, wrapper, events, root, '~/.SSH/sample'], {
+    cwd: root, env: { PATH: root }, encoding: 'utf8', timeout: 4000,
+  });
+  assert.ifError(result.error);
+  assertBlocked([result]);
+  assert.equal(fs.readFileSync(events, 'utf8'), '1');
 });

@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import spawn from 'cross-spawn';
-import { HOME_SECRET_PATHS } from './secret-paths.js';
+import { HOME_SECRET_PATHS, HOME_SESSION_PATHS } from './secret-paths.js';
 
 const GUARD_SCRIPT = fileURLToPath(import.meta.url);
 const BLOCKED = 'lark_cli_secret_path_blocked';
@@ -36,24 +36,39 @@ function physicalPath(candidate, hops = 0) {
   return path.join(physicalPath(parent, hops), path.basename(candidate));
 }
 
-function protectedRoots(home) {
-  const alternatives = HOME_SECRET_PATHS.flatMap((rule) => {
+function protectedPaths(home) {
+  const roots = HOME_SECRET_PATHS.flatMap((rule) => {
     const absolute = path.join(home, rule);
     if (!rule.includes('*')) return [absolute, physicalPath(absolute)].map((p) => escapeRe(shellPath(p)));
     const parent = path.dirname(absolute);
     const name = path.basename(absolute).split('*').map(escapeRe).join('[^/]*');
     return [parent, physicalPath(parent)].map((p) => escapeRe(shellPath(p)) + '/' + name);
   });
-  return new RegExp('^(?:' + alternatives.join('|') + ')(?:/|$)', PATH_CASE);
+  const sessions = HOME_SESSION_PATHS.flatMap((rule) => {
+    const [prefix, filename] = rule.split('/**/');
+    const dir = path.join(home, prefix);
+    const name = filename.split('*').map(escapeRe).join('[^/]*');
+    return [dir, physicalPath(dir)].map((p) => escapeRe(shellPath(p)) + '/(?:[^/]+/)*' + name);
+  });
+  return new RegExp(`^(?:(?:${roots.join('|')})(?:/|$)|(?:${sessions.join('|')})$)`, PATH_CASE);
 }
 
 function* argumentPaths(args) {
   for (const arg of args) {
     const equals = arg.startsWith('-') ? arg.indexOf('=') : -1;
-    const value = equals < 0 ? arg : arg.slice(equals + 1);
-    if (value === '') continue;
-    yield value;
-    if (value.startsWith('@') && value.length > 1) yield value.slice(1);
+    const values = [arg.slice(equals + 1)];
+    if (arg.length > 2 && arg[0] === '-' && arg[1] !== '-') values.push(arg.slice(2));
+    for (const value of values) {
+      let start = 0;
+      while (start < value.length) {
+        const candidate = value.slice(start);
+        yield candidate;
+        if (candidate.startsWith('@') && candidate.length > 1) yield candidate.slice(1);
+        const next = value.indexOf('=', start);
+        if (next < 0) break;
+        start = next + 1;
+      }
+    }
   }
 }
 
@@ -71,8 +86,8 @@ function localPath(value, home) {
 }
 
 function hasProtectedPath(args, home) {
-  const roots = protectedRoots(home);
-  const protectedPath = (p) => ENV_NAME.test(path.basename(p)) || roots.test(shellPath(p));
+  const deny = protectedPaths(home);
+  const protectedPath = (p) => ENV_NAME.test(path.basename(p)) || deny.test(shellPath(p));
   for (const value of argumentPaths(args)) {
     const candidate = localPath(value, home);
     if (candidate && (protectedPath(path.normalize(candidate)) || protectedPath(physicalPath(candidate)))) return true;
