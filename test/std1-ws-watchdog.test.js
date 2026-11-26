@@ -30,7 +30,9 @@ function fakeTimers() {
 }
 // 阶梯构造时先排一个 5 分钟清零定时器（list[0]）；之后每次 bailOut 排的退出定时器都在它后面
 const exitTimersOf = (tm) => tm.list.slice(1);
-const tmpFile = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'std1-ladder-')), 'bail-count.json');
+const tmpDirs = []; // 随本测试进程退出清掉
+process.once('exit', () => { for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true }); });
+const tmpFile = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'std1-ladder-')); tmpDirs.push(d); return path.join(d, 'bail-count.json'); };
 
 test('assertAppIdShape：以 cli_ 开头且不含空白才过；错误文本不含 App ID 本身', () => {
   assert.equal(assertAppIdShape('cli_t01'), null); // 假 ID 写短，脱敏门不把它当真的

@@ -21,7 +21,9 @@ const OWNER = 'ou_test0001';
 const BOT = 'ou_bot0001';
 const longId = (n) => ['om', `abcdef${n}`].join('_'); // 长的消息 id 运行时拼（源码里不放像真 id 的串）
 
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'std1-backfill-'));
+const tmpDirs = []; // 随本测试进程退出清掉
+process.once('exit', () => { for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true }); });
+const tmp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'std1-backfill-')); tmpDirs.push(d); return d; };
 const mkClock = (t0 = T0) => { const k = { t: t0 }; k.now = () => k.t; return k; };
 const sink = () => { const logs = []; return { logs, log: (s) => logs.push(String(s)) }; };
 const tick = () => new Promise((r) => setImmediate(r));

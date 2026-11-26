@@ -7,7 +7,9 @@ import path from 'node:path';
 import { createDedupeStore, writeJsonAtomic } from '../src/inbound-dedupe.js';
 
 const DAY = 24 * 3600 * 1000;
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'std1-dedupe-'));
+const tmpDirs = []; // 随本测试进程退出清掉
+process.once('exit', () => { for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true }); });
+const tmp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'std1-dedupe-')); tmpDirs.push(d); return d; };
 const mkClock = (t0 = 1_700_000_000_000) => { const k = { t: t0 }; k.now = () => k.t; return k; };
 const quiet = () => { const logs = []; return { logs, log: (s) => logs.push(s) }; };
 /** 内存里的 fs（大批量登记的用例不想真写盘几千次） */
