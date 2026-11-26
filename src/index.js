@@ -26,13 +26,29 @@ import { createLiveDailySession, ownerToolsWarning } from './daily-session-live.
 import { OWNER_DM_FILE_NAME, bootOwnerDm, ownerDmBootLine, createOwnerDmRecorder } from './owner-dm-store.js'; // BRIDGE-DMID-1
 import { childRegistryFor, CHILD_REGISTRY_FILE, deferUntilAwake, orphanNoticeText } from './child-registry.js'; // BRIDGE-RUN-2
 import { readEnvFileKeys, registerEnvFileKeys } from './child-env.js'; // BRIDGE-RUN-2
+import { tail6, installConsoleIdMask, tightenLogFds } from './log-safe.js'; // BRIDGE-STD-1
+import { assertAppIdShape, createExitLadder, failFast, createReadyWatchdog, inspectConnection } from './ws-watchdog.js'; // BRIDGE-STD-1
+import { createDedupeStore } from './inbound-dedupe.js'; // BRIDGE-STD-1
+import { backfillConfig, createIngest, createChatBook, mergeKnownChats, createBackfill } from './backfill.js'; // BRIDGE-STD-1
+
+// BRIDGE-STD-1 C9：日志里的 id 只留末 6 位。逐处截短（tail6）是主力；这里是兜底——此后任何一行日志里漏网的完整 oc_/ou_/on_ id 只留末 6 位。
+// 必须在第一行日志之前装上；启动时再把 stdout / stderr 指向的日志文件收紧到 0600（launchd 自己建的日志文件默认 0644）
+installConsoleIdMask(console);
+tightenLogFds();
 
 const APP_ID = process.env.FEISHU_APP_ID;
 const APP_SECRET = process.env.FEISHU_APP_SECRET;
 
-if (!APP_ID || !APP_SECRET) {
-  console.error('缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，请检查 .env');
-  process.exit(1);
+// BRIDGE-STD-1 W9：退出阶梯提前到这里（连续失败次数跨重启累积，见 ws-watchdog.js）。凭据缺失 / App ID 形状不对也走它，
+// 不再裸 exit(1)——否则 launchd 每分钟拉起一次、一次一行报错，永远没人看
+const exitLadder = createExitLadder({ file: path.join(DATA_DIR, 'bail-count.json') });
+{
+  const problem = (!APP_ID || !APP_SECRET) ? '缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，请检查 .env' : assertAppIdShape(APP_ID);
+  if (problem) {
+    failFast(exitLadder, problem);
+    // 永不返回：后面读 owner 私聊、起长连接都不能被走到。退出定时器没有 unref（见 createExitLadder），到点进程以 1 退出
+    await new Promise(() => {});
+  }
 }
 
 // FEISHU_DOMAIN=lark 时接入国际版 Lark（open.larksuite.com）
@@ -43,6 +59,9 @@ const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET, domain: D
 // 长连接终局处理：SDK 的重连预算耗尽（或遇到不可重试的错误码）后会彻底放弃，
 // 此时进程还活着、调度器还在跑、launchd 认为一切正常，但机器人对所有消息永久失聪。
 // 唯一可靠的信号是主动退出——交给 launchd KeepAlive 拉起，重连即恢复。
+// BRIDGE-STD-1 W9：再加一道「启动自证」——以 onReady 回调（不是日志里那句 ws client ready）为就绪：
+// 启动 60 秒没就绪、断线超过 10 分钟没恢复，都走同一条阶梯退出（ws-watchdog.js）
+const wsWatchdog = createReadyWatchdog({ onTimeout: (reason) => bailOut(reason, 15_000) });
 const wsClient = new lark.WSClient({
   appId: APP_ID,
   appSecret: APP_SECRET,
@@ -53,55 +72,26 @@ const wsClient = new lark.WSClient({
     // 加 15 秒阻尼：持续性故障时避免与 launchd 形成高频重启风暴
     bailOut(`长连接进入终止状态，退出交由 launchd 重启: ${e?.message ?? e}`, 15_000);
   },
-  onReconnecting: (n) => console.log(`[ws] 重连中（第 ${n ?? '?'} 次）`),
-  onReconnected: () => console.log('[ws] 已重连'),
+  onReady: () => { console.log('[ws] 就绪（onReady）'); wsWatchdog.ready(); backfill.run('ready'); },
+  onReconnecting: (n) => { console.log(`[ws] 重连中（第 ${n ?? '?'} 次）`); wsWatchdog.reconnecting(); },
+  onReconnected: () => { console.log('[ws] 已重连'); wsWatchdog.reconnected(); backfill.run('reconnected'); },
 });
 
 // 兜底巡检：万一 SDK 未回调 onError（版本差异），仍能自愈
 setInterval(() => {
-  try {
-    const st = wsClient.getConnectionStatus?.();
-    const state = typeof st === 'string' ? st : st?.state; // SDK 返回的是对象，早先直接比字符串是死代码
-    if (state === 'failed') {
-      bailOut(`巡检发现连接状态=${state}，退出交由 launchd 重启`, 15_000);
-    }
-  } catch { /* 该 SDK 版本没有此方法则忽略 */ }
+  const state = inspectConnection(wsClient); // 字符串 / { state } 两种形态都认，没有该方法或抛错＝null
+  if (state === 'failed') {
+    bailOut(`巡检发现连接状态=${state}，退出交由 launchd 重启`, 15_000);
+  }
 }, 60_000).unref();
 
 // 退出前先给正在跑的子进程一点收尾时间，并对连环重启加阻尼：
 // 裸 exit(1) 配 launchd ThrottleInterval=10，遇到持续性故障就是每天 8640 次重启
 // 外加 8640 条飞书推送——比原来的「静默失聪」更糟。
-const BAIL_COUNT_FILE = path.join(DATA_DIR, 'bail-count.json');
-const BACKOFF_LADDER = [15_000, 60_000, 300_000, 900_000]; // 15s → 1m → 5m → 15m
-const startedAt = Date.now();
-
-// 连续失败次数跨重启累积：固定阻尼挡不住持续性故障，
-// 进程一起来就再死会形成稳定的高频重启 + 推送风暴
-function readBailCount() {
-  try {
-    const d = JSON.parse(fs.readFileSync(BAIL_COUNT_FILE, 'utf8'));
-    return Number(d?.n) || 0;
-  } catch { return 0; }
-}
-function bumpBailCount() {
-  const n = readBailCount() + 1;
-  try { fs.writeFileSync(BAIL_COUNT_FILE, JSON.stringify({ n, at: Date.now() })); } catch {}
-  return n;
-}
-// 稳定运行足够久即认为已恢复，清零阶梯
-setTimeout(() => {
-  try { fs.rmSync(BAIL_COUNT_FILE, { force: true }); } catch {}
-}, 5 * 60 * 1000).unref();
-
-let exiting = false;
+// 阶梯本体（BAIL_COUNT_FILE / BACKOFF_LADDER / 连续失败计数 / 5 分钟清零 / exiting 守卫）BRIDGE-STD-1 起搬到 ws-watchdog.js 的 createExitLadder，行为不变；
+// 这里留一个同名薄封装，给长连接回调和下面的 uncaughtException 用
 function bailOut(reason, delayMs = 0) {
-  if (exiting) return;
-  exiting = true;
-  // 起来没多久就又要死＝持续故障，按阶梯拉长等待
-  const n = Date.now() - startedAt < 5 * 60 * 1000 ? bumpBailCount() : 1;
-  const wait = Math.max(delayMs, BACKOFF_LADDER[Math.min(n - 1, BACKOFF_LADDER.length - 1)]);
-  console.error(`[exit] ${reason}（第 ${n} 次连续失败，${Math.round(wait / 1000)}s 后退出）`);
-  setTimeout(() => process.exit(1), wait).unref();
+  exitLadder.bailOut(reason, delayMs);
 }
 
 // 进程级兜底：宁可重启，也不要带病静默运行（事件回调里的异常会直冲 uncaughtException）
@@ -163,17 +153,10 @@ const HELP_TEXT = [
 ].join('\n');
 
 // ---- 消息去重（飞书事件可能重投） ----
-const seen = new Set();
+// BRIDGE-STD-1 W5：落盘到 data/inbound-seen.json——重启后飞书重推、补拉到的老消息不会再答第二遍
+const dedupe = createDedupeStore({ file: path.join(DATA_DIR, 'inbound-seen.json') });
 function isDuplicate(messageId) {
-  if (seen.has(messageId)) return true;
-  seen.add(messageId);
-  if (seen.size > 1000) {
-    for (const id of seen) {
-      seen.delete(id);
-      if (seen.size <= 500) break;
-    }
-  }
-  return false;
+  return dedupe.checkAndMark(messageId);
 }
 // BRIDGE-INBOUND-1：入口兜底（src/inbound-guard.js）——进模型前出错的消息回一句固定的话、记一行日志；去重记录不动（飞书超时重推仍按重复丢弃）；挂在事件注册处
 const inboundGuard = createInboundGuard({ reply, log: console.error });
@@ -950,8 +933,33 @@ const shutdown = createShutdown({
 });
 shutdown.install(process);
 
+// ---- 过期只消费、启动与重连后补拉、低频补漏（BRIDGE-STD-1 C5 / W7，src/backfill.js） ----
+// 补拉到的消息走 ingest：超过 BRIDGE_STALE_MS 的只登记不回答；其余照旧进兜底与处理链，靠同一张落盘去重表不重答
+const backfillSettings = backfillConfig();
+const chatBook = createChatBook({ file: path.join(DATA_DIR, 'inbound-cursor.json') });
+const ingest = createIngest({
+  dedupe,
+  handle: (data) => inboundGuard(data, trackedHandleMessage),
+  staleMs: backfillSettings.staleMs,
+  onSeen: (message, at) => chatBook.note(message.chat_id, message.chat_type, at),
+});
+// 单独一个不出声的客户端：SDK 请求失败时会把请求参数（含会话 id）打进日志；失败由补拉自己记一行错误码
+const backfillClient = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET, domain: DOMAIN, loggerLevel: lark.LoggerLevel.fatal });
+const backfill = createBackfill({
+  ...backfillSettings,
+  listMessages: (params) => backfillClient.im.v1.message.list({ params }),
+  knownChats: () => mergeKnownChats({ ownerDmChatId, recent: chatBook.recent(), allowChats: ALLOW_CHATS }),
+  ingest,
+  dedupe,
+  book: chatBook,
+  getBotOpenId: () => lookupBotOpenId(client, { entry: true }),
+  isDraining: () => shutdown.isDraining(),
+});
+
 console.log('启动飞书长连接…');
 wsClient.start({ eventDispatcher });
+wsWatchdog.start(); // BRIDGE-STD-1 W9：60 秒内没有 onReady → 走阶梯退出，交给 launchd 重新拉起
+backfill.start(); // 低频补漏定时器（BRIDGE_SWEEP_MIN；BRIDGE_BACKFILL=off 时只记一行已关闭）
 
 // 飞书 scope 自检：register 创建的应用是零权限，文档/多维表格工具会静默失效。
 // 只读查询，失败不影响启动；结果并入启动通知，让 owner 在手机上就看到该去后台开哪些权限。

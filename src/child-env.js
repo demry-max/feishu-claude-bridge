@@ -62,6 +62,7 @@ export const BRIDGE_OWN_KEYS = Object.freeze([
   // 定时任务、目录、杂项
   'SCHED_MAX_CONCURRENT', 'SCHED_MAX_LATE_MS', 'SCHED_APPROVAL_MODE', 'WORKSPACE_DIR', 'GUEST_WORKSPACE_DIR', 'DATA_DIR', 'INCOMING_TTL_MS',
   'SHUTDOWN_GRACE_SEC', 'STARTUP_NOTICE', 'WS_PING_TIMEOUT_SEC', 'LAUNCHD_LABEL',
+  'BRIDGE_BACKFILL', 'BRIDGE_SWEEP_MIN', 'BRIDGE_STALE_MS', // BRIDGE-STD-1：补拉与过期（按字符串键名读，防漂移扫描认不出，要手工列在这里）
   'TTS_VOICE', 'TTS_MAX_CHARS', 'FFMPEG_BIN',
   // dotenv 自己的 .env 路径开关（BRIDGE-RUN-2）：不外传也让 claude 起的、会 import 'dotenv/config' 的 MCP 子进程读不到桥接的 .env
   'DOTENV_CONFIG_PATH',
