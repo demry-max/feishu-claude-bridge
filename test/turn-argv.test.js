@@ -1,7 +1,7 @@
 // BRIDGE-PRIV-1 T2 / T7：buildClaudeArgs 按 turn 的 argv。
-// T2  仓主在群里 / 发往群或别处的定时 / 发往别处的自诊断：与访客同形状（工作区、工具白名单、无 MCP），多 4 条拒绝规则与几行提示；
-//     仓主私聊 / 心跳 / 发往仓主私聊的定时：开关开时与基线 3c2d3ae 的夹具逐字相同（三档）。
-// T7  不变量：所有档 × 开关开关，凡是带工具的 argv 一定含 4 条 .env / security 拒绝规则（心跳只一份）；零工具 argv 与基线夹具逐字相同。
+// T2  仓主在群里 / 发往群或别处的定时 / 发往别处的自诊断：采用访客的工作区、工具白名单和 MCP 边界。
+//     仓主私聊 / 心跳 / 发往仓主私聊的定时：开关开时在基线夹具上追加 HOME 密钥拒绝规则。
+// T7  带工具的 argv 必须包含一份密钥拒绝规则。零工具 argv 与基线夹具逐字相同。
 // 全程假 claude CLI、不碰钥匙串、不联网。夹具只读，从不重新生成。
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +12,7 @@ import { CASES, PROFILES, makeHarness, runMatrix, snapCase } from './fixtures/bi
 import { ON_NAMES, onCallOf, runOnMatrix } from './fixtures/biz-on-matrix.mjs';
 import { resolveTurn } from '../src/turn-context.js';
 import { SCHED_DEST_OWNER_P2P } from '../src/biz-wiring.js';
-import { stripSnap, hasSecretsDeny, secretsDenyOf, disallowedOf } from './helpers/strip-secrets-deny.js';
+import { stripSnap, hasSecretsDeny, secretsDenyOf, disallowedOf, homeSecretsDeny, SECRETS_DENY_COUNT } from './helpers/strip-secrets-deny.js';
 
 const REPO = fs.realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 const OFF = JSON.parse(fs.readFileSync(path.join(REPO, 'test', 'fixtures', 'owner-args-biz-off-419d56f.json'), 'utf8')).profiles;
@@ -51,23 +51,28 @@ const diagOtherTurn = (profile, bizOn, o = {}) => resolveTurn({
   source: 'sched-diag', isOwner: true, chatId: 'sched-diag:daily.json', schedDest: 'other', ownerDmKnown: true, profile, bizOn, ...o,
 });
 
-test('T2-1 仓主私聊 / 心跳 / 发往私聊的定时：开关开时 argv 与基线 3c2d3ae 夹具逐字相同（legacy / audit / strict）', async () => {
+test('T2-1 仓主私聊 / 心跳 / 发往私聊的定时：开关开时 argv 等于基线夹具加 HOME 拒读（legacy / audit / strict）', async () => {
   const got = await runOnMatrix(h);
   assert.deepEqual(Object.keys(got), Object.keys(ON));
   for (const pname of Object.keys(PROFILES)) {
     assert.deepEqual(Object.keys(got[pname]), ON_NAMES, pname);
-    for (const name of ON_NAMES) assert.deepEqual(got[pname][name], ON[pname][name], `${pname}/${name}`);
+    for (const name of ON_NAMES) {
+      const expected = structuredClone(ON[pname][name]);
+      const i = expected.args.indexOf('--disallowedTools');
+      expected.args[i + 1] = [expected.args[i + 1], ...homeSecretsDeny('/<home>')].join(',');
+      assert.deepEqual(got[pname][name], expected, `${pname}/${name}`);
+    }
   }
-  // 夹具没有空转：心跳的 4 条规则只一份，其余各例都有 biz_get
+  // 心跳的密钥拒绝规则只一份，owner 私聊有 biz_get。
   for (const pname of Object.keys(PROFILES)) {
-    assert.ok(hasSecretsDeny(ON[pname].heartbeat.args), `${pname}/heartbeat`);
+    assert.ok(hasSecretsDeny(got[pname].heartbeat.args), `${pname}/heartbeat`);
     assert.ok(ON[pname].ownerP2p.args.some((a) => a.includes('mcp__biz__biz_get')), pname);
   }
 });
 
 for (const [label, bms] of SWITCH) {
   for (const [pname, profile] of Object.entries(PROFILES)) {
-    test(`T2-2 仓主在群里（旧式调用 与 显式 turn）：访客形状 + 4 条拒绝规则 + 群聊说明（${pname} / 开关${label}）`, async () => {
+    test(`T2-2 仓主在群里（旧式调用 与 显式 turn）：访客形状 + 密钥拒绝规则 + 群聊说明（${pname} / 开关${label}）`, async () => {
       const m = await loadFor(profile, bms);
       const guest = snapOf(m, ['guest:oc_group1:ou_owner', false, [], {}]);
       const viaOpts = snapOf(m, OWNER_GROUP_LEGACY);
@@ -82,13 +87,13 @@ for (const [label, bms] of SWITCH) {
       assert.ok(viaOpts.args.includes('--strict-mcp-config'));
       assert.equal(flag(viaOpts.args, '--setting-sources'), '');
       assert.ok(!viaOpts.args.join(' ').includes('lark-cli') && !viaOpts.args.join(' ').includes('mcp__'), '无 lark-cli / 飞书 / biz 工具');
-      assert.ok(hasSecretsDeny(viaOpts.args), '4 条拒绝规则');
+      assert.ok(hasSecretsDeny(viaOpts.args), '密钥拒绝规则齐全');
       assert.ok(o.prompt.startsWith(g.prompt));
       assert.match(o.prompt.slice(g.prompt.length), /^\n- 本轮发言的是机器人的主人，但这里是群聊：按访客权限运行/);
       assert.ok(!/memory|记忆索引|outbox/.test(g.prompt.replace('私密记忆', '')), '访客提示词不讲 outbox / 记忆索引');
     });
 
-    test(`T2-3 发往群 / 别处 / 目的地不明的定时：访客形状 + 4 条拒绝规则 + 一行说明（${pname} / 开关${label}）`, async () => {
+    test(`T2-3 发往群 / 别处 / 目的地不明的定时：访客形状 + 密钥拒绝规则 + 一行说明（${pname} / 开关${label}）`, async () => {
       const m = await loadFor(profile, bms);
       const guest = snapOf(m, ['guest:oc_group1:ou_x', false, [], {}]);
       const g = withoutPrompt(guest.args);
@@ -129,7 +134,7 @@ for (const [label, bms] of SWITCH) {
       assert.equal(other.cwd, snapOf(m, ['guest:oc_g:ou_x', false, [], {}]).cwd, '访客工作区');
       assert.ok(other.mcp === null && !other.args.includes('--mcp-config') && !other.args.includes('--allowedTools'));
       assert.ok(other.args.includes('--strict-mcp-config'));
-      assert.equal(secretsDenyOf(other.args).length, 0, '零工具档不加 4 条拒绝规则（与基线同一份拒绝表）');
+      assert.equal(secretsDenyOf(other.args).length, 0, '零工具档的拒绝表与基线一致');
       assert.match(flag(other.args, '--append-system-prompt'), /结果会发往群或别的会话/);
       // 旧式调用（opts.schedDest 显式写 other）同形
       const legacy = snapOf(m, ['sched-diag:daily.json', true, [], { model: 'claude-test-diag', effort: 'low', schedDest: 'other' }]);
@@ -170,7 +175,7 @@ async function allArgv(bms) {
 }
 
 for (const [label, bms] of SWITCH) {
-  test(`T7 不变量（开关${label}）：带工具的 argv 一定有 4 条拒绝规则（心跳只一份）；零工具 argv 与基线夹具逐字相同`, async () => {
+  test(`T7 不变量（开关${label}）：带工具的 argv 只带一份密钥拒绝规则，零工具 argv 与基线夹具逐字相同`, async () => {
     const rows = await allArgv(bms);
     assert.equal(rows.length, 3 * (CASE_NAMES.length + Object.keys(EXTRA).length));
     let withTools = 0;
@@ -179,22 +184,22 @@ for (const [label, bms] of SWITCH) {
       const tag = `${pname}/${name}`;
       if (isZeroTool(snap.args)) {
         zero += 1;
-        assert.equal(secretsDenyOf(snap.args).length, 0, `${tag}：零工具档不加这 4 条`);
+        assert.equal(secretsDenyOf(snap.args).length, 0, `${tag}：零工具档与基线一致`);
         // 基线里本来就是零工具的用例：argv 与夹具逐字相同（不经任何剥离）
         if (base) {
           assert.deepEqual(snap, OFF[pname][name], `${tag}：零工具 argv 与基线夹具相同`);
         }
       } else {
         withTools += 1;
-        assert.ok(hasSecretsDeny(snap.args), `${tag}：带工具的 argv 必须有 4 条 .env / security 拒绝规则`);
-        assert.equal(disallowedOf(snap.args).filter((r) => secretsDenyOf(snap.args).includes(r)).length, 4, `${tag}：不重复`);
+        assert.ok(hasSecretsDeny(snap.args), `${tag}：带工具的 argv 必须带齐密钥拒绝规则`);
+        assert.equal(disallowedOf(snap.args).filter((r) => secretsDenyOf(snap.args).includes(r)).length, SECRETS_DENY_COUNT, `${tag}：不重复`);
       }
     }
     assert.ok(withTools >= 30 && zero >= 6, `两类都要有（${withTools}/${zero}），防止不变量空转`);
   });
 }
 
-test('T7 关时「有工具」的 argv 拿掉 4 条后与基线夹具逐字相同（旧夹具没有空转）', async () => {
+test('T7 关时「有工具」的 argv 拿掉密钥拒绝规则后与基线夹具逐字相同（旧夹具没有空转）', async () => {
   const m = await runMatrix(h);
   let checked = 0;
   for (const pname of Object.keys(PROFILES)) {

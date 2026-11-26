@@ -22,11 +22,13 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import spawn from 'cross-spawn';
 import { HANDOFF_PROMPT, buildCarryoverInfo, extractHandoffSummary, readRecentJournals, readRounds } from '../src/daily-session.js';
+import { envDenyRules } from '../src/biz-wiring.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
 
 const READONLY = ['--tools', 'Read,Grep,Glob', '--allowedTools', 'Read(./**)', '--setting-sources', '', '--strict-mcp-config',
+  '--disallowedTools', envDenyRules(REPO).join(','),
   '--settings', JSON.stringify({ autoMemoryEnabled: false })];
 // 交接提示词同线上；回放只读，额外说明跳过写入、只出摘要
 export const REPLAY_HANDOFF_PROMPT = `${HANDOFF_PROMPT}\n（回放对比：本轮只读，跳过第 1–3 步的写入，只输出第 4 步的摘要。）`;
