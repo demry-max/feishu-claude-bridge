@@ -299,7 +299,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
      > 请在飞书里私聊机器人发「你好」，告诉我有没有收到回复。
      >
      > Please DM the bot "hello" in Feishu and tell me whether it replied.
-5. **验证**：`grep -n "\[msg\]" bridge.log | tail -3`，应有一行 `[msg] … @ p2p [text]: …`。
+5. **验证**：`grep -n "\[msg\]" bridge.log | tail -3`，应有一行 `[msg] … @ p2p [text] len=… id=…`（日志不记正文）。
    - 人说收到回复 → 成功。
    - **日志里没有 `[msg]`**：飞书没把消息推过来。
      - 「使用长连接接收事件」没开，或没加 `im.message.receive_v1`。
@@ -370,7 +370,7 @@ owner 是唯一能用本机工具和记忆的人，其他人只能联网检索�
 | 优雅退出等待 | `120` 秒（macOS launchd 下最多 50） | `SHUTDOWN_GRACE_SEC` | macOS 改了之后要重跑 `npm run install-service` 更新 `ExitTimeOut` |
 | 启动与重连后补拉历史消息（可靠性修复） | **开** | `BRIDGE_BACKFILL=on` / `off` | 要开通读历史消息的权限（scope 名未核实，见 `docs/release-sheet.md`）；没开通只记 `[backfill] 拉取失败` |
 | 定时补漏（可靠性修复） | **开**，每 `10` 分钟 | `BRIDGE_SWEEP_MIN`：`0`（关）或 5–60 | 补拉已开 |
-| 过期消息只记不答（可靠性修复） | **开**，`600000` 毫秒 | `BRIDGE_STALE_MS`（60000–86400000） | 当前版本只对补拉到的消息生效（实时事件尚未接上） |
+| 过期消息只记不答（可靠性修复） | **开**，`600000` 毫秒 | `BRIDGE_STALE_MS`（60000–86400000） | 无 |
 
 最后三项是可靠性修复，不算可选功能，所以缺省开启（原因见 README「重启与断线」）。
 

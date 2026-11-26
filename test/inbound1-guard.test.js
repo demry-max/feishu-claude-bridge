@@ -134,8 +134,9 @@ describe('G 入口兜底', () => {
     assert.equal(api.isDuplicate('om_2'), false);
     await api.inboundGuard({ message: { message_id: 'om_2' } }, async () => 'done');
     assert.equal(api.isDuplicate('om_2'), true, '正常处理完的仍算重复');
-    // 注册处：trackedHandleMessage 交给兜底（只这一条是源码断言）
-    assert.match(SRC, /'im\.message\.receive_v1': \(data\) => inboundGuard\(data, trackedHandleMessage\)/);
+    // 注册处：事件走统一入口（BRIDGE-STD-1：过期判定在前），入口仍把 trackedHandleMessage 交给兜底（只这两条是源码断言）
+    assert.match(SRC, /'im\.message\.receive_v1': \(data\) => ingest\(data, 'event'\)/);
+    assert.match(SRC, /handle: \(data\) => inboundGuard\(data, trackedHandleMessage\),/);
     assert.ok(!/createInboundGuard\(\{[^}]*forget/.test(SRC), '兜底实例不再传 forget');
   });
 

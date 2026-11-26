@@ -14,19 +14,23 @@ export function maskIds(text) {
   return String(text).replace(ID_RE, (m, p) => `${p}_…${m.slice(-6)}`);
 }
 
+// SDK 打请求错误时把请求体（config.data）和飞书回显的字段值（field_violations[].value）一起交给 console：这两处装着消息正文，整个换掉
+const BODY_AT = { config: 'data', field_violations: 'value' };
+
 /**
- * 一个参数脱 id。字符串与 Error（取栈）直接脱；数组和普通对象逐层复制着脱——SDK 的默认 logger 把参数装在数组里交给 console，
+ * 一个参数脱 id、去请求正文。字符串与 Error（取栈）直接脱；数组和普通对象逐层复制着脱——SDK 的默认 logger 把参数装在数组里交给 console，
  * 报错对象（带请求参数、URL）嵌在里面。类实例原样交出去；原对象不改；环引用和超过 8 层的部分记 […]。
  */
-function maskArg(a, path = []) {
+function maskArg(a, path = [], under = '') {
   try {
     if (typeof a === 'string') return maskIds(a);
     if (a instanceof Error) return maskIds(a.stack ?? String(a));
     const list = Array.isArray(a);
     if (!list && !(a && typeof a === 'object' && [Object.prototype, null].includes(Object.getPrototypeOf(a)))) return a;
     if (path.length >= 8 || path.includes(a)) return '[…]';
-    const next = (v) => maskArg(v, [...path, a]);
-    return list ? a.map(next) : Object.fromEntries(Object.entries(a).map(([k, v]) => [maskIds(k), next(v)]));
+    const next = (v, k) => maskArg(v, [...path, a], k);
+    if (list) return a.map((v) => next(v, under));
+    return Object.fromEntries(Object.entries(a).map(([k, v]) => [maskIds(k), BODY_AT[under] === k && v !== undefined ? '[正文未记]' : next(v, k)]));
   } catch { return a; /* 拿不到栈 / 对象有毒：原样交出去，日志不能因此崩 */ }
 }
 

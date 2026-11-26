@@ -384,7 +384,7 @@ describe('O 回传文件', () => {
   test('O9a runTurn 成功路径：flushOutbox 第 4 参仍是 undefined（缺省 = 发送），文件照发', async (t) => {
     const b = bridge(t, { files: { 'r.pdf': 'R' } });
     await b.send('你好');
-    assert.deepEqual(b.flushArgs, [undefined]);
+    assert.deepEqual(b.flushArgs, [{ idempotencyKey: 'reply:om_1' }]);
     assert.equal(b.rawSent.length, 1);
     assert.equal(b.rawSent[0].data.msg_type, 'file');
     assert.deepEqual(ls(b.keep), []);
@@ -393,7 +393,7 @@ describe('O 回传文件', () => {
   test('O9b runTurn 失败：{mode:\'hold\'}、文件进保留目录、不上传；失败回复末尾带「📎」说明，原错误文字在前', async (t) => {
     const b = bridge(t, { files: { 'r.pdf': 'R' }, run: async () => { throw new Error('boom'); } });
     await b.send('你好');
-    assert.deepEqual(b.flushArgs, [{ mode: 'hold' }]);
+    assert.deepEqual(b.flushArgs, [{ mode: 'hold', idempotencyKey: 'reply:om_1' }]);
     assert.deepEqual(b.rawSent, []);
     assert.equal(ls(b.keep).length, 1);
     assert.equal(b.replies.length, 1);
@@ -405,7 +405,7 @@ describe('O 回传文件', () => {
   test('O9c runTurn 取消：{mode:\'discard\'}、文件清掉、不进保留目录、不回复', async (t) => {
     const b = bridge(t, { files: { 'r.pdf': 'R' }, run: async () => { throw Object.assign(new Error('cancelled'), { cancelled: true }); } });
     await b.send('你好');
-    assert.deepEqual(b.flushArgs, [{ mode: 'discard' }]);
+    assert.deepEqual(b.flushArgs, [{ mode: 'discard', idempotencyKey: 'reply:om_1' }]);
     assert.deepEqual([ls(b.outDir), ls(b.keep), b.rawSent, b.replies], [[], [], [], []]);
   });
 

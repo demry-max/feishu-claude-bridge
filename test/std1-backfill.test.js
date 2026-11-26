@@ -328,12 +328,16 @@ test('已知会话：owner 私聊 ＋ 7 天内发过消息的 ＋ ALLOW_CHATS �
 });
 
 // ---- 运行部分 -----------------------------------------------------------------------------
-/** 假定时器：只要 setInterval */
+/** 假定时器：list 里是 setInterval 挂的，timeouts 里是 setTimeout 挂的（都不会自己到点） */
 function fakeIntervals() {
   const list = [];
+  const timeouts = [];
   return {
     list,
+    timeouts,
     setInterval: (fn, ms) => { const h = { fn, ms, unrefCalled: false, unref() { h.unrefCalled = true; return h; } }; list.push(h); return h; },
+    setTimeout: (fn, ms) => { const h = { fn, ms, cleared: false }; timeouts.push(h); return h; },
+    clearTimeout: (h) => { if (h) h.cleared = true; },
   };
 }
 /**
@@ -692,4 +696,141 @@ test('断网演练：断网时补漏失败只记 code；重连后跑一轮——
   assert.ok(r.logs.includes('[ws] 重连中（第 ? 次）'));
   assert.ok(r.logs.includes('[ws] 已重连'));
   assert.ok(r.logs.some((l) => l.startsWith('[backfill] reason=reconnected ')));
+});
+
+// ---- STD-1b (i)：首次启动水位线——重启前已经答过的消息不重做 ----------------------------------
+/** index.js 同款接线：水位线取自去重表，传给入口 */
+function wired({ dir, clock, items = [] }) {
+  const { logs, log } = sink();
+  const effects = [];
+  const dedupe = createDedupeStore({ file: path.join(dir, 'inbound-seen.json'), now: clock.now, log });
+  const ingest = createIngest({
+    dedupe, notBeforeMs: dedupe.since, now: clock.now, log,
+    handle: async (d) => { if (dedupe.checkAndMark(d.message.message_id)) return; effects.push(d.message.message_id); },
+  });
+  const backfill = createBackfill({
+    listMessages: async () => page(items), knownChats: () => [{ chatId: P2P, kind: 'p2p' }], ingest, dedupe,
+    book: createChatBook({ file: path.join(dir, 'inbound-cursor.json'), now: clock.now, log }),
+    getBotOpenId: async () => BOT, now: clock.now, log,
+  });
+  return { backfill, ingest, dedupe, effects, logs };
+}
+
+test('首次启动：补拉到启动时刻之前的消息只登记去重、不处理；之后的照常处理', async () => {
+  const clock = mkClock();
+  const dir = tmp();
+  const r = wired({ dir, clock, items: [item('om_old1', T0 - 2 * MIN), item('om_old2', T0 - 1), item('om_new1', T0 + 1000)] });
+  clock.t += 2000;
+  await r.backfill.run('ready');
+  assert.deepEqual(r.effects, ['om_new1']);
+  assert.equal(r.dedupe.has('om_old1'), true);
+  assert.equal(r.dedupe.has('om_old2'), true);
+  assert.ok(r.logs.includes('[stale] id=…m_old1 早于首次启动水位线，只登记不处理 src=backfill'), r.logs.join('\n'));
+});
+
+test('首次启动：实时事件重推启动前的消息同样只登记', async () => {
+  const clock = mkClock();
+  const r = wired({ dir: tmp(), clock });
+  await r.ingest(eventOf(item('om_old3', T0 - MIN)), 'event');
+  assert.deepEqual(r.effects, []);
+  assert.equal(r.dedupe.has('om_old3'), true);
+});
+
+test('水位线落盘：几分钟后再重启不前移也不丢——启动前的仍不做，两次启动之间的照常做', async () => {
+  const clock = mkClock();
+  const dir = tmp();
+  const first = wired({ dir, clock }); // 首次启动，一条消息都没来就又重启了
+  assert.equal(first.dedupe.since, T0);
+  clock.t += 3 * MIN;
+  const second = wired({ dir, clock, items: [item('om_old4', T0 - MIN), item('om_gap1', T0 + MIN)] });
+  assert.equal(second.dedupe.since, T0);
+  await second.backfill.run('ready');
+  assert.deepEqual(second.effects, ['om_gap1']);
+});
+
+test('水位线：没有水位线的旧状态文件按 0；文件损坏（记录全丢）按本次启动时刻重新立', () => {
+  const clock = mkClock();
+  const dir = tmp();
+  const file = path.join(dir, 'inbound-seen.json');
+  fs.writeFileSync(file, JSON.stringify({ v: 1, ids: [] }));
+  assert.equal(createDedupeStore({ file, now: clock.now, log: () => {} }).since, 0);
+  fs.writeFileSync(file, '{broken');
+  assert.equal(createDedupeStore({ file, now: clock.now, log: () => {} }).since, T0);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).since, T0);
+});
+
+test('接线：入口的水位线取自落盘去重表', () => {
+  const from = SRC.indexOf('createIngest({');
+  assert.ok(from > 0);
+  assert.match(SRC.slice(from, SRC.indexOf('\n});', from)), /notBeforeMs: dedupe\.since/);
+});
+
+// ---- STD-1b (ii)：补拉请求超时 ------------------------------------------------------------------
+const CHAT_B = 'oc_test0003';
+const twoChats = [{ chatId: P2P, kind: 'p2p' }, { chatId: CHAT_B, kind: 'p2p' }];
+
+test('列表请求挂住：到点放弃这一轮（后面的会话本轮不拉），下一轮照常', async () => {
+  const hung = deferred();
+  const r = rig({ chats: twoChats, respond: (chatId, params, n) => (n === 1 ? hung.promise : page(chatId === P2P ? [item('om_t1', T0 - MIN)] : [])) });
+  let done = false;
+  const first = r.backfill.run('reconnected').then(() => { done = true; });
+  await tick();
+  assert.equal(done, false);
+  assert.equal(r.timers.timeouts.length, 1);
+  assert.equal(r.timers.timeouts[0].ms, 30_000);
+  r.timers.timeouts[0].fn();
+  await tick();
+  assert.equal(done, true, '超时后本轮结束');
+  await first;
+  assert.equal(r.calls.length, 1);
+  assert.ok(r.logs.includes('[backfill] 拉取失败（p2p）code=TIMEOUT'), r.logs.join('\n'));
+  assert.ok(r.logs.includes('[backfill] 请求超时，放弃本轮；下一轮照常'));
+
+  await r.backfill.run('sweep');
+  assert.equal(r.calls.length, 3);
+  assert.deepEqual(r.effects, ['om_t1']);
+  assert.ok(r.timers.timeouts.slice(1).every((h) => h.cleared), '按时返回的请求要撤掉定时器');
+});
+
+test('超时之后挂住的请求才回来：内容不交付、游标不动', async () => {
+  const hung = deferred();
+  const r = rig({ respond: () => hung.promise });
+  const run = r.backfill.run('ready');
+  await tick();
+  r.timers.timeouts[0].fn();
+  await run;
+  hung.resolve(page([item('om_late', T0 - MIN)]));
+  await tick();
+  await tick();
+  assert.deepEqual(r.effects, []);
+  assert.equal(r.book.cursor(P2P), 0);
+});
+
+test('超时时已经排队的补一轮照常跑', async () => {
+  const hung = deferred();
+  const r = rig({ respond: (chatId, params, n) => (n === 1 ? hung.promise : page([])) });
+  const run = r.backfill.run('ready');
+  await tick();
+  r.backfill.run('reconnected');
+  r.timers.timeouts[0].fn();
+  await run;
+  assert.equal(r.calls.length, 2);
+});
+
+test('取机器人 open_id 挂住：到点按取不到处理，跳过群、私聊照拉', async () => {
+  const timers = fakeIntervals();
+  const calls = [];
+  const dir = tmp();
+  const dedupe = createDedupeStore({ file: path.join(dir, 'inbound-seen.json'), log: () => {} });
+  const backfill = createBackfill({
+    listMessages: async (p) => { calls.push(p.container_id); return page([]); },
+    knownChats: () => [{ chatId: GROUP, kind: 'group' }, { chatId: P2P, kind: 'p2p' }], ingest: async () => {}, dedupe,
+    book: createChatBook({ file: path.join(dir, 'inbound-cursor.json'), log: () => {} }),
+    getBotOpenId: () => new Promise(() => {}), timers, log: () => {},
+  });
+  const run = backfill.run('ready');
+  await tick();
+  timers.timeouts[0].fn();
+  await run;
+  assert.deepEqual(calls, [P2P]);
 });

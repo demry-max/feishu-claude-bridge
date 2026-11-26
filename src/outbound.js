@@ -5,6 +5,7 @@ import { withUuid, outboxPart, contentPart } from './send-key.js'; // BRIDGE-SEN
 import { defaultKeepDir, keepEntry, displayName, unsentNote } from './outbox-keep.js'; // BRIDGE-SEND-2
 import { stripRenewedNote } from './renewed-note.js'; // BRIDGE-INBOUND-1
 import { stripLocalPaths } from './messages.js'; // BRIDGE-INBOUND-1（messages.js 不 import 本文件，无环）
+import { maskIds, tail6 } from './log-safe.js'; // BRIDGE-STD-1
 
 
 // ---- 出站脱敏：回复送出前抹掉密钥/令牌/内网地址，避免误发到群里 ----
@@ -342,8 +343,8 @@ export function voiceText(text) {
     .slice(0, TTS_MAX_CHARS);
 }
 
-export async function sendVoice(client, text, sendRaw) {
-  if (process.platform !== 'darwin') return false;
+export async function sendVoice(client, text, sendRaw, { idempotencyKey, exec = execFileP, platform = process.platform } = {}) {
+  if (platform !== 'darwin') return false;
   const plain = voiceText(text);
   if (!plain) return false;
 
@@ -351,11 +352,11 @@ export async function sendVoice(client, text, sendRaw) {
   const aiff = `${base}.aiff`;
   const opus = `${base}.opus`;
   try {
-    await execFileP('say', ['-v', TTS_VOICE, '-o', aiff, plain]);
-    await execFileP(process.env.FFMPEG_BIN || 'ffmpeg', [
+    await exec('say', ['-v', TTS_VOICE, '-o', aiff, plain]);
+    await exec(process.env.FFMPEG_BIN || 'ffmpeg', [
       '-y', '-i', aiff, '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', opus,
     ]);
-    const { stdout } = await execFileP(process.env.FFMPEG_BIN || 'ffmpeg', ['-i', opus], { encoding: 'utf8' }).catch((e) => ({ stdout: e.stderr ?? '' }));
+    const { stdout } = await exec(process.env.FFMPEG_BIN || 'ffmpeg', ['-i', opus], { encoding: 'utf8' }).catch((e) => ({ stdout: e.stderr ?? '' }));
     const m = String(stdout).match(/Duration: (\d+):(\d+):([\d.]+)/);
     const durationMs = m ? Math.round(((+m[1] * 3600 + +m[2] * 60 + parseFloat(m[3])) * 1000)) : 1000;
 
@@ -364,10 +365,11 @@ export async function sendVoice(client, text, sendRaw) {
     });
     const key = up?.file_key ?? up?.data?.file_key;
     if (!key) throw new Error('上传语音未返回 file_key');
-    await sendRaw({ msg_type: 'audio', content: JSON.stringify({ file_key: key }) });
+    await sendRaw(withUuid({ msg_type: 'audio', content: JSON.stringify({ file_key: key }) }, idempotencyKey, contentPart('audio', plain)));
     return true;
   } catch (e) {
-    console.error('[tts]', e?.message ?? e);
+    // 只记错误码：合成命令的报错文字里带着整段回复
+    console.error(`[tts] 语音回复失败（code=${e?.response?.data?.code ?? e?.code ?? e?.name ?? '?'}）`);
     return false;
   } finally {
     for (const f of [aiff, opus]) fs.rmSync(f, { force: true });
@@ -497,10 +499,10 @@ export async function handleScheduledFailure({ err, jobName, send, runDiagnosis,
 }
 
 /**
- * 入站消息日志行：先脱敏再截断（反过来会把截断后不足 8 位的密钥尾巴留在日志里），换行折成 ⏎ 保持一行。
- * 起因：owner 私聊贴过一整把 bms_sk_… 密钥，旧写法原样记进了 ~/Library/Logs/feishu-claude-bridge.log。
+ * 入站消息日志行：只记身份、会话类型、消息类型、字数和消息尾号，正文一个字不进日志（BRIDGE-STD-1）。
+ * `[msg] ` 前缀和 ` @ p2p [text]` 的形状别改：AGENTS.md §6 靠 grep 认它。
  */
-export function formatInboundLog({ who, chatType, messageType, exec = false, text }) {
-  const body = redact(text).replace(/\r?\n/g, ' ⏎ ').slice(0, 80);
-  return `[msg] ${who} @ ${chatType} [${messageType}]${exec ? ' [exec]' : ''}: ${body}`;
+export function formatInboundLog({ who, chatType, messageType, exec = false, text, messageId }) {
+  const length = [...String(text ?? '')].length;
+  return `[msg] ${maskIds(who)} @ ${chatType} [${messageType}]${exec ? ' [exec]' : ''} len=${length} id=${tail6(messageId)}`;
 }

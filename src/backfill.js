@@ -12,6 +12,7 @@ const HOUR = 60 * MIN;
 const DEFAULT_STALE_MS = 10 * MIN;
 const PAGE_SIZE = 50;
 const MAX_PAGES = 3;
+const REQUEST_TIMEOUT_MS = 30 * 1000;
 
 /** create_time（毫秒数字串）→ 毫秒；缺失 / 认不出来 → null。不能当成 0：当成 0 就永远过期、永远不答 */
 export function messageTime(createTime) {
@@ -42,11 +43,11 @@ export function backfillConfig(env = process.env, log = console.log) {
 }
 
 /**
- * 事件和补拉的共同入口：过期 → 在去重表里登记成已消费，不进处理链、不回复；否则原样交给 handle。
+ * 事件和补拉的共同入口：过期、或建在首次启动水位线（notBeforeMs）之前 → 在去重表里登记成已消费，不进处理链、不回复；否则原样交给 handle。
  * handle 的同步前段（处理链第一句判重）在本函数返回前就跑完了，所以同一条消息两路同时到也只处理一次。
  * onSeen(message, 毫秒|null)：不论答了、过期还是重复都回调（会话登记与游标前移）。
  */
-export function createIngest({ dedupe, handle, staleMs = DEFAULT_STALE_MS, now = Date.now, log = console.log, onSeen = () => {} }) {
+export function createIngest({ dedupe, handle, staleMs = DEFAULT_STALE_MS, notBeforeMs = 0, now = Date.now, log = console.log, onSeen = () => {} }) {
   const note = (message, at) => { try { onSeen(message, at); } catch { /* 记游标出错不能挡住收消息 */ } };
   return async function ingest(data, src = 'event') {
     const message = data?.message;
@@ -54,8 +55,10 @@ export function createIngest({ dedupe, handle, staleMs = DEFAULT_STALE_MS, now =
     const id = message.message_id;
     const at = messageTime(message.create_time);
     if (at === null) log(`[stale] id=${tail6(id)} create_time 缺失或无法识别，按不过期处理 src=${src}`);
-    if (isStale(at, now(), staleMs)) {
-      if (id && !dedupe.checkAndMark(id)) log(`[stale] id=${tail6(id)} age=${Math.round((now() - at) / MIN)}m src=${src}`);
+    const early = at !== null && at < notBeforeMs; // 首次启动前的消息：旧版本可能已经答过
+    if (early || isStale(at, now(), staleMs)) {
+      const why = early ? '早于首次启动水位线，只登记不处理' : `age=${Math.round((now() - at) / MIN)}m`;
+      if (id && !dedupe.checkAndMark(id)) log(`[stale] id=${tail6(id)} ${why} src=${src}`);
       note(message, at);
       return undefined;
     }
@@ -175,6 +178,7 @@ export function backfillWindow({ cursorMs = 0, now, staleMs }) {
 export function createBackfill({
   listMessages, knownChats, ingest, dedupe, book, getBotOpenId, isDraining = () => false,
   staleMs = DEFAULT_STALE_MS, enabled = true, sweepMin = 10, now = Date.now, timers = globalThis, log = console.log,
+  requestTimeoutMs = REQUEST_TIMEOUT_MS,
 }) {
   const failedAt = new Map(); // chat_id → 上次记失败日志的时刻
   const truncatedAt = new Map(); // chat_id → 记过「窗口截到 stale」的游标位置
@@ -183,6 +187,15 @@ export function createBackfill({
   let sweeper = null;
   // 只取错误码：错误对象和接口文案里可能带会话 id
   const codeOf = (e) => String(e?.response?.data?.code ?? e?.code ?? e?.name ?? '?').slice(0, 40);
+
+  /** 请求挂住不能把单飞卡死：到点按失败处理（e.hung）。挂住的请求之后即使回来，结果也丢弃 */
+  function limit(request) {
+    let timer;
+    const expired = new Promise((_, reject) => {
+      timer = timers.setTimeout(() => reject(Object.assign(new Error('request timeout'), { code: 'TIMEOUT', hung: true })), requestTimeoutMs);
+    });
+    return Promise.race([request, expired]).finally(() => timers.clearTimeout(timer));
+  }
 
   async function pull({ chatId, kind, cursorMs }, botOpenId, tally) {
     const { startSec, truncatedMs } = backfillWindow({ cursorMs, now: now(), staleMs });
@@ -193,10 +206,10 @@ export function createBackfill({
     let pageToken;
     for (let page = 1; page <= MAX_PAGES; page += 1) {
       if (isDraining()) return;
-      const res = await listMessages({
+      const res = await limit(listMessages({
         container_id_type: 'chat', container_id: chatId, start_time: String(startSec),
         sort_type: 'ByCreateTimeAsc', page_size: PAGE_SIZE, ...(pageToken ? { page_token: pageToken } : {}),
-      });
+      }));
       if (res?.code) throw Object.assign(new Error('list failed'), { code: res.code });
       const plan = planBackfill({ items: res?.data?.items ?? [], cursorMs, now: now(), staleMs, has: (id) => dedupe.has(id), botOpenId, chatKind: kind });
       for (const { data, stale } of plan.deliver) {
@@ -219,7 +232,7 @@ export function createBackfill({
       if (isDraining()) return;
       if (chat.kind === 'group') {
         if (botOpenId === undefined) {
-          try { botOpenId = (await getBotOpenId()) || null; } catch { botOpenId = null; }
+          try { botOpenId = (await limit(getBotOpenId())) || null; } catch { botOpenId = null; }
           if (!botOpenId) log('[backfill] 取不到机器人 open_id，本轮跳过群补拉');
         }
         if (!botOpenId) continue;
@@ -229,9 +242,11 @@ export function createBackfill({
         failedAt.delete(chat.chatId);
       } catch (e) {
         tally.failed += 1;
-        if (now() - (failedAt.get(chat.chatId) ?? -Infinity) < HOUR) continue;
-        failedAt.set(chat.chatId, now());
-        log(`[backfill] 拉取失败（${chat.kind}）code=${codeOf(e)}`);
+        if (now() - (failedAt.get(chat.chatId) ?? -Infinity) >= HOUR) {
+          failedAt.set(chat.chatId, now());
+          log(`[backfill] 拉取失败（${chat.kind}）code=${codeOf(e)}`);
+        }
+        if (e?.hung) { log('[backfill] 请求超时，放弃本轮；下一轮照常'); break; }
       }
     }
     if (reason !== 'sweep' || tally.delivered > 0) {

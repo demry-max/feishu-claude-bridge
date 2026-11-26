@@ -285,13 +285,13 @@ describe('C 多段发送', () => {
     const a = replyFn(() => ({ data: { message_id: 'om_x' } }));
     const content = '你好 **世界**';
     assert.equal(await a.reply('om_1', content), undefined);
-    assert.deepEqual(a.reqs, [{ path: { message_id: 'om_1' }, data: { msg_type: 'interactive', content: JSON.stringify({ config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content }] }) } }]);
+    assert.deepEqual(a.reqs, [{ path: { message_id: 'om_1' }, data: { msg_type: 'interactive', content: JSON.stringify({ config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content }] }), uuid: feishuUuid('reply:om_1', contentPart('card', content)) } }]);
     await a.reply('om_1', '');
     assert.equal(a.reqs.length, 1);
 
     const b = replyFn((x) => { if (x.data.msg_type === 'interactive') throw httpErr(); return {}; });
     await b.reply('om_2', content);
-    assert.deepEqual(b.reqs[1], { path: { message_id: 'om_2' }, data: { msg_type: 'text', content: JSON.stringify({ text: content }) } });
+    assert.deepEqual(b.reqs[1], { path: { message_id: 'om_2' }, data: { msg_type: 'text', content: JSON.stringify({ text: content }), uuid: feishuUuid('reply:om_2', contentPart('text', content)) } });
     assert.ok(b.errs.some((l) => l.startsWith('[reply] card failed, fallback to text:')));
 
     const long = `${'汉'.repeat(12_000)}\n\n\`\`\`js\n${'let a = 1;\n'.repeat(40)}\`\`\`\n\n| a | b |\n|---|---|\n${'| 1 | 2 |\n'.repeat(20)}\n${'汉'.repeat(12_000)}\n`;

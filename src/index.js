@@ -201,7 +201,8 @@ let ownerDm = { remember: () => {}, statusLine: () => '' };
 async function reply(messageId, text) {
   // BRIDGE-SEND-2：按请求体字节分段（超过一段放得下的才分），段间串行；卡片失败降级文本，与定时任务 / 心跳同一条路
   if (!redact(text)) return; // 空文本从前一条都不发（分段循环里没有块），保持
-  await sendCardWithFallback((data) => client.im.v1.message.reply({ path: { message_id: messageId }, data }), redact(text), {}, (e) => console.error('[reply] card failed, fallback to text:', e?.message ?? e));
+  // BRIDGE-STD-1：带请求级 uuid（飞书侧去重）；这条路没有调用方重试，长回复断在半路时照旧补一条提示
+  await sendCardWithFallback((data) => client.im.v1.message.reply({ path: { message_id: messageId }, data }), redact(text), { idempotencyKey: `reply:${messageId}`, noticeOnFail: true }, (e) => console.error('[reply] card failed, fallback to text:', e?.response?.data?.code ?? '', e?.message ?? e));
 }
 
 async function react(messageId, emoji) {
@@ -598,8 +599,10 @@ async function runTurn(spec) {
       messageType: message.message_type,
       exec: route.lane === 'exec',
       text,
+      messageId: message.message_id,
     }));
     await react(message.message_id, 'OnIt');
+    const replyKey = `reply:${message.message_id}`; // 本轮附件、语音的请求级 uuid 由它派生（BRIDGE-STD-1）
     const progress = createProgressChannel(client, message.message_id);
     try {
       prompt = dailySession.beforeTurn({ sessionKey, prompt, text, isOwner, chatType: message.chat_type, confirmed: dsConfirmed, queued, merged, route, toolTurn }); // 每日新会话（off 原样返回；排队轮、带确认提示的合并轮不换）
@@ -610,11 +613,11 @@ async function runTurn(spec) {
       // 机器人写进本轮专属 outbox 的图片/文件随本轮一起回传
       await flushOutbox(client, outboxDirFor(sessionKey, isOwner), (data) =>
         client.im.v1.message.reply({ path: { message_id: message.message_id }, data })
-      );
+      , { idempotencyKey: replyKey });
       if (voiceChats.has(message.chat_id) && answer) {
         await sendVoice(client, answer, (data) =>
           client.im.v1.message.reply({ path: { message_id: message.message_id }, data })
-        );
+        , { idempotencyKey: replyKey });
       }
       await react(message.message_id, 'DONE');
     } catch (e) {
@@ -623,7 +626,7 @@ async function runTurn(spec) {
       // 取消轮只清不发；失败轮不发，挪到保留目录并在报错里列出文件名（BRIDGE-SEND-2）
       const held = await flushOutbox(client, outboxDirFor(sessionKey, isOwner), (data) =>
         client.im.v1.message.reply({ path: { message_id: message.message_id }, data })
-      , { mode: e?.cancelled ? 'discard' : 'hold' }).catch(() => null);
+      , { mode: e?.cancelled ? 'discard' : 'hold', idempotencyKey: replyKey }).catch(() => null);
       if (e?.cancelled) return; // /cancel 主动终止，不报错
       console.error('[claude]', e);
       // 登录类失败（含钥匙串锁住）给确定性修复步骤；瞬时刷新不算登录失效；其余原样报错
@@ -633,7 +636,7 @@ async function runTurn(spec) {
 }
 
 const eventDispatcher = new lark.EventDispatcher({}).register({
-  'im.message.receive_v1': (data) => inboundGuard(data, trackedHandleMessage), // BRIDGE-INBOUND-1：进模型前出错不再没反应
+  'im.message.receive_v1': (data) => ingest(data, 'event'), // BRIDGE-STD-1：过期只记不答、登记会话；里头仍走 BRIDGE-INBOUND-1 的入口兜底
   // 机器人事件 → 「owner 对心跳消息的操作」信号（BRIDGE-EV-1）：表情 / 已读 / 撤回原本到达即丢，卡片按钮回调是新增的。
   // 全部由桥接按确定规则处理：不调模型、永不抛出；按钮回调同步校验后立即回 toast，回写异步排队
   ...(() => {
@@ -941,6 +944,7 @@ const ingest = createIngest({
   dedupe,
   handle: (data) => inboundGuard(data, trackedHandleMessage),
   staleMs: backfillSettings.staleMs,
+  notBeforeMs: dedupe.since, // 首次启动水位线：早于它的消息只登记去重，不重做
   onSeen: (message, at) => chatBook.note(message.chat_id, message.chat_type, at),
 });
 // 单独一个不出声的客户端：SDK 请求失败时会把请求参数（含会话 id）打进日志；失败由补拉自己记一行错误码

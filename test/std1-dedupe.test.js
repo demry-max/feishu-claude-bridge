@@ -47,7 +47,7 @@ test('缺 id / 非字符串 id：不当重复、不登记（不把 undefined 当
   assert.equal(s.size, 0);
 });
 
-test('重启不丢：登记后新建一个 store 读同一个文件，同 id 仍是重复；文件形态 { v:1, ids:[[id, 登记时刻]] }，权限 0600', () => {
+test('重启不丢：登记后新建一个 store 读同一个文件，同 id 仍是重复；文件形态 { v:1, since:首启时刻, ids:[[id, 登记时刻]] }，权限 0600', () => {
   const dir = tmp();
   const file = path.join(dir, 'data', 'seen.json');
   const k = mkClock();
@@ -56,7 +56,7 @@ test('重启不丢：登记后新建一个 store 读同一个文件，同 id 仍
   k.t += 5;
   s1.checkAndMark('m2');
   const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.deepEqual(doc, { v: 1, ids: [['m1', 1_700_000_000_000], ['m2', 1_700_000_000_005]] });
+  assert.deepEqual(doc, { v: 1, since: 1_700_000_000_000, ids: [['m1', 1_700_000_000_000], ['m2', 1_700_000_000_005]] });
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   assert.deepEqual(fs.readdirSync(path.dirname(file)), ['seen.json'], '不留临时文件');
   const s2 = createDedupeStore({ file, now: k.now, ...quiet() });

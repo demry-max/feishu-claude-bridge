@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import * as lark from '@larksuiteoapi/node-sdk';
+import { createRequire } from 'node:module';
 import { findOwnerCandidates } from '../scripts/lib/checks.js';
 import { tail6, maskIds, installConsoleIdMask, tightenLogFds } from '../src/log-safe.js';
 
@@ -80,7 +81,7 @@ test('installConsoleIdMask：SDK 默认 logger 的形态（参数装在数组里
   const out = calls[0][1][1];
   const seen = out[0][0];
   assert.equal(seen.message, 'user ou_…st0008');
-  assert.deepEqual(seen.config, { url: 'https://x.invalid/chats/oc_…st0006', params: { container_id: 'oc_…st0006', 'ou_…st0007': 1 }, data: '{"receive_id":"ou_…st0009"}' });
+  assert.deepEqual(seen.config, { url: 'https://x.invalid/chats/oc_…st0006', params: { container_id: 'oc_…st0006', 'ou_…st0007': 1 }, data: '[正文未记]' });
   assert.ok(seen.cause.includes('on_…st0010'));
   assert.equal(seen.self, '[…]');
   assert.equal(out[1].request_id, 12);
@@ -112,6 +113,35 @@ test('installConsoleIdMask：真实 SDK 的默认 logger 经全局 console 打�
   const dump = JSON.stringify(seen);
   assert.ok(dump.includes('ou_…st0013') && dump.includes('oc_…st0014') && dump.includes('oc_…st0015'), dump);
   assert.ok(!/(oc|ou)_test00(13|14|15)/.test(dump), dump);
+});
+
+test('installConsoleIdMask：真实 SDK 请求失败打出的日志里没有请求体和回显值（formatErrors 带 config.data、field_violations）', async () => {
+  const names = ['log', 'info', 'warn', 'error'];
+  const saved = names.map((n) => console[n]);
+  const symbol = Symbol.for('feishu-bridge.console-id-mask');
+  const seen = [];
+  const body = '机密正文丁戊';
+  // 要和 SDK 用同一份 axios（它按 CommonJS 引），formatErrors 靠 instanceof 认错误
+  const sdkRequire = createRequire(createRequire(import.meta.url).resolve('@larksuiteoapi/node-sdk'));
+  const axios = sdkRequire('axios');
+  const fail = async (opts) => {
+    throw new axios.AxiosError('Request failed with status code 400', 'ERR_BAD_REQUEST', { ...opts, data: JSON.stringify(opts.data) }, {},
+      { status: 400, statusText: 'Bad Request', data: { code: 99992402, msg: 'field validation failed', error: { field_violations: [{ field: 'content', value: body, description: 'too long' }] } } });
+  };
+  try {
+    console.log = (...args) => { seen.push(args); };
+    delete console[symbol];
+    installConsoleIdMask(console);
+    const client = new lark.Client({ appId: 'cli_t01', appSecret: 's', disableTokenCache: true, httpInstance: { request: fail } });
+    seen.length = 0;
+    await assert.rejects(client.im.v1.message.reply({ path: { message_id: 'm1' }, data: { msg_type: 'text', content: body } }, lark.withTenantToken('t-test')));
+  } finally {
+    names.forEach((n, i) => { console[n] = saved[i]; });
+    delete console[symbol];
+  }
+  const dump = JSON.stringify(seen);
+  assert.ok(dump.includes('99992402') && dump.includes('field validation failed') && dump.includes('too long'), dump);
+  assert.ok(!dump.includes(body), dump);
 });
 
 // §3.5 第 1 点（owner 候选换数据源）还没做：setup / doctor 仍从日志里取 owner 未登记时私聊者的完整 open_id

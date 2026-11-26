@@ -101,15 +101,16 @@ async function sendSegments(create, chunk, { segments, ranges, omittedChars }, o
       } catch (e2) {
         let rest = omittedChars;
         for (let j = i; j < n; j += 1) rest += codePoints(chunk.slice(ranges[j][0], ranges[j][1]));
-        if (key) {
+        if (key && !opts.noticeOnFail) {
           console.error(`[send] 长消息第 ${i + 1}/${n} 段发送失败，后面约 ${rest} 字没有发出（交给调用方重试）`);
           throw e2;
         }
         if (i === 0) throw e2;
-        // 没有幂等键：抛错会让调用方整条重发、前面已送达的段重复，所以补一条提示，不抛
+        // 没人会整条重试（没给幂等键，或调用方声明 noticeOnFail）：抛错只会让重发时前面已送达的段重复，所以补一条提示，不抛
         console.error(`[send] 长消息第 ${i + 1}/${n} 段发送失败，后面约 ${rest} 字没有发出（已补发提示）`);
         try {
-          await create({ msg_type: 'text', content: JSON.stringify({ text: `⚠️ 上面这条消息较长，分 ${n} 段发送；第 ${i + 1} 段起没能发出，后面约 ${rest} 字没有送达。` }) });
+          const hint = `⚠️ 上面这条消息较长，分 ${n} 段发送；第 ${i + 1} 段起没能发出，后面约 ${rest} 字没有送达。`;
+          await create(withUuid({ msg_type: 'text', content: JSON.stringify({ text: hint }) }, key, contentPart('hint', hint)));
         } catch (e3) {
           console.error('[send] 补发「没发完」提示也失败:', e3?.message ?? e3);
         }

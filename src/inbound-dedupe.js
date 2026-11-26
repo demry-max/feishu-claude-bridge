@@ -41,6 +41,7 @@ export function createDedupeStore({ file, keepMs = DEFAULT_KEEP_MS, keepMin = 20
   const seen = new Map(); // id → 登记时刻 ms；Map 的插入顺序 ＝ 登记顺序，最老的在最前
   const base = path.basename(file);
   let lastWarnAt = -Infinity;
+  let since = 0; // 首次启动水位线 ms：建在它之前的消息，旧版本可能已经答过（见 createIngest 的 notBeforeMs）
   const say = (line) => { try { log(line); } catch { /* 日志出错不影响去重 */ } };
   const warnHourly = (line) => {
     const t = now();
@@ -60,12 +61,15 @@ export function createDedupeStore({ file, keepMs = DEFAULT_KEEP_MS, keepMin = 20
 
   function load() {
     const r = readJsonFile(file, { fs });
-    if (r.status === 'missing') return;
     const doc = r.value;
-    if (r.status !== 'ok' || !doc || typeof doc !== 'object' || doc.v !== 1 || !Array.isArray(doc.ids)) {
-      say(`[dedupe] ${base} 损坏或格式不认识，按空表起步`);
+    const usable = r.status === 'ok' && doc && typeof doc === 'object' && doc.v === 1 && Array.isArray(doc.ids);
+    if (!usable) {
+      if (r.status !== 'missing') say(`[dedupe] ${base} 损坏或格式不认识，按空表起步`);
+      since = now(); // 没有任何已处理记录可查：以本次启动时刻立水位线，立刻落盘（几分钟内再重启也不丢）
+      persist();
       return;
     }
+    if (Number.isFinite(doc.since)) since = doc.since;
     const good = doc.ids.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && e[0] && Number.isFinite(e[1]));
     if (good.length < doc.ids.length) say(`[dedupe] ${base} 里有 ${doc.ids.length - good.length} 条记录无法识别，已丢弃`);
     good.sort((a, b) => a[1] - b[1]); // 稳定排序：登记时刻相同的保持文件里的先后
@@ -75,7 +79,7 @@ export function createDedupeStore({ file, keepMs = DEFAULT_KEEP_MS, keepMin = 20
 
   function persist() {
     try {
-      writeJsonAtomic(file, { v: 1, ids: [...seen] }, { fs });
+      writeJsonAtomic(file, { v: 1, ...(since ? { since } : {}), ids: [...seen] }, { fs });
     } catch (e) {
       warnHourly(`[dedupe] 写 ${base} 失败（${e?.code ?? e?.name ?? '?'}），内存里照常记；重启后这期间的消息可能被重答`);
     }
@@ -95,5 +99,6 @@ export function createDedupeStore({ file, keepMs = DEFAULT_KEEP_MS, keepMin = 20
     },
     has: (id) => seen.has(id),
     get size() { return seen.size; },
+    get since() { return since; },
   };
 }
