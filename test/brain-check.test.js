@@ -18,12 +18,14 @@ test('package.json exposes the brain-check script', () => {
   assert.equal(manifest.scripts['brain-check'], 'node scripts/brain-check.js');
 });
 
-test('brain-check reports only agent, tier, raw permission and quota', async () => {
-  const summary = { agent_id: 'private-assistant-owner', read_max_tier: 'L1', raw_allowed: true,
-    remaining: { search: { minute: 8 } } };
+test('brain-check reports agent, channel, read tiers, raw permission, quota and Asker verification', async () => {
+  const summary = { agent_id: 'private-assistant-owner', channel: 'dm', read_tiers: ['L1'], raw_allowed: true,
+    rate: {
+      search_minute_left: 8, search_day_left: 180, read_minute_left: 119, list_minute_left: 60, whoami_minute_left: 29,
+    } };
   const result = await check({ status: 200, summary, result: { content: [{ type: 'text', text: 'marker-not-for-output' }] } });
   assert.equal(result.status, 0);
-  assert.deepEqual(result.outputs, [JSON.stringify(summary)]);
+  assert.deepEqual(result.outputs, [JSON.stringify({ ...summary, identity_check: '身份由 Asker 头核验' })]);
 });
 
 test('brain-check uses exit 3 for the global gate and exit 1 for other failures', async () => {
