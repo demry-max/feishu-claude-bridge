@@ -12,7 +12,8 @@
     "doctor": "node scripts/doctor.js",
     "setup": "node scripts/setup.js",
     "biz-check": "node scripts/biz-check.js",
-    "bms-check": "node scripts/biz-check.js bms"
+    "bms-check": "node scripts/biz-check.js bms",
+    "brain-check": "node scripts/brain-check.js"
   },
   "keywords": [],
   "author": "",

@@ -16,7 +16,8 @@ import { setAccountNotifier, verifyFallbackAtStartup } from './account-fallback.
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
-import { OWNER_TOOL_PROFILE, BIZ_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt, warnOwnerBroadBash } from './claude.js';
+import { OWNER_TOOL_PROFILE, BIZ_ON, BRAIN_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt, warnOwnerBroadBash } from './claude.js';
+import { BRAIN_INIT_MISMATCH, BRAIN_INIT_STOP } from './brain-wiring.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 import { schedDestOf } from './biz-wiring.js';
 import { tasksCommandReply, listPlain, listWhen, SCHED_APPROVAL_KEY_FILE } from './sched-approval.js'; // BRIDGE-PRIV-2
@@ -296,7 +297,7 @@ async function handleMessage(data, seq = ++arrivalSeq) {
   // isOwner 只留给桥接命令的权限判定，工作区 / 工具 / 记忆 / 会话键一律看 turn
   const turn = resolveTurn({
     source: 'chat', isOwner, chatType: message.chat_type, chatId: message.chat_id, senderOpenId,
-    profile: OWNER_TOOL_PROFILE, bizOn: BIZ_ON,
+    profile: OWNER_TOOL_PROFILE, bizOn: BIZ_ON, brainOn: typeof BRAIN_ON === 'boolean' && BRAIN_ON,
   });
   // 会话键必须区分身份：群里 owner 与访客共用一个 chat_id，但两者的 cwd 曾经不同（workspace vs workspace-guest）。
   // 若共用同一个 session，访客一次 --resume 就能恢复出 owner 那条带私有记忆的会话历史——工作区隔离会被整个绕过。
@@ -628,6 +629,11 @@ async function runTurn(spec) {
         client.im.v1.message.reply({ path: { message_id: message.message_id }, data })
       , { mode: e?.cancelled ? 'discard' : 'hold', idempotencyKey: replyKey }).catch(() => null);
       if (e?.cancelled) return; // /cancel 主动终止，不报错
+      if (turn.brain && e?.code === BRAIN_INIT_MISMATCH) {
+        await reply(message.message_id, BRAIN_INIT_STOP).catch(() => {});
+        if (held?.note) await reply(message.message_id, held.note).catch(() => {});
+        return;
+      }
       console.error('[claude]', e);
       // 登录类失败（含钥匙串锁住）给确定性修复步骤；瞬时刷新不算登录失效；其余原样报错
       await reply(message.message_id, (await claudeFailureReply(String(e.message ?? e))) + dailySession.failureNote(e) + (held?.note ? `\n\n${held.note}` : ''));
@@ -788,7 +794,7 @@ function schedTurnFor(source, job) {
   return resolveTurn({
     source, isOwner: true, chatId: `${source}:${job._file}`,
     schedDest: schedDestOf(chatId, ownerDmChatId), ownerDmKnown: Boolean(ownerDmChatId),
-    profile: OWNER_TOOL_PROFILE, bizOn: BIZ_ON,
+    profile: OWNER_TOOL_PROFILE, bizOn: BIZ_ON, brainOn: typeof BRAIN_ON === 'boolean' && BRAIN_ON,
   });
 }
 
@@ -849,27 +855,31 @@ const scheduler = startScheduler({
       notifyOwner: (text, reason) => (ctx?.notifyOnce ? ctx.notifyOnce(reason, text) : sendToOwner(text)),
       isQuiet: isQuietAnswer,
       onRunFailure: async (e) => {
-        // 失败自诊断：让 Claude 判断是什么原因、能否自行修复。
-        // 登录类故障例外：诊断本身也要调 claude，只会同样失败（9/20–9/21 两天里每次都是
-        // 「诊断也失败了」），所以直接发确定性修复步骤。
-        const err = String(e?.message ?? e).slice(0, 800);
-        const diagTurn = schedTurnFor('sched-diag', job); // 与上面同一个目的地判定：发往非 owner 私聊的任务，自诊断也不带私密工具
-        await handleScheduledFailure({
-          err,
-          jobName: job.name ?? job._file,
-          send: (text) => sendToChat(chatId, text),
-          runDiagnosis: () => runClaude(
-            `sched-diag:${job._file}`,
-            // 自诊断是模板化的短任务，没必要用旗舰模型；提示词按工具档拼（audit/strict 或非私密档把任务指令/报错围栏起来）
-            schedDiagPrompt(job, err, { fence: diagTurn.private === false }),
-            diagTurn.private,
-            [],
-            null,
-            { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low', turn: diagTurn }
-          ),
-        });
+        const brainInitMismatch = schedTurn.brain && e?.code === BRAIN_INIT_MISMATCH;
+        if (!brainInitMismatch) {
+          // 失败自诊断：让 Claude 判断是什么原因、能否自行修复。
+          // 登录类故障例外：诊断本身也要调 claude，只会同样失败（9/20–9/21 两天里每次都是
+          // 「诊断也失败了」），所以直接发确定性修复步骤。
+          const err = String(e?.message ?? e).slice(0, 800);
+          const diagTurn = schedTurnFor('sched-diag', job); // 与上面同一个目的地判定：发往非 owner 私聊的任务，自诊断也不带私密工具
+          await handleScheduledFailure({
+            err,
+            jobName: job.name ?? job._file,
+            send: (text) => sendToChat(chatId, text),
+            runDiagnosis: () => runClaude(
+              `sched-diag:${job._file}`,
+              // 自诊断是模板化的短任务，没必要用旗舰模型；提示词按工具档拼（audit/strict 或非私密档把任务指令/报错围栏起来）
+              schedDiagPrompt(job, err, { fence: diagTurn.private === false }),
+              diagTurn.private,
+              [],
+              null,
+              { model: process.env.DIAG_MODEL || 'claude-haiku-5-5', effort: 'low', turn: diagTurn }
+            ),
+          });
+        }
         // 失败时不发回传文件：挪到保留目录，另发一行列出文件名（BRIDGE-SEND-2）；取消的只清不发
         const held = await flushOutbox(client, outboxDirFor(schedChatId, schedTurn.private), sendCreate, { mode: e?.cancelled ? 'discard' : 'hold' }).catch(() => null);
+        if (brainInitMismatch) await sendToChat(chatId, BRAIN_INIT_STOP, sendOpts).catch(() => {});
         if (held?.note) await sendToChat(chatId, held.note).catch(() => {});
       },
     });
