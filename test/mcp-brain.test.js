@@ -5,6 +5,7 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { BROWSER_UA } from '../src/biz-targets.js';
 import { createBrainClient, createBrainServer } from '../src/mcp-brain.js';
 import { BRAIN_KEYCHAIN } from '../src/brain-targets.js';
 import { brainMcpServer, writeBrainMcpConfig } from '../src/brain-wiring.js';
@@ -70,7 +71,7 @@ test('request headers are exact and keychain values stay out of local surfaces',
     assert.equal(req.headers['CF-Access-Client-Secret'], VALUES.cfSecret);
     assert.equal(req.headers.Accept, 'application/json, text/event-stream');
     assert.equal(req.headers['Content-Type'], 'application/json');
-    assert.equal(req.headers['User-Agent'], 'feishu-claude-bridge/2.3.0');
+    assert.equal(req.headers['User-Agent'], BROWSER_UA);
     const { id, ...body } = JSON.parse(req.body);
     assert.ok(id != null);
     assert.deepEqual(body, { jsonrpc: '2.0', method: 'tools/call', params: { name: 'search', arguments: input } });

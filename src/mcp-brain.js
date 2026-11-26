@@ -6,7 +6,8 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { BRAIN_ENDPOINT, BRAIN_KEYCHAIN, BRAIN_LIMITS, BRAIN_TOOL_NAMES, BRAIN_USER_AGENT } from './brain-targets.js';
+import { BROWSER_UA } from './biz-targets.js';
+import { BRAIN_ENDPOINT, BRAIN_KEYCHAIN, BRAIN_LIMITS, BRAIN_TOOL_NAMES } from './brain-targets.js';
 import { fencedMcpResult } from './tool-audit.js';
 
 const INPUTS = {
@@ -167,7 +168,7 @@ async function request({ name, input, id, secrets, fetch, timeoutMs, log }) {
         'X-Brain-Asker': JSON.stringify({ kind: 'feishu_union_id', value: unionId }),
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
-        'User-Agent': BRAIN_USER_AGENT,
+        'User-Agent': BROWSER_UA,
       },
       body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: name.slice(6), arguments: input } }),
     }), deadline]);
