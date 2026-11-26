@@ -16,7 +16,7 @@ import { setAccountNotifier, verifyFallbackAtStartup } from './account-fallback.
 import { createProgressChannel, flushOutbox, migrateLegacyOutbox, resolveSenderName, redact, sendVoice, claudeFailureReply, handleScheduledFailure, formatInboundLog } from './outbound.js';
 import { recallHint } from './memory-recall.js';
 import { fetchGrantedScopes, evaluateScopes, formatScopeReport } from './feishu-scopes.js';
-import { OWNER_TOOL_PROFILE, BIZ_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt } from './claude.js';
+import { OWNER_TOOL_PROFILE, BIZ_ON, detectConfirm, createToolTurn, startToolAuditSummary, schedDiagPrompt, warnOwnerBroadBash } from './claude.js';
 import { createOwnerMessageQueue, messageQueueEnabled, mergeQueuedTurns, MERGED_NO_CONFIRM, withClearedNote } from './message-queue.js';
 import { schedDestOf } from './biz-wiring.js';
 import { tasksCommandReply, listPlain, listWhen, SCHED_APPROVAL_KEY_FILE } from './sched-approval.js'; // BRIDGE-PRIV-2
@@ -1026,6 +1026,7 @@ async function scopeSelfCheck() {
   // 显式 ALLOWED_TOOLS 不并入默认值：缺了默认里的 Edit(./…/**) 写入项就只警告（只列项名，不改权限）
   const ownerEdits = ownerToolsWarning(process.env);
   if (ownerEdits) console.error(ownerEdits);
+  warnOwnerBroadBash();
 }
 
 // 启动通知放在全部自检之后：此前 announceStartup() 在 config 块之前调用，

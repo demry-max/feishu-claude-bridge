@@ -1,6 +1,6 @@
 // BRIDGE-BMS-1：把 biz_get（src/mcp-biz.js）接进 claude CLI 参数的零件。claude.js 只做最小接线，细节都在这里。
 // - mcp.json 里的 biz 条目不带任何 env：Key 由 MCP 子进程自己从钥匙串读，不经过 argv、env、临时文件。
-// - .env 拒读规则按仓库绝对路径写成 Read(//<abs>/.env)、Read(//<abs>/.env.*)，另拒 Bash 直接调用 security
+// - 仓库 .env 与 HOME 下的密钥路径按绝对路径拒读，另拒 Bash 直接调用 security
 //   （钥匙串条目对 /usr/bin/security 免提示；拒绝优先于任何允许）。
 // - biz 子进程经 /usr/bin/env -u 启动：去掉 NODE_OPTIONS、NODE_EXTRA_CA_CERTS 与各种 *_PROXY，免得改信任链或绕代理。
 // - 定时任务只有目的地是 owner 私聊时才挂 biz_get（schedDestOf / schedToOwnerDm），目的地未知按「不是」处理。
@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BIZ_SERVER, BIZ_TOOL, BIZ_SKILL } from './biz-targets.js';
+import { HOME_SECRET_PATHS } from './secret-paths.js';
 
 export const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_DIR = path.resolve(SRC_DIR, '..');
@@ -34,10 +35,16 @@ export function bizMcpServer() {
 /** 有工具的档一律拒绝经 Bash 直接调用 security（钥匙串条目对它免提示）。 */
 export const SECURITY_DENY = Object.freeze(['Bash(security:*)', 'Bash(/usr/bin/security:*)']);
 
-/** .env 拒读 + security 拒绝：.env 按仓库绝对路径（// 开头）。 */
+/** 拒读仓库 .env 和运行账户的密钥路径，保留对 security 的拒绝。 */
 export function envDenyRules(repo = REPO_DIR) {
   const r = String(repo).replace(/^\/+/, '');
-  return [`Read(//${r}/.env)`, `Read(//${r}/.env.*)`, ...SECURITY_DENY];
+  const home = os.homedir();
+  const homeDeny = HOME_SECRET_PATHS.flatMap((name) => {
+    const absolute = path.join(home, name).split(path.sep).join('/').replace(/^\/+/, '');
+    // /** 保护目录内容，并单列路径本身以覆盖 .npmrc 与 .credentials* 一类文件。
+    return [`Read(//${absolute})`, `Read(//${absolute}/**)`];
+  });
+  return [`Read(//${r}/.env)`, `Read(//${r}/.env.*)`, ...SECURITY_DENY, ...homeDeny];
 }
 
 /** 定时任务的目的地：恰好是 owner 私聊时为 SCHED_DEST_OWNER_P2P；owner 私聊未知、目的地缺失或不同一律 'other'。 */
@@ -99,7 +106,7 @@ export const BIZ_HEARTBEAT_LINE =
 
 /**
  * 心跳参数加上 biz_get（只在开关开时由 claude.js 调用）：不改心跳档原有的构造，只在结果上做加法——
- *   --allowedTools 末尾加工具名；--disallowedTools 末尾加 .env 拒读与 security 拒绝；提示词末尾加一行；
+ *   --allowedTools 末尾加工具名；--disallowedTools 可追加密钥拒绝规则；提示词末尾加一行；
  *   紧跟 --strict-mcp-config 插入 --mcp-config <只含 biz 的临时文件>；cleanup 先跑原来的，再删临时目录。
  */
 export function withBizHeartbeat(res, { deny = envDenyRules(), mcp = writeBizOnlyMcpConfig } = {}) {

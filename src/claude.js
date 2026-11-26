@@ -798,7 +798,7 @@ function buildHeartbeatArgs(opts = {}) {
   args.push('--setting-sources', '');
   args.push('--strict-mcp-config');
   args.push('--tools', HEARTBEAT_TOOLS.join(','));
-  args.push('--disallowedTools', [...HEARTBEAT_DENY, ...ENV_DENY].join(',')); // BRIDGE-PRIV-1：有工具的档一律带 .env 拒读 + security 拒绝
+  args.push('--disallowedTools', [...HEARTBEAT_DENY, ...ENV_DENY].join(','));
   args.push('--settings', JSON.stringify({ autoMemoryEnabled: false }));
   if (model) args.push('--model', model);
   if (effort) args.push('--effort', effort);
@@ -910,12 +910,12 @@ export { startToolAuditSummary } from './tool-audit.js';
 // 只有 BMS_TOOL_ENABLED=1 才开（模块加载时读一次）。开时 owner 私聊、发往 owner 私聊的定时任务（含 strict 只读定时）、心跳挂上
 // mcp__biz__biz_get；群里的 owner 轮次、发往群或目的地未知的定时任务、访客、sched-diag、验收一律不给。
 // 关时 biz 相关的 argv 与基线一致。主机、钥匙串条目、请求逻辑在 biz-targets.js / mcp-biz.js。
-// BRIDGE-PRIV-1：.env 拒读 + security 拒绝（ENV_DENY）不再看这个开关——所有「有工具」的档一律带（见 buildClaudeArgs）。
+// ENV_DENY 保护 .env、HOME 下的密钥路径和钥匙串，在所有带工具的档始终生效。
 // 这一轮挂不挂 biz_get、用哪个工作区与工具档，都由 turn（turn-context.js）决定，本文件不再按 chatId 前缀 / chatType 推断。
 import { BIZ_SERVER, BIZ_TOOL, BIZ_SKILL } from './biz-targets.js';
 import { bizMcpServer, envDenyRules, writeBizOnlyMcpConfig, installBizSkill, withBizHeartbeat } from './biz-wiring.js';
 export const BIZ_ON = process.env.BMS_TOOL_ENABLED === '1';
-const ENV_DENY = envDenyRules(path.resolve(__dirname, '..')); // .env 拒读 + 拒绝 Bash 直接调用 security
+const ENV_DENY = envDenyRules(path.resolve(__dirname, '..'));
 // createToolTurn 不再包一层：index.js 直接把 turn 放进 runClaude 的 opts（见 buildClaudeArgs 的 turnOf）
 export { createToolTurn };
 
@@ -926,6 +926,23 @@ export const OWNER_TOOL_PROFILE = (() => {
   console.error('[tool-profile] OWNER_TOOL_PROFILE 只能是 legacy/audit/strict，当前值无效，按 legacy 处理');
   return 'legacy';
 })();
+
+const BROAD_BASH_PROGRAM = /^(?:\*|(?:cat|head|tail|less|cp|base64|node)\*?|python.*)$/;
+
+/** 启动时只记录事件码。strict 使用自己的放行表。 */
+export function warnOwnerBroadBash(warn = console.error) {
+  if (OWNER_TOOL_PROFILE === 'strict') return;
+  const tools = ALLOWED_TOOLS.match(/[^\s,()]+(?:\([^)]*\))?/g) ?? [];
+  const broadBash = tools.some((tool) => {
+    if (tool === 'Bash') return true;
+    if (!tool.startsWith('Bash(')) return false;
+    const command = tool.slice('Bash('.length, -1).trim();
+    const [program] = command.split(/[\s:]/, 1);
+    return BROAD_BASH_PROGRAM.test(path.posix.basename(program));
+  });
+  if (broadBash) warn('owner_tools_broad_bash');
+}
+
 /**
  * 这一轮的 turn：调用方（index.js）显式传了 opts.turn 就用它；没传的（heartbeat.js、verifier、daily-session、
  * 既有测试）由 turnFromLegacyCall 按老口径推。第三个参数不是 owner 时，私密档的 turn 不可信，一律退回按访客推。
@@ -1044,7 +1061,7 @@ function buildOwnerProfileArgs(chatId, extraTools, opts, turn) {
   if (strict) {
     args.push('--tools', STRICT_TOOLS.join(','));
     args.push('--disallowedTools', [...ownerDenyList(sched), ...ENV_DENY].join(','));
-  } else args.push('--disallowedTools', ENV_DENY.join(',')); // BRIDGE-PRIV-1：audit 本无拒绝表，只加 .env 拒读 + security 拒绝（不再看 biz 开关）
+  } else args.push('--disallowedTools', ENV_DENY.join(','));
   args.push('--settings', ownerHookSettings(strict));
   if (base.model) args.push('--model', base.model);
   if (base.effort) args.push('--effort', base.effort);
@@ -1234,7 +1251,7 @@ export function buildClaudeArgs(chatId, isOwner = false, extraTools = [], opts =
   const turn = turnOf(chatId, isOwner, opts);
   switch (turn.toolSet) {
     case 'heartbeat': {
-      // BRIDGE-BMS-1：开关开时在心跳档结果上做加法（工具名、一行提示、只含 biz 的 MCP）；.env 拒读已在心跳档自己的拒绝表里，这里不再重复加
+      // 心跳档已带密钥拒绝规则。开关打开时只追加 biz 工具、提示和 MCP。
       const hb = buildHeartbeatArgs(opts);
       return BIZ_ON && turn.biz ? withBizHeartbeat(hb, { deny: [] }) : hb;
     }
@@ -1283,7 +1300,7 @@ function buildBase(chatId, turn, extraTools, opts, profileBase) {
     .filter(Boolean)
     .join(',');
   if (tools) args.push('--allowedTools', tools);
-  // BRIDGE-PRIV-1：legacy 档的 owner 一律带 .env 拒读 + security 拒绝（audit/strict 由 buildOwnerProfileArgs 加；访客在下面并进它自己的拒绝表）
+  // legacy 在这里附加密钥拒绝规则，audit/strict 在 buildOwnerProfileArgs 中附加。
   if (owner && !profileBase) args.push('--disallowedTools', ENV_DENY.join(','));
   if (!owner) {
     // 关键：--allowedTools 不是沙箱，它只是「免询问」白名单，是加法项。

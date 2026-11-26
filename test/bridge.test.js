@@ -25,7 +25,7 @@ const {
   GUEST_WORKSPACE_DIR,
 } = await import('../src/claude.js');
 
-const { secretsDenyOf, disallowedOf, hasSecretsDeny } = await import('./helpers/strip-secrets-deny.js');
+const { secretsDenyOf, disallowedOf, hasSecretsDeny, SECRETS_DENY_COUNT } = await import('./helpers/strip-secrets-deny.js');
 
 const argVal = (args, flag) => {
   const i = args.indexOf(flag);
@@ -108,9 +108,8 @@ describe('访客隔离（行为断言）', () => {
 
   test('owner 不受访客那套限制影响', () => {
     assert.ok(!owner.args.includes('--strict-mcp-config'));
-    // BRIDGE-PRIV-1：owner 也常带 .env / security 的 4 条拒绝规则，但仅此 4 条，没有访客那套黑名单
-    assert.ok(hasSecretsDeny(owner.args), 'owner 必须带 4 条 .env / security 拒绝规则');
-    assert.equal(disallowedOf(owner.args).length, 4, 'owner 的 --disallowedTools 只能是这 4 条');
+    assert.ok(hasSecretsDeny(owner.args), 'owner 必须带齐密钥拒绝规则');
+    assert.equal(disallowedOf(owner.args).length, SECRETS_DENY_COUNT, 'owner 的 --disallowedTools 只有密钥拒绝规则');
     assert.deepEqual(disallowedOf(owner.args), secretsDenyOf(owner.args));
   });
 
