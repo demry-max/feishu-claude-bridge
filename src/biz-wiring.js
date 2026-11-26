@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BIZ_SERVER, BIZ_TOOL, BIZ_SKILL } from './biz-targets.js';
-import { HOME_SECRET_PATHS } from './secret-paths.js';
+import { HOME_ENV_PATHS, HOME_SECRET_PATHS } from './secret-paths.js';
 
 export const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_DIR = path.resolve(SRC_DIR, '..');
@@ -39,12 +39,14 @@ export const SECURITY_DENY = Object.freeze(['Bash(security:*)', 'Bash(/usr/bin/s
 export function envDenyRules(repo = REPO_DIR) {
   const r = String(repo).replace(/^\/+/, '');
   const home = os.homedir();
+  const homePath = (name) => path.join(home, name).split(path.sep).join('/').replace(/^\/+/, '');
   const homeDeny = HOME_SECRET_PATHS.flatMap((name) => {
-    const absolute = path.join(home, name).split(path.sep).join('/').replace(/^\/+/, '');
+    const absolute = homePath(name);
     // /** 保护目录内容，并单列路径本身以覆盖 .npmrc 与 .credentials* 一类文件。
     return [`Read(//${absolute})`, `Read(//${absolute}/**)`];
   });
-  return [`Read(//${r}/.env)`, `Read(//${r}/.env.*)`, ...SECURITY_DENY, ...homeDeny];
+  const envDeny = HOME_ENV_PATHS.map((name) => `Read(//${homePath(name)})`);
+  return [`Read(//${r}/.env)`, `Read(//${r}/.env.*)`, ...SECURITY_DENY, ...homeDeny, ...envDeny];
 }
 
 /** 定时任务的目的地：恰好是 owner 私聊时为 SCHED_DEST_OWNER_P2P；owner 私聊未知、目的地缺失或不同一律 'other'。 */
